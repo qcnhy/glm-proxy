@@ -1,0 +1,41 @@
+{
+  "_comment": "复制本文件为 config.json 并填入真实密钥。config.json 不会被提交到 git。",
+  "feishu_webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/YOUR_WEBHOOK_ID",
+  "upstreams": [
+    {
+      "_comment": "内网网关：阿里云 GLM 中转，需 VPN。仅 Chat Completions（openai_url）。",
+      "name": "internal",
+      "openai_url": "https://your-internal-gateway/openai/v1",
+      "key": "YOUR_INTERNAL_KEY",
+      "relay_port": 4444,
+      "interceptor_port": 14444,
+      "model": "glm-5",
+      "max_context_tokens": 202745
+    },
+    {
+      "_comment": "中转站：第三方 GLM 中转，支持 Anthropic Messages。",
+      "name": "external",
+      "openai_url": "https://your-relay/v1",
+      "anthropic_url": "https://your-relay/v1/messages",
+      "anthropic_auth": "bearer",
+      "key": "YOUR_EXTERNAL_KEY",
+      "relay_port": 4445,
+      "interceptor_port": 14445,
+      "model": "glm-5.2",
+      "max_context_tokens": 202745
+    },
+    {
+      "_comment": "智谱官方：原生 Anthropic Messages 端点。anthropic_auth=x-api-key。",
+      "name": "official",
+      "openai_url": "https://open.bigmodel.cn/api/paas/v4",
+      "anthropic_url": "https://open.bigmodel.cn/api/anthropic/v1/messages",
+      "anthropic_auth": "x-api-key",
+      "key": "YOUR_ZHIPU_API_KEY",
+      "relay_port": 4446,
+      "interceptor_port": 14446,
+      "model": "glm-5.2",
+      "messages_model": "glm-5.2",
+      "max_context_tokens": 202745
+    }
+  ]
+}
