@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.7.6 — codex-relay + Python 路由层
+GLM API 代理 v2.8.0 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -38,6 +38,11 @@ _cfg = _load_config()
 LISTEN = ("0.0.0.0", 9999)
 REQUEST_TIMEOUT = 300
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+
+# Responses API 路由路径：
+#   True  → codex-relay（Responses→Chat Completions，OpenAI 原生）
+#   False → ccproxy-api（Responses→Anthropic Messages）
+RESPONSES_USE_COMPLETIONS = True
 
 FEISHU_WEBHOOK = _cfg.get("feishu_webhook", "")
 
@@ -197,13 +202,16 @@ class InterceptorHandler(BaseHTTPRequestHandler):
                 roles[r] = roles.get(r, 0) + 1
             log.info("[relay] %s translated: %d msgs %dKB | roles=%s | stream=%s",
                      up["name"], len(messages), len(body) // 1024, roles, is_stream)
-            # [DEBUG] 保存翻译后的请求用于排查 1214 错误
+            # [DEBUG] 保存翻译后的请求用于排查（大请求才存，避免占磁盘）
             if up["name"] == "official" and len(messages) > 100:
                 ts = time.strftime("%Y%m%d_%H%M%S")
                 path = os.path.join(LOG_DIR, f"debug_relay_{ts}.json")
                 with open(path, "w", encoding="utf-8") as f:
                     json.dump(data, f, ensure_ascii=False, indent=2)
                 log.info("[relay] %s [DEBUG] saved translated request to %s", up["name"], path)
+            # 修复 max_tokens=None（智谱 Chat Completions 会报 1210 参数错误）
+            if data.get("max_tokens") is None:
+                data["max_tokens"] = 16384
             if is_stream:
                 data.setdefault("stream_options", {})["include_usage"] = True
                 body = json.dumps(data).encode("utf-8")
@@ -502,7 +510,106 @@ def _append_tool_result(messages, output_item):
     messages.append({"role": "user", "content": [tool_result]})
 
 
-def _convert_responses_to_messages(body):
+# apply_patch 的 patch 格式规则（GLM 不原生支持 FREEFORM 工具，靠描述教它）
+_APPLY_PATCH_RULES = (
+    "\n\nSTOP! Your previous apply_patch calls were ALL WRONG (empty {} or invalid format). "
+    "IGNORE all previous attempts. Follow ONLY the rules below:\n"
+    "CRITICAL RULES for patch format:\n"
+    "1. In *** Update File sections, EVERY content line MUST start with one of:\n"
+    "   - space ( ) = context line (unchanged, shown for reference)\n"
+    "   - minus (-) = line to REMOVE from the file\n"
+    "   - plus (+) = line to ADD to the file\n"
+    "2. NEVER write bare text lines without a prefix character!\n"
+    "3. Start each change section with @@ (just @@ alone, NO curly braces or anything after it)\n"
+    "4. Do NOT use --- separator, it is NOT valid\n"
+    "5. *** Begin Patch and *** End Patch are COMMANDS, NOT content. "
+    "Do NOT add +/-/space prefix to them!\n"
+    "6. You CANNOT append to a file with multiple Add File operations. "
+    "Each file can only be Added ONCE. If you need a large file, "
+    "write ALL content in a SINGLE *** Add File operation. "
+    "To modify an existing file, use *** Update File instead.\n\n"
+    "To change line 2 from 'old' to 'new' in a file:\n"
+    "*** Begin Patch\n"
+    "*** Update File: path/to/file.txt\n"
+    "@@\n"
+    " line 1\n"
+    "-old\n"
+    "+new\n"
+    " line 3\n"
+    "*** End Patch\n\n"
+    "To create a new file (NO @@ in Add File):\n"
+    "*** Begin Patch\n"
+    "*** Add File: path/new.txt\n"
+    "+line 1\n"
+    "+line 2\n"
+    "*** End Patch\n\n"
+    "To delete a file:\n"
+    "*** Begin Patch\n"
+    "*** Delete File: path/old.txt\n"
+    "*** End Patch"
+)
+
+
+def _make_apply_patch_tool_description(original_desc):
+    """给 apply_patch 工具描述追加 patch 格式规则"""
+    return (original_desc or "") + _APPLY_PATCH_RULES
+
+
+def _convert_custom_tools_for_completions(body):
+    """codex-relay 路径（Responses→Chat Completions）的工具转换：
+    把 custom/grammar 工具（如 apply_patch）转成 OpenAI function 格式，
+    否则 codex-relay/GLM 不认识，GLM 会改用 shell_command。"""
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return body
+    new_tools = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            new_tools.append(tool)
+            continue
+        t = tool.get("type", "")
+        if t == "custom":
+            name = tool.get("name", "")
+            new_tools.append({
+                "type": "function",
+                "name": name,
+                "description": _make_apply_patch_tool_description(tool.get("description", "")),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "patch": {"type": "string", "description": "The patch content in V4A format"},
+                    },
+                    "required": ["patch"],
+                },
+            })
+        else:
+            new_tools.append(tool)
+    body["tools"] = new_tools
+
+    # 转换 input 里的 custom_tool_call / custom_tool_call_output（往返结果）
+    # codex-relay 不认识 custom 类型，需转成标准 function_call / function_call_output
+    inp = body.get("input")
+    if isinstance(inp, list):
+        new_input = []
+        for item in inp:
+            if isinstance(item, dict):
+                t = item.get("type", "")
+                if t == "custom_tool_call":
+                    new_item = dict(item)
+                    new_item["type"] = "function_call"
+                    if "input" in new_item and "arguments" not in new_item:
+                        new_item["arguments"] = new_item.pop("input")
+                    new_input.append(new_item)
+                elif t == "custom_tool_call_output":
+                    new_item = dict(item)
+                    new_item["type"] = "function_call_output"
+                    new_input.append(new_item)
+                else:
+                    new_input.append(item)
+            else:
+                new_input.append(item)
+        body["input"] = new_input
+    return body
     """将 OpenAI Responses API 请求转换为 Anthropic Messages API 请求。
     ccproxy-api 的转换器不处理 function_call/function_call_output，
     所以这里自己实现完整的转换。"""
@@ -561,44 +668,7 @@ def _convert_responses_to_messages(body):
         elif t == "custom":
             # apply_patch 等 custom/grammar 工具 → 转为 function 格式让 GLM 能调用
             name = tool.get("name", "")
-            desc = tool.get("description", "")
-            desc += (
-                "\n\nSTOP! Your previous apply_patch calls were ALL WRONG (empty {} or invalid format). "
-                "IGNORE all previous attempts. Follow ONLY the rules below:\n"
-                "CRITICAL RULES for patch format:\n"
-                "1. In *** Update File sections, EVERY content line MUST start with one of:\n"
-                "   - space ( ) = context line (unchanged, shown for reference)\n"
-                "   - minus (-) = line to REMOVE from the file\n"
-                "   - plus (+) = line to ADD to the file\n"
-                "2. NEVER write bare text lines without a prefix character!\n"
-                "3. Start each change section with @@ (just @@ alone, NO curly braces or anything after it)\n"
-                "4. Do NOT use --- separator, it is NOT valid\n"
-                "5. *** Begin Patch and *** End Patch are COMMANDS, NOT content. "
-                "Do NOT add +/-/space prefix to them!\n"
-                "6. You CANNOT append to a file with multiple Add File operations. "
-                "Each file can only be Added ONCE. If you need a large file, "
-                "write ALL content in a SINGLE *** Add File operation. "
-                "To modify an existing file, use *** Update File instead.\n\n"
-                "To change line 2 from 'old' to 'new' in a file:\n"
-                "*** Begin Patch\n"
-                "*** Update File: path/to/file.txt\n"
-                "@@\n"
-                " line 1\n"
-                "-old\n"
-                "+new\n"
-                " line 3\n"
-                "*** End Patch\n\n"
-                "To create a new file (NO @@ in Add File):\n"
-                "*** Begin Patch\n"
-                "*** Add File: path/new.txt\n"
-                "+line 1\n"
-                "+line 2\n"
-                "*** End Patch\n\n"
-                "To delete a file:\n"
-                "*** Begin Patch\n"
-                "*** Delete File: path/old.txt\n"
-                "*** End Patch"
-            )
+            desc = _make_apply_patch_tool_description(tool.get("description", ""))
             tools_out.append({
                 "type": "custom",
                 "name": name,
@@ -799,7 +869,11 @@ def _fix_apply_patch_args(output_blocks):
                 p = json.loads(line[6:])
                 item = p.get("item", {})
                 if item.get("name") == "apply_patch" and item.get("type") == "function_call" and item.get("arguments"):
-                    patch_calls.append({"call_id": item.get("call_id", item.get("id", "")), "arguments": item["arguments"]})
+                    patch_calls.append({
+                        "call_id": item.get("call_id", item.get("id", "")),
+                        "ids": {x for x in (item.get("id"), item.get("call_id")) if x},
+                        "arguments": item["arguments"],
+                    })
             except:
                 pass
 
@@ -808,6 +882,7 @@ def _fix_apply_patch_args(output_blocks):
 
     for pc in patch_calls:
         call_id = pc["call_id"]
+        ids = pc["ids"]
         args = pc["arguments"]
         if not args:
             continue
@@ -836,10 +911,11 @@ def _fix_apply_patch_args(output_blocks):
 
         log.info("    [apply_patch] unwrapped: %s", repr(patch_text[:100]))
 
-        # 3. 改写所有包含该 call_id 的 block
+        # 3. 改写所有相关的 block（匹配 id 或 call_id，因为 delta 用 item_id 而非 call_id）
+        id_bytes = [i.encode() for i in ids]
         new_blocks = []
         for block in output_blocks:
-            if not block or call_id.encode() not in block:
+            if not block or not any(ib in block for ib in id_bytes):
                 new_blocks.append(block)
                 continue
 
@@ -1035,8 +1111,8 @@ class Handler(BaseHTTPRequestHandler):
 
             # 构建目标 URL 和请求头（每个上游只需一次）
             is_responses_converted = False
-            if is_responses and "anthropic_url" in up and HAS_CCPROXY:
-                # Responses API → Anthropic Messages 直连（绕过 codex-relay）
+            if is_responses and not RESPONSES_USE_COMPLETIONS and "anthropic_url" in up and HAS_CCPROXY:
+                # Responses API → Anthropic Messages 直连（ccproxy 路径）
                 url = up["anthropic_url"].rstrip("/")
                 auth = up.get("anthropic_auth", "x-api-key")
                 if auth == "bearer":
@@ -1050,7 +1126,7 @@ class Handler(BaseHTTPRequestHandler):
                 }
                 is_responses_converted = True
             elif is_responses:
-                # Responses API → codex-relay（旧路径，备用）
+                # Responses API → codex-relay（Chat Completions 路径，OpenAI 原生）
                 url = f"http://127.0.0.1:{up['relay_port']}{self.path}"
                 up_headers = {
                     "Content-Type": "application/json",
@@ -1129,6 +1205,8 @@ class Handler(BaseHTTPRequestHandler):
                                      converted.get("max_tokens", 0),
                                      body.get("max_output_tokens"))
                     else:
+                        # codex-relay 路径：转换 custom 工具（apply_patch 等）为 function 格式
+                        _convert_custom_tools_for_completions(body)
                         payload = json.dumps(body).encode()
                     if "Content-Type" not in up_headers and payload is not None:
                         up_headers["Content-Type"] = "application/json"
@@ -1760,6 +1838,13 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception:
                         pass
 
+            # 修复 apply_patch：function_call → custom_tool_call（与 Messages 路径一致）
+            _fix_apply_patch_args(output_blocks)
+
+            # 保存 exchange 用于排查
+            resp_text = b"".join(output_blocks).decode("utf-8", errors="replace")
+            self._save_exchange(getattr(self, '_debug_req_body', {}), resp_text, upstream_name, "relay")
+
             if has_output:
                 # 发送前检测处理后输出是否包含 think 标签
                 for ob in output_blocks:
@@ -1989,7 +2074,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.7.6 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.8.0 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         log.info("  %s: relay :%d → interceptor :%d → %s | model=%s ctx=%s",
