@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.8.0 — codex-relay + Python 路由层
+GLM API 代理 v2.8.1 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -197,13 +197,23 @@ class InterceptorHandler(BaseHTTPRequestHandler):
             is_stream = data.get("stream", False)
             messages = data.get("messages", [])
             roles = {}
+            null_content_fixed = 0
             for m in messages:
                 r = m.get("role", "?")
                 roles[r] = roles.get(r, 0) + 1
+                # 修复 content=null → ""
+                # 但 assistant+tool_calls 消息保留 null（external 能正确转成 tool_use 块，
+                # 改成 "" 反而会转成无效的空 text block 导致 422）
+                if m.get("content") is None and not m.get("tool_calls"):
+                    m["content"] = ""
+                    null_content_fixed += 1
+            if null_content_fixed:
+                log.info("[relay] %s fixed %d null content → \"\"", up["name"], null_content_fixed)
+                body = json.dumps(data).encode("utf-8")
             log.info("[relay] %s translated: %d msgs %dKB | roles=%s | stream=%s",
                      up["name"], len(messages), len(body) // 1024, roles, is_stream)
             # [DEBUG] 保存翻译后的请求用于排查（大请求才存，避免占磁盘）
-            if up["name"] == "official" and len(messages) > 100:
+            if len(messages) > 15:
                 ts = time.strftime("%Y%m%d_%H%M%S")
                 path = os.path.join(LOG_DIR, f"debug_relay_{ts}.json")
                 with open(path, "w", encoding="utf-8") as f:
@@ -598,7 +608,14 @@ def _convert_custom_tools_for_completions(body):
                     new_item = dict(item)
                     new_item["type"] = "function_call"
                     if "input" in new_item and "arguments" not in new_item:
-                        new_item["arguments"] = new_item.pop("input")
+                        # custom_tool_call.input 是原始文本（apply_patch 的 patch），
+                        # 但 function_call.arguments 必须是 JSON，包成 {"patch": ...}
+                        raw_input = new_item.pop("input")
+                        try:
+                            json.loads(raw_input)  # 已是合法JSON则原样用
+                            new_item["arguments"] = raw_input
+                        except Exception:
+                            new_item["arguments"] = json.dumps({"patch": raw_input}, ensure_ascii=False)
                     new_input.append(new_item)
                 elif t == "custom_tool_call_output":
                     new_item = dict(item)
@@ -2074,7 +2091,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.8.0 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.8.1 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         log.info("  %s: relay :%d → interceptor :%d → %s | model=%s ctx=%s",
