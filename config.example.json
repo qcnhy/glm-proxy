@@ -1,5 +1,7 @@
 {
   "_comment": "复制本文件为 config.json 并填入真实密钥。config.json 不会被提交到 git。",
+  "responses_use_completions": true,
+  "_comment_responses": "Responses API 路由：true=Completions端点(主路径,codex-relay), false=Messages端点(备用,ccproxy-api)",
   "feishu_webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/YOUR_WEBHOOK_ID",
   "upstreams": [
     {

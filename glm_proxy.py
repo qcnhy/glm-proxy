@@ -39,10 +39,10 @@ LISTEN = ("0.0.0.0", 9999)
 REQUEST_TIMEOUT = 300
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 
-# Responses API 路由路径：
-#   True  → codex-relay（Responses→Chat Completions，OpenAI 原生）
-#   False → ccproxy-api（Responses→Anthropic Messages）
-RESPONSES_USE_COMPLETIONS = True
+# Responses API 路由路径（config.json 的 responses_use_completions 控制）：
+#   True  → codex-relay（Responses→Chat Completions，主路径）
+#   False → ccproxy-api（Responses→Anthropic Messages，备用路径）
+RESPONSES_USE_COMPLETIONS = _cfg.get("responses_use_completions", True)
 
 FEISHU_WEBHOOK = _cfg.get("feishu_webhook", "")
 
