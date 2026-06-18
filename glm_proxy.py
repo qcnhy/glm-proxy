@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.8.1 — codex-relay + Python 路由层
+GLM API 代理 v2.8.2 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -1131,11 +1131,12 @@ class Handler(BaseHTTPRequestHandler):
             if is_responses and not RESPONSES_USE_COMPLETIONS and "anthropic_url" in up and HAS_CCPROXY:
                 # Responses API → Anthropic Messages 直连（ccproxy 路径）
                 url = up["anthropic_url"].rstrip("/")
+                mkey = up.get("messages_key", up["key"])
                 auth = up.get("anthropic_auth", "x-api-key")
                 if auth == "bearer":
-                    auth_header = {"Authorization": f"Bearer {up['key']}"}
+                    auth_header = {"Authorization": f"Bearer {mkey}"}
                 else:
-                    auth_header = {"x-api-key": up["key"], "anthropic-version": "2023-06-01"}
+                    auth_header = {"x-api-key": mkey, "anthropic-version": "2023-06-01"}
                 up_headers = {
                     "Content-Type": "application/json",
                     "Connection": "close",
@@ -1152,11 +1153,12 @@ class Handler(BaseHTTPRequestHandler):
             elif is_messages and "anthropic_url" in up:
                 # Messages API → Anthropic 端点
                 url = up["anthropic_url"].rstrip("/")
+                mkey = up.get("messages_key", up["key"])
                 auth = up.get("anthropic_auth", "x-api-key")
                 if auth == "bearer":
-                    auth_header = {"Authorization": f"Bearer {up['key']}"}
+                    auth_header = {"Authorization": f"Bearer {mkey}"}
                 else:
-                    auth_header = {"x-api-key": up["key"], "anthropic-version": "2023-06-01"}
+                    auth_header = {"x-api-key": mkey, "anthropic-version": "2023-06-01"}
                 up_headers = {
                     "Content-Type": "application/json",
                     "Connection": "close",
@@ -2091,7 +2093,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.8.1 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.8.2 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         log.info("  %s: relay :%d → interceptor :%d → %s | model=%s ctx=%s",

@@ -13,12 +13,13 @@
       "max_context_tokens": 202745
     },
     {
-      "_comment": "中转站：第三方 GLM 中转，支持 Anthropic Messages。",
+      "_comment": "中转站：第三方 GLM 中转，支持 Anthropic Messages。OpenAI 和 Claude 端点用不同 key 区分。",
       "name": "external",
       "openai_url": "https://your-relay/v1",
       "anthropic_url": "https://your-relay/v1/messages",
       "anthropic_auth": "bearer",
-      "key": "YOUR_EXTERNAL_KEY",
+      "key": "YOUR_OPENAI_KEY",
+      "messages_key": "YOUR_CLAUDE_KEY",
       "relay_port": 4445,
       "interceptor_port": 14445,
       "model": "glm-5.2",
