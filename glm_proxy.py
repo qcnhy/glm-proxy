@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.8.3 — codex-relay + Python 路由层
+GLM API 代理 v2.9.0 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -307,6 +307,8 @@ class InterceptorHandler(BaseHTTPRequestHandler):
 
 def _start_interceptors():
     for up in UPSTREAMS:
+        if "interceptor_port" not in up:
+            continue  # 仅 Messages 的渠道不需要拦截器
         handler = type("InterceptorHandler_%s" % up["name"],
                        (InterceptorHandler,),
                        {"upstream_config": up})
@@ -391,6 +393,8 @@ def _start_relays():
         log.error("Or set CODEX_RELAY_BIN=/path/to/codex-relay")
         sys.exit(1)
     for up in UPSTREAMS:
+        if "relay_port" not in up:
+            continue  # 仅 Messages 的渠道（如 external-claude）不需要 codex-relay
         env = os.environ.copy()
         env["CODEX_RELAY_API_KEY"] = up["key"]
         # codex-relay → interceptor → 真实上游
@@ -524,6 +528,9 @@ def _append_tool_result(messages, output_item):
 _APPLY_PATCH_RULES = (
     "\n\nSTOP! Your previous apply_patch calls were ALL WRONG (empty {} or invalid format). "
     "IGNORE all previous attempts. Follow ONLY the rules below:\n"
+    "MANDATORY: You MUST use apply_patch for ALL file operations — creating, editing, "
+    "or deleting files. Do NOT use shell commands (echo, sed, powershell Set-Content, etc.) "
+    "to write or modify files. apply_patch is the ONLY correct way to change files.\n\n"
     "CRITICAL RULES for patch format:\n"
     "1. In *** Update File sections, EVERY content line MUST start with one of:\n"
     "   - space ( ) = context line (unchanged, shown for reference)\n"
@@ -1096,42 +1103,39 @@ class Handler(BaseHTTPRequestHandler):
         # 4) 遍历上游，自动回退 + 空输出截断重试
         last_err = None
 
-        # 客户端通过 API key 指定上游：发 "2" 走 external，发 "3" 走 official
+        # 客户端发特定 key（"3"）强制走 official
         client_key = self.headers.get("Authorization", "").replace("Bearer ", "").strip()
-        key_upstream = {"2": "external", "3": "official"}.get(client_key, "")
+        force_official = (client_key == "3")
 
         hour = datetime.now().hour
         weekday = datetime.now().weekday()  # 0=Mon, 6=Sun
         is_worktime = weekday < 5 and 9 <= hour < 18  # 工作日 9:00-18:00
 
+        # 确定本次请求需要的能力
+        needs_completions = is_responses and RESPONSES_USE_COMPLETIONS
+        needs_messages = is_messages or (is_responses and not RESPONSES_USE_COMPLETIONS)
+
         for up in UPSTREAMS:
             if up.get("disabled"):
                 continue
-            if up["name"] == "internal" and not internal_alive:
+            if force_official and up["name"] != "official":
                 continue
-            # 客户端指定上游时，只走指定的
-            if key_upstream:
-                if up["name"] != key_upstream:
-                    continue
-            else:
-                # 未指定：优先 external，不可用时走 official
-                if up["name"] == "official" and is_worktime:
-                    # 工作时间跳过 official（除非 external 不可用）
-                    external_available = any(
-                        u["name"] == "external" and not u.get("disabled")
-                        for u in UPSTREAMS
-                    )
-                    if external_available:
-                        continue
-                if up["name"] == "external" and not is_worktime:
-                    pass  # 临时允许非工作时间使用 external
+            if up.get("require_health") and not internal_alive:
+                continue
+            if up.get("worktime_only") and not is_worktime:
+                continue
+            # 能力检查：渠道必须支持本次请求需要的端点类型
+            if needs_completions and "openai_url" not in up:
+                continue
+            if needs_messages and "anthropic_url" not in up:
+                continue
 
             # 构建目标 URL 和请求头（每个上游只需一次）
             is_responses_converted = False
             if is_responses and not RESPONSES_USE_COMPLETIONS and "anthropic_url" in up and HAS_CCPROXY:
                 # Responses API → Anthropic Messages 直连（ccproxy 路径）
                 url = up["anthropic_url"].rstrip("/")
-                mkey = up["messages_key"]  # 必需：key 不支持 messages 端点，不能复用
+                mkey = up["key"]  # 统一用渠道 key（external-claude 拆分后单一 key）
                 auth = up.get("anthropic_auth", "x-api-key")
                 if auth == "bearer":
                     auth_header = {"Authorization": f"Bearer {mkey}"}
@@ -1153,7 +1157,7 @@ class Handler(BaseHTTPRequestHandler):
             elif is_messages and "anthropic_url" in up:
                 # Messages API → Anthropic 端点
                 url = up["anthropic_url"].rstrip("/")
-                mkey = up["messages_key"]  # 必需：key 不支持 messages 端点，不能复用
+                mkey = up["key"]  # 统一用渠道 key（external-claude 拆分后单一 key）
                 auth = up.get("anthropic_auth", "x-api-key")
                 if auth == "bearer":
                     auth_header = {"Authorization": f"Bearer {mkey}"}
@@ -2093,11 +2097,15 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.8.3 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.0 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
-        log.info("  %s: relay :%d → interceptor :%d → %s | model=%s ctx=%s",
-                 up["name"], up["relay_port"], up["interceptor_port"], up["openai_url"], up["model"], ctx)
+        if "relay_port" in up:
+            log.info("  %s: relay :%d → interceptor :%d → %s | model=%s ctx=%s",
+                     up["name"], up["relay_port"], up["interceptor_port"], up["openai_url"], up["model"], ctx)
+        else:
+            log.info("  %s: messages → %s | model=%s ctx=%s",
+                     up["name"], up.get("anthropic_url", "?"), up["model"], ctx)
 
     # 启动拦截器（必须在 codex-relay 之前）
     _start_interceptors()
