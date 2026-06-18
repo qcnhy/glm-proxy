@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.0 — codex-relay + Python 路由层
+GLM API 代理 v2.9.1 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -419,7 +419,7 @@ def _stop_relays():
                 pass
 
 
-# ── 上下文截断（上游空输出时从尾部删除消息重试）──
+# ── think 标签清理 ──
 def _strip_think_tags(text):
     """剥离推理标签"""
     import re
@@ -436,23 +436,21 @@ def _strip_think_tags(text):
 
 
 
-def _strip_images(body):
-    """剥离 input 中所有 input_image，返回剥离数量"""
-    stripped = 0
+def _request_has_images(body):
+    """检测 Responses 请求是否包含图片（input_image）"""
     input_items = body.get("input", [])
     if not isinstance(input_items, list):
-        return 0  # input 是字符串时无需处理
+        return False
     for item in input_items:
+        if not isinstance(item, dict):
+            continue
         for field in ("content", "output"):
             content = item.get(field)
             if isinstance(content, list):
-                before = len(content)
-                new_content = [c for c in content if c.get("type") != "input_image"]
-                item[field] = new_content
-                stripped += before - len(new_content)
-                if not new_content and field == "output":
-                    item["output"] = "[image removed]"
-    return stripped
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "input_image":
+                        return True
+    return False
 
 # ── Responses API → Messages API 请求转换 ──────────────────────────
 
@@ -570,6 +568,104 @@ _APPLY_PATCH_RULES = (
 def _make_apply_patch_tool_description(original_desc):
     """给 apply_patch 工具描述追加 patch 格式规则"""
     return (original_desc or "") + _APPLY_PATCH_RULES
+
+
+def _convert_responses_to_messages(body):
+    """将 OpenAI Responses API 请求转换为 Anthropic Messages API 请求。
+    ccproxy-api 的转换器不处理 function_call/function_call_output/custom_tool_call，
+    所以这里自己实现完整的转换（用于 Messages 路径）。"""
+    messages = []
+    system_parts = []
+
+    # 提取 system prompt
+    instructions = body.get("instructions")
+    if isinstance(instructions, str) and instructions:
+        system_parts.append(instructions)
+
+    # 转换 input 数组
+    input_items = body.get("input", [])
+    if isinstance(input_items, str):
+        messages.append({"role": "user", "content": input_items})
+    elif isinstance(input_items, list):
+        for item in input_items:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type", "")
+            if item_type == "message":
+                role = item.get("role", "user")
+                content = item.get("content", [])
+                text = _extract_text_from_content(content)
+                if role in ("system", "developer"):
+                    if text:
+                        system_parts.append(text)
+                elif role in ("user", "assistant"):
+                    messages.append({"role": role, "content": text})
+            elif item_type == "function_call":
+                _append_tool_use(messages, item)
+            elif item_type == "function_call_output":
+                _append_tool_result(messages, item)
+            elif item_type == "custom_tool_call":
+                # custom_tool_call → function_call（apply_patch 等）
+                _append_tool_use(messages, {**item, "type": "function_call",
+                                            "arguments": item.get("input", "")})
+            elif item_type == "custom_tool_call_output":
+                # custom_tool_call_output → function_call_output
+                _append_tool_result(messages, item)
+
+    # 构建输出
+    result = {"model": body.get("model", "glm-5")}
+    if system_parts:
+        result["system"] = "\n\n".join(system_parts)
+    result["messages"] = messages
+
+    # 转换 tools
+    tools_out = []
+    for tool in body.get("tools", []):
+        if not isinstance(tool, dict):
+            continue
+        t = tool.get("type", "")
+        if t == "function":
+            tools_out.append({
+                "type": "custom",
+                "name": tool.get("name", ""),
+                "input_schema": tool.get("parameters", tool.get("input_schema", {})),
+            })
+        elif t == "custom":
+            # apply_patch 等 custom/grammar 工具 → 转 function 让 GLM 能调用
+            tools_out.append({
+                "type": "custom",
+                "name": tool.get("name", ""),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "patch": {"type": "string",
+                                  "description": _make_apply_patch_tool_description(tool.get("description", ""))},
+                    },
+                    "required": ["patch"],
+                },
+            })
+        elif t == "namespace":
+            # 展平 namespace 子工具
+            ns_name = tool.get("name", "")
+            for sub in tool.get("tools", []):
+                sub_name = sub.get("name", "")
+                tools_out.append({
+                    "type": "custom",
+                    "name": f"{ns_name}.{sub_name}" if ns_name else sub_name,
+                    "input_schema": sub.get("parameters", sub.get("input_schema", {})),
+                })
+    if tools_out:
+        result["tools"] = tools_out
+
+    # 字段映射
+    max_tokens = body.get("max_output_tokens")
+    result["max_tokens"] = max_tokens if max_tokens else 16384
+    if body.get("stream"):
+        result["stream"] = True
+    if body.get("temperature") is not None:
+        result["temperature"] = body["temperature"]
+
+    return result
 
 
 def _convert_custom_tools_for_completions(body):
@@ -764,75 +860,6 @@ def _convert_messages_error_to_responses(err_body):
     return fix_map
 
 
-def _truncate_input(body, max_remove=1):
-    """从 input/messages 尾部按"回合"删除消息，保持消息序列合法。
-    一个回合 = 连续的 assistant + 后续 user（可能含 tool_result）。
-    对于 Responses API (input)，按 function_call/function_call_output 对删除。
-    不会删除前两条消息（保留上下文起始）。"""
-    key = "input" if "input" in body else "messages"
-    items = body.get(key)
-    if not items or len(items) <= 2:
-        return 0
-
-    removed = 0
-
-    # Responses API 格式：input 中是 flat 列表
-    if key == "input":
-        for i in range(len(items) - 1, -1, -1):
-            if removed >= max_remove:
-                break
-            item = items[i]
-            t = item.get("type", "")
-            if t in ("function_call", "function_call_output"):
-                items.pop(i)
-                removed += 1
-        for i in range(len(items) - 1, -1, -1):
-            if removed >= max_remove:
-                break
-            item = items[i]
-            if item.get("role") == "assistant" or item.get("type") == "message":
-                items.pop(i)
-                removed += 1
-        for i in range(len(items) - 1, 1, -1):
-            if removed >= max_remove:
-                break
-            item = items[i]
-            if item.get("role") == "user":
-                items.pop(i)
-                removed += 1
-        return removed
-
-    # Messages API (Anthropic) 格式：按回合删除，保持 user/assistant 交替
-    while removed < max_remove and len(items) > 2:
-        if len(items) < 2:
-            break
-        last = items[-1]
-        role = last.get("role", "")
-        # system 消息（Claude 注入的提醒）直接删除，不计入回合
-        if role == "system":
-            items.pop()
-            continue
-        # user 消息：删除后看是否跟着 assistant
-        if role == "user":
-            items.pop()
-            removed += 1
-            # 如果前一条是 assistant，也一起删
-            if items and items[-1].get("role") == "assistant":
-                items.pop()
-                removed += 1
-        elif role == "assistant":
-            items.pop()
-            removed += 1
-            # 如果前一条是 user，也一起删（保持交替）
-            if items and items[-1].get("role") == "user" and len(items) > 2:
-                items.pop()
-                removed += 1
-        else:
-            # 未知 role，直接删掉继续
-            items.pop()
-            continue
-
-    return removed
 
 # ── apply_patch 转换 ──────────────────────────────────
 def _parse_patch_to_operation(patch_text):
@@ -1100,8 +1127,9 @@ class Handler(BaseHTTPRequestHandler):
         else:
             log.info(">>> [%s] %s %s", client_ip, method, self.path)
 
-        # 4) 遍历上游，自动回退 + 空输出截断重试
+        # 4) 遍历上游，自动回退（不截断——客户端会自动压缩，错误都是实际错误）
         last_err = None
+        body_saved = False  # 调试body只保存一次（首次失败时）
 
         # 客户端发特定 key（"3"）强制走 official
         client_key = self.headers.get("Authorization", "").replace("Bearer ", "").strip()
@@ -1111,9 +1139,15 @@ class Handler(BaseHTTPRequestHandler):
         weekday = datetime.now().weekday()  # 0=Mon, 6=Sun
         is_worktime = weekday < 5 and 9 <= hour < 18  # 工作日 9:00-18:00
 
+        # 检测图片：有图片强制走 Messages（Completions 不支持图片，Messages 支持）
+        has_images = is_responses and isinstance(body, dict) and _request_has_images(body)
+        use_completions = RESPONSES_USE_COMPLETIONS and not has_images
+        if has_images:
+            log.info("    [image] 含图片 → 走 Messages 路径")
+
         # 确定本次请求需要的能力
-        needs_completions = is_responses and RESPONSES_USE_COMPLETIONS
-        needs_messages = is_messages or (is_responses and not RESPONSES_USE_COMPLETIONS)
+        needs_completions = is_responses and use_completions
+        needs_messages = is_messages or (is_responses and not use_completions)
 
         for up in UPSTREAMS:
             if up.get("disabled"):
@@ -1132,7 +1166,7 @@ class Handler(BaseHTTPRequestHandler):
 
             # 构建目标 URL 和请求头（每个上游只需一次）
             is_responses_converted = False
-            if is_responses and not RESPONSES_USE_COMPLETIONS and "anthropic_url" in up and HAS_CCPROXY:
+            if is_responses and not use_completions and "anthropic_url" in up and HAS_CCPROXY:
                 # Responses API → Anthropic Messages 直连（ccproxy 路径）
                 url = up["anthropic_url"].rstrip("/")
                 mkey = up["key"]  # 统一用渠道 key（external-claude 拆分后单一 key）
@@ -1192,246 +1226,155 @@ class Handler(BaseHTTPRequestHandler):
                 if fixed:
                     log.info("    fixed %d tool_use inputs (list→dict)", fixed)
 
-            # 剥离图片（Completions 路径：lai.lerwee Chat Completions 不支持图片）
-            if body and is_responses:
-                s = _strip_images(body)
-                if s > 0:
-                    log.info("    stripped %d images", s)
 
-            # 保存原始请求体副本（用于调试）
-            original_body_saved = False
-
-            # 截断重试循环（指数退避：1, 2, 4, 8...）
-            truncated = 0
-            # 保存原始 Responses body（转换路径截断时需要重新转换）
-            original_responses_body = body if is_responses_converted else None
-            for retry in range(15):
-                # 生成 payload（截断后需重新生成）
-                payload = None
-                if body is not None:
-                    body["model"] = up["model"]
-                    if is_responses and body.get("previous_response_id"):
-                        pid_len = len(json.dumps(body, ensure_ascii=False))
-                        if pid_len > 200000:
-                            log.warning("    payload %dKB, stripping previous_response_id", pid_len // 1024)
-                            del body["previous_response_id"]
-                    # Responses→Messages 转换
-                    if is_responses_converted:
-                        converted = _convert_responses_to_messages(body)
-                        converted["model"] = up.get("messages_model", up["model"])
-                        payload = json.dumps(converted).encode()
-                        if retry == 0:
-                            log.info("    [converted] %d msgs, %d tools, %dKB, max_tokens=%d (client max_output=%s)",
-                                     len(converted.get("messages", [])),
-                                     len(converted.get("tools", [])),
-                                     len(payload) // 1024,
-                                     converted.get("max_tokens", 0),
-                                     body.get("max_output_tokens"))
-                    else:
-                        # codex-relay 路径：转换 custom 工具（apply_patch 等）为 function 格式
-                        _convert_custom_tools_for_completions(body)
-                        payload = json.dumps(body).encode()
-                    if "Content-Type" not in up_headers and payload is not None:
-                        up_headers["Content-Type"] = "application/json"
-
-                if retry == 0:
-                    log.info("    -> %s", up["name"])
+            # 生成 payload（每个 upstream 只尝试一次，不截断重试——客户端会自动压缩）
+            payload = None
+            if body is not None:
+                body["model"] = up["model"]
+                if is_responses and body.get("previous_response_id"):
+                    pid_len = len(json.dumps(body, ensure_ascii=False))
+                    if pid_len > 200000:
+                        log.warning("    payload %dKB, stripping previous_response_id", pid_len // 1024)
+                        del body["previous_response_id"]
+                if is_responses_converted:
+                    converted = _convert_responses_to_messages(body)
+                    converted["model"] = up.get("messages_model", up["model"])
+                    payload = json.dumps(converted).encode()
+                    log.info("    [converted] %d msgs, %d tools, %dKB, max_tokens=%d (client max_output=%s)",
+                             len(converted.get("messages", [])),
+                             len(converted.get("tools", [])),
+                             len(payload) // 1024,
+                             converted.get("max_tokens", 0),
+                             body.get("max_output_tokens"))
                 else:
-                    key = "input" if "input" in body else "messages"
-                    count = len(body.get(key, []))
-                    log.info("    -> %s retry=%d (%d %s remaining, %dKB)",
-                             up["name"], retry, count, key, len(payload) // 1024)
+                    # codex-relay 路径：转换 custom 工具（apply_patch 等）为 function 格式
+                    _convert_custom_tools_for_completions(body)
+                    payload = json.dumps(body).encode()
+                if "Content-Type" not in up_headers and payload is not None:
+                    up_headers["Content-Type"] = "application/json"
 
-                try:
-                    # 官方 API 限速
-                    if up["name"] == "official":
-                        _official_limiter.acquire()
-                    req = Request(url, data=payload, headers=up_headers, method=method)
-                    resp = urlopen(req, timeout=REQUEST_TIMEOUT)
+            log.info("    -> %s", up["name"])
 
-                    if is_stream:
-                        if is_responses_converted:
-                            # Responses→Messages 转换路径的流式处理
-                            events, has_output = self._converted_stream(resp, up["name"])
-                            if not has_output and body:
-                                truncated += 1
-                                if not original_body_saved:
-                                    self._save_debug_body(body)
-                                    original_body_saved = True
-                                key = "input"
-                                count = len(body.get(key, []))
-                                if truncated <= 3:
-                                    remove_n = min(2 ** (truncated - 1), 64)
-                                else:
-                                    remove_n = max(count // 2, 64)
-                                removed = _truncate_input(body, max_remove=remove_n)
-                                if removed > 0:
-                                    log.warning("    !!! [converted] empty output, truncated %d/%d items", removed, count)
-                                    continue
-                            if has_output:
-                                return
-                            break
-                        elif is_responses:
-                            events, has_output, stream_error = self._relay_stream(resp, up["name"])
-                            # 上游返回 response.failed → 直接转发错误，不截断重试
-                            if stream_error:
-                                log.warning("    !!! %s upstream error, forwarding to client: %s",
-                                            up["name"], stream_error)
-                                # 重新发送已经缓冲的 SSE（包含 response.failed）
-                                return
-                            if not has_output and body:
-                                truncated += 1
-                                if not original_body_saved:
-                                    self._save_debug_body(body)
-                                    original_body_saved = True
-                                key = "input" if "input" in body else "messages"
-                                count = len(body.get(key, []))
-                                if truncated <= 3:
-                                    remove_n = min(2 ** (truncated - 1), 64)
-                                else:
-                                    remove_n = max(count // 2, 64)
-                                removed = _truncate_input(body, max_remove=remove_n)
-                                if removed > 0:
-                                    log.warning("    !!! empty output, truncated %d/%d items", removed, count)
-                                    continue
-                            if has_output:
-                                return
-                            break
-                        elif is_messages:
-                            has_output, usage, ctx_exceeded, stream_err = self._messages_stream(resp, up["name"])
-                            # 上下文超限 → 返回 400 触发客户端自动压缩
-                            if ctx_exceeded:
-                                self._send_context_exceeded(body, up)
-                                return
-                            # 流式 error（1234/1305）不截断，直接返回错误
-                            if stream_err and not has_output:
-                                log.warning("    !!! %s stream error with no output, not truncating", up["name"])
-                                break
-                            if not has_output and body:
-                                truncated += 1
-                                if not original_body_saved:
-                                    self._save_debug_body(body)
-                                    original_body_saved = True
-                                key = "messages"
-                                count = len(body.get(key, []))
-                                if truncated <= 3:
-                                    remove_n = min(2 ** (truncated - 1), 64)
-                                else:
-                                    remove_n = max(count // 2, 64)
-                                removed = _truncate_input(body, max_remove=remove_n)
-                                if removed > 0:
-                                    log.warning("    !!! empty output, truncated %d/%d items", removed, count)
-                                    continue
-                            if has_output:
-                                return
-                            break
-                        else:
-                            self._pipe_stream(resp, up["name"])
+            try:
+                # 官方 API 限速
+                if up["name"] == "official":
+                    _official_limiter.acquire()
+                req = Request(url, data=payload, headers=up_headers, method=method)
+                resp = urlopen(req, timeout=REQUEST_TIMEOUT)
+
+                if is_stream:
+                    if is_responses_converted:
+                        # Responses→Messages 转换路径的流式处理
+                        events, has_output = self._converted_stream(resp, up["name"])
+                        if has_output:
                             return
-                    else:
-                        result = resp.read()
-                        # Responses→Messages 转换路径：非流式响应转换
-                        if is_responses_converted:
-                            try:
-                                anthropic_resp = json.loads(result)
-                                # 检查是否是 Anthropic 错误响应
-                                if anthropic_resp.get("type") == "error":
-                                    result = _convert_messages_error_to_responses(result)
-                                    self._send_raw(resp.status, result, "application/json")
-                                    return
-                                # 用 ccproxy 转换
-                                msg_resp = MessageResponse(**anthropic_resp)
-                                openai_resp = convert__anthropic_message_to_openai_responses__response(msg_resp)
-                                result = json.dumps(openai_resp.model_dump(exclude_none=True, mode='json'),
-                                                    ensure_ascii=False).encode()
-                                output = openai_resp.output if hasattr(openai_resp, 'output') else []
-                                if not output:
-                                    truncated += 1
-                                    if not original_body_saved:
-                                        self._save_debug_body(body)
-                                        original_body_saved = True
-                                    count = len(body.get("input", []))
-                                    if truncated <= 3:
-                                        remove_n = min(2 ** (truncated - 1), 64)
-                                    else:
-                                        remove_n = max(count // 2, 64)
-                                    removed = _truncate_input(body, max_remove=remove_n)
-                                    if removed > 0:
-                                        log.warning("    !!! [converted] empty output, truncated %d/%d", removed, count)
-                                        continue
-                                log.info("    <<< %s [converted] OK", up["name"])
-                            except Exception as ce:
-                                log.error("    !!! [converted] response error: %s", ce)
-                            self._send_raw(200, result, "application/json")
+                    elif is_responses:
+                        events, has_output, stream_error = self._relay_stream(resp, up["name"])
+                        # 上游返回 response.failed → 直接转发错误
+                        if stream_error:
+                            log.warning("    !!! %s upstream error, forwarding to client: %s",
+                                        up["name"], stream_error)
                             return
-                        # 检测空输出
-                        empty = False
-                        try:
-                            r = json.loads(result)
-                            output = r.get("output", [])
-                            if is_responses and not output and body:
-                                empty = True
-                            # 记录上游 token 用量
-                            usage = r.get("usage", {})
-                            if usage:
-                                inp = usage.get("input_tokens", 0)
-                                out = usage.get("output_tokens", 0)
-                                log.info("    usage: input=%d output=%d total=%d",
-                                         inp, out, inp + out)
-                        except Exception:
-                            pass
-                        if empty:
-                            removed = _truncate_input(body)
-                            if removed > 0:
-                                log.warning("    !!! empty output, truncated %d items", removed)
-                                continue  # 重试同一上游
-                            break  # 截断无效
-                        try:
-                            self._send_raw(resp.status, result,
-                                           resp.headers.get("Content-Type", "application/json"))
-                        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
-                            log.warning("client disconnected during response")
+                        if has_output:
                             return
-                    log.info("    <<< %s OK", up["name"])
-                    return
-                except HTTPError as e:
-                    err_body = e.read()
-                    last_err = (e.code, err_body)
-                    log.error("    !!! %s %d: %s", up["name"], e.code, err_body[:200].decode(errors="replace"))
-                    # 502/500 可能是上下文超限，检测并返回标准错误触发客户端压缩
-                    if e.code in (500, 502) and body and (is_responses or is_messages):
-                        max_ctx = up.get("max_context_tokens", 200000)
-                        payload_bytes = len(json.dumps(body).encode())
-                        est_tokens = payload_bytes / 3.5
-                        if est_tokens > max_ctx * 0.9:
+                    elif is_messages:
+                        has_output, usage, ctx_exceeded, stream_err = self._messages_stream(resp, up["name"])
+                        # 上下文超限 → 返回 400 触发客户端自动压缩
+                        if ctx_exceeded:
                             self._send_context_exceeded(body, up)
                             return
-                        # 不是上下文超限，尝试截断重试兜底
-                        truncated += 1
-                        if not original_body_saved:
+                        if has_output:
+                            return
+                    else:
+                        self._pipe_stream(resp, up["name"])
+                        return
+                    # 空输出：不截断，尝试下一个上游
+                    if not body_saved:
+                        self._save_debug_body(body)
+                        body_saved = True
+                    log.warning("    !!! %s empty output, trying next upstream", up["name"])
+                    continue
+                else:
+                    result = resp.read()
+                    # Responses→Messages 转换路径：非流式响应转换
+                    if is_responses_converted:
+                        try:
+                            anthropic_resp = json.loads(result)
+                            # 检查是否是 Anthropic 错误响应
+                            if anthropic_resp.get("type") == "error":
+                                result = _convert_messages_error_to_responses(result)
+                                self._send_raw(resp.status, result, "application/json")
+                                return
+                            # 用 ccproxy 转换
+                            msg_resp = MessageResponse(**anthropic_resp)
+                            openai_resp = convert__anthropic_message_to_openai_responses__response(msg_resp)
+                            result = json.dumps(openai_resp.model_dump(exclude_none=True, mode='json'),
+                                                ensure_ascii=False).encode()
+                            output = openai_resp.output if hasattr(openai_resp, 'output') else []
+                            if not output:
+                                if not body_saved:
+                                    self._save_debug_body(body)
+                                    body_saved = True
+                                log.warning("    !!! %s empty output, trying next upstream", up["name"])
+                                continue
+                            log.info("    <<< %s [converted] OK", up["name"])
+                        except Exception as ce:
+                            log.error("    !!! [converted] response error: %s", ce)
+                        self._send_raw(200, result, "application/json")
+                        return
+                    # 检测空输出
+                    empty = False
+                    try:
+                        r = json.loads(result)
+                        output = r.get("output", [])
+                        if is_responses and not output and body:
+                            empty = True
+                        # 记录上游 token 用量
+                        usage = r.get("usage", {})
+                        if usage:
+                            inp = usage.get("input_tokens", 0)
+                            out = usage.get("output_tokens", 0)
+                            log.info("    usage: input=%d output=%d total=%d",
+                                     inp, out, inp + out)
+                    except Exception:
+                        pass
+                    if empty:
+                        if not body_saved:
                             self._save_debug_body(body)
-                            original_body_saved = True
-                        key = "input" if "input" in body else "messages"
-                        count = len(body.get(key, []))
-                        if truncated <= 3:
-                            remove_n = min(2 ** (truncated - 1), 64)
-                        else:
-                            remove_n = max(count // 2, 64)
-                        removed = _truncate_input(body, max_remove=remove_n)
-                        if removed > 0:
-                            log.warning("    !!! HTTP %d, truncated %d/%d items, retrying...", e.code, removed, count)
-                            continue
-                    break
-                except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as e:
-                    log.error("    !!! %s connection reset: %s", up["name"], e)
-                    last_err = e
-                    break
-                except Exception as e:
-                    last_err = e
-                    log.error("    !!! %s error: %s", up["name"], e)
-                    break
+                            body_saved = True
+                        log.warning("    !!! %s empty output, trying next upstream", up["name"])
+                        continue  # 尝试下一个上游
+                    try:
+                        self._send_raw(resp.status, result,
+                                       resp.headers.get("Content-Type", "application/json"))
+                    except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                        log.warning("client disconnected during response")
+                        return
+                    log.info("    <<< %s OK", up["name"])
+                    return
+            except HTTPError as e:
+                err_body = e.read()
+                last_err = (e.code, err_body)
+                log.error("    !!! %s %d: %s", up["name"], e.code, err_body[:200].decode(errors="replace"))
+                # 502/500 可能是上下文超限，返回标准错误触发客户端压缩
+                if e.code in (500, 502) and body and (is_responses or is_messages):
+                    max_ctx = up.get("max_context_tokens", 200000)
+                    est_tokens = len(json.dumps(body).encode()) / 3.5
+                    if est_tokens > max_ctx * 0.9:
+                        self._send_context_exceeded(body, up)
+                        return
+                continue  # 尝试下一个上游（不截断重试）
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as e:
+                log.error("    !!! %s connection reset: %s", up["name"], e)
+                last_err = e
+                continue
+            except Exception as e:
+                last_err = e
+                log.error("    !!! %s error: %s", up["name"], e)
+                continue
 
-        if body and (is_responses or is_messages) and not original_body_saved:
+        # 所有上游都失败
+        if body and (is_responses or is_messages) and not body_saved:
             self._save_debug_body(body)
         self._send_last_error(last_err)
 
@@ -2097,7 +2040,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.0 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.1 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:

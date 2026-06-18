@@ -26,7 +26,7 @@
       "relay_port": 4445,
       "interceptor_port": 14445,
       "model": "glm-5.2",
-      "max_context_tokens": 202745,
+      "max_context_tokens": 1000000,
       "worktime_only": true
     },
     {
@@ -37,7 +37,7 @@
       "key": "YOUR_CLAUDE_KEY",
       "model": "glm-5.2",
       "messages_model": "glm-5.2",
-      "max_context_tokens": 202745,
+      "max_context_tokens": 1000000,
       "worktime_only": true
     },
     {
@@ -51,7 +51,7 @@
       "interceptor_port": 14446,
       "model": "glm-5.2",
       "messages_model": "glm-5.2",
-      "max_context_tokens": 202745
+      "max_context_tokens": 1000000
     }
   ]
 }
