@@ -26,12 +26,13 @@
       "max_context_tokens": 202745
     },
     {
-      "_comment": "智谱官方：原生 Anthropic Messages 端点。anthropic_auth=x-api-key。",
+      "_comment": "智谱官方：原生 Anthropic Messages 端点。官方一个 key 通吃两个端点，messages_key 填同值。",
       "name": "official",
       "openai_url": "https://open.bigmodel.cn/api/paas/v4",
       "anthropic_url": "https://open.bigmodel.cn/api/anthropic/v1/messages",
       "anthropic_auth": "x-api-key",
       "key": "YOUR_ZHIPU_API_KEY",
+      "messages_key": "YOUR_ZHIPU_API_KEY",
       "relay_port": 4446,
       "interceptor_port": 14446,
       "model": "glm-5.2",
