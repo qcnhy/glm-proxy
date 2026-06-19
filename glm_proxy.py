@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.1 — codex-relay + Python 路由层
+GLM API 代理 v2.9.2 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -90,6 +90,10 @@ class RateLimiter:
                 self.tokens -= 1
 
 _official_limiter = RateLimiter(rate=1.5, burst=2)  # 官方 API 限速
+
+# 请求序号（多会话日志关联用）
+import itertools
+_req_counter = itertools.count(1)
 
 # ── 飞书通知 ──────────────────────────────────────────
 def _send_feishu(msg):
@@ -1083,7 +1087,13 @@ class Handler(BaseHTTPRequestHandler):
             traceback.print_exc()
 
     # ── 统一路由 ─────────────────────────────────────
+    def _ms(self):
+        """本次请求耗时（毫秒）"""
+        return int((time.monotonic() - getattr(self, '_req_start', time.monotonic())) * 1000)
+
     def _route(self, method):
+        self._req_id = next(_req_counter)  # 请求序号（日志关联用）
+        self._req_start = time.monotonic()  # 请求开始时间（耗时统计用）
         # 0) 拦截错误的客户端配置（base URL 多了 /v1 导致路径重复）
         if self.path.startswith("/v1/v1/"):
             log.warning(">>> malformed path %s (double /v1), rejecting", self.path)
@@ -1121,11 +1131,11 @@ class Handler(BaseHTTPRequestHandler):
                      or self.headers.get("X-Real-IP", "")
                      or self.client_address[0])
         if is_responses:
-            log.info(">>> [%s] POST %s stream=%s tools=%d input=%d",
-                     client_ip, self.path, is_stream, len(body.get("tools", [])),
+            log.info("[#%d] >>> [%s] POST %s stream=%s tools=%d input=%d",
+                     self._req_id, client_ip, self.path, is_stream, len(body.get("tools", [])),
                      len(body.get("input", [])))
         else:
-            log.info(">>> [%s] %s %s", client_ip, method, self.path)
+            log.info("[#%d] >>> [%s] %s %s", self._req_id, client_ip, method, self.path)
 
         # 4) 遍历上游，自动回退（不截断——客户端会自动压缩，错误都是实际错误）
         last_err = None
@@ -1253,7 +1263,7 @@ class Handler(BaseHTTPRequestHandler):
                 if "Content-Type" not in up_headers and payload is not None:
                     up_headers["Content-Type"] = "application/json"
 
-            log.info("    -> %s", up["name"])
+            log.info("[#%d]     -> %s", self._req_id, up["name"])
 
             try:
                 # 官方 API 限速
@@ -1272,19 +1282,15 @@ class Handler(BaseHTTPRequestHandler):
                         events, has_output, stream_error = self._relay_stream(resp, up["name"])
                         # 上游返回 response.failed → 直接转发错误
                         if stream_error:
-                            log.warning("    !!! %s upstream error, forwarding to client: %s",
-                                        up["name"], stream_error)
+                            log.warning("[#%d]     !!! %s upstream error, forwarding to client: %s",
+                                        self._req_id, up["name"], stream_error)
                             return
                         if has_output:
                             return
                     elif is_messages:
-                        has_output, usage, ctx_exceeded, stream_err = self._messages_stream(resp, up["name"])
-                        # 上下文超限 → 返回 400 触发客户端自动压缩
-                        if ctx_exceeded:
-                            self._send_context_exceeded(body, up)
-                            return
-                        if has_output:
-                            return
+                        # 增量流式：已发送响应头并边收边发，直接返回（不再回退/不发400）
+                        self._messages_stream(resp, up["name"])
+                        return
                     else:
                         self._pipe_stream(resp, up["name"])
                         return
@@ -1292,7 +1298,7 @@ class Handler(BaseHTTPRequestHandler):
                     if not body_saved:
                         self._save_debug_body(body)
                         body_saved = True
-                    log.warning("    !!! %s empty output, trying next upstream", up["name"])
+                    log.warning("[#%d]     !!! %s empty output, trying next upstream", self._req_id, up["name"])
                     continue
                 else:
                     result = resp.read()
@@ -1315,11 +1321,11 @@ class Handler(BaseHTTPRequestHandler):
                                 if not body_saved:
                                     self._save_debug_body(body)
                                     body_saved = True
-                                log.warning("    !!! %s empty output, trying next upstream", up["name"])
+                                log.warning("[#%d]     !!! %s empty output, trying next upstream", self._req_id, up["name"])
                                 continue
-                            log.info("    <<< %s [converted] OK", up["name"])
+                            log.info("[#%d]     <<< %s [converted] OK (%dms)", self._req_id, up["name"], self._ms())
                         except Exception as ce:
-                            log.error("    !!! [converted] response error: %s", ce)
+                            log.error("[#%d]     !!! [converted] response error: %s", self._req_id, ce)
                         self._send_raw(200, result, "application/json")
                         return
                     # 检测空输出
@@ -1342,7 +1348,7 @@ class Handler(BaseHTTPRequestHandler):
                         if not body_saved:
                             self._save_debug_body(body)
                             body_saved = True
-                        log.warning("    !!! %s empty output, trying next upstream", up["name"])
+                        log.warning("[#%d]     !!! %s empty output, trying next upstream", self._req_id, up["name"])
                         continue  # 尝试下一个上游
                     try:
                         self._send_raw(resp.status, result,
@@ -1350,12 +1356,12 @@ class Handler(BaseHTTPRequestHandler):
                     except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
                         log.warning("client disconnected during response")
                         return
-                    log.info("    <<< %s OK", up["name"])
+                    log.info("[#%d]     <<< %s OK (%dms)", self._req_id, up["name"], self._ms())
                     return
             except HTTPError as e:
                 err_body = e.read()
                 last_err = (e.code, err_body)
-                log.error("    !!! %s %d: %s", up["name"], e.code, err_body[:200].decode(errors="replace"))
+                log.error("[#%d]     !!! %s %d: %s", self._req_id, up["name"], e.code, err_body[:200].decode(errors="replace"))
                 # 502/500 可能是上下文超限，返回标准错误触发客户端压缩
                 if e.code in (500, 502) and body and (is_responses or is_messages):
                     max_ctx = up.get("max_context_tokens", 200000)
@@ -1365,12 +1371,12 @@ class Handler(BaseHTTPRequestHandler):
                         return
                 continue  # 尝试下一个上游（不截断重试）
             except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as e:
-                log.error("    !!! %s connection reset: %s", up["name"], e)
+                log.error("[#%d]     !!! %s connection reset: %s", self._req_id, up["name"], e)
                 last_err = e
                 continue
             except Exception as e:
                 last_err = e
-                log.error("    !!! %s error: %s", up["name"], e)
+                log.error("[#%d]     !!! %s error: %s", self._req_id, up["name"], e)
                 continue
 
         # 所有上游都失败
@@ -1399,22 +1405,32 @@ class Handler(BaseHTTPRequestHandler):
                 total += len(chunk)
             self.close_connection = True
             size = f"{total // 1024}KB" if total >= 1024 else f"{total}B"
-            log.info("    <<< %s STREAM OK (%s)", upstream_name, size)
+            log.info("[#%d]     <<< %s STREAM OK (%s, %dms)", self._req_id, upstream_name, size, self._ms())
         except (ConnectionResetError, BrokenPipeError):
-            log.warning("    <<< %s STREAM interrupted", upstream_name)
+            log.warning("[#%d]     <<< %s STREAM interrupted", self._req_id, upstream_name)
 
     # ── Messages API 流式处理（缓冲 + 空输出检测 + usage）──
     def _messages_stream(self, resp, upstream_name):
-        """缓冲 Messages API SSE 流，检测空输出，提取 usage。
-        返回 (has_output, usage_dict, context_exceeded)"""
-        output_blocks = []
+        """增量流式转发 Messages API SSE（边收边发，避免客户端超时）。
+        遇 error 块就地合成正常结束。返回 (has_output, usage_dict, context_exceeded, stream_error)"""
         has_output = False
         context_exceeded = False
         stream_error = False
         last_usage = {}
-        block_count = 0
+        open_indices = []
         total_bytes = 0
+        block_count = 0
+        size = 0
         try:
+            # 立即发送响应头，开始增量流式（避免客户端长时间等数据超时断开）
+            self.send_response(200)
+            for h in ["Content-Type", "Cache-Control"]:
+                v = resp.headers.get(h)
+                if v:
+                    self.send_header(h, v)
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
             buf = b""
             while True:
                 chunk = resp.read(4096)
@@ -1435,129 +1451,72 @@ class Handler(BaseHTTPRequestHandler):
                     if b"event: error" in block:
                         try:
                             text = block.decode("utf-8", errors="replace")
+                            err_code, err_msg, data_raw = None, None, None
                             for line in text.split("\n"):
                                 if line.startswith("data: "):
-                                    p = json.loads(line[6:])
-                                    err = p.get("error", {})
-                                    log.warning("[messages] %s stream error: %s %s",
-                                                upstream_name, err.get("code"),
-                                                err.get("message", "")[:100])
-                        except Exception:
-                            pass
+                                    data_raw = line[6:]
+                                    p = json.loads(data_raw)
+                                    err = p.get("error", p)  # 兼容 {error:{}} 和顶层
+                                    err_code = err.get("code") if isinstance(err, dict) else None
+                                    err_msg = err.get("message", "") if isinstance(err, dict) else str(err)
+                            log.warning("[#%d] [messages] %s stream error: code=%s msg=%s | has_output=%s bytes=%d",
+                                        self._req_id, upstream_name, err_code, (err_msg or "")[:150],
+                                        has_output, total_bytes)
+                            log.warning("[#%d] [messages] raw error block: %s",
+                                        self._req_id, repr(text[:500]))
+                        except Exception as pe:
+                            log.warning("[#%d] [messages] %s stream error (parse failed: %s), raw: %s",
+                                        self._req_id, upstream_name, pe,
+                                        repr(block.decode("utf-8", errors="replace")[:500]))
                         stream_error = True
-                        continue  # 跳过 error block，不加入 output_blocks
+                        # 就地合成正常结束（关闭未关闭的 content_block）
+                        for idx in open_indices:
+                            self.wfile.write(("event: content_block_stop\ndata: {\"type\": \"content_block_stop\", \"index\": " + str(idx) + "}\n\n").encode())
+                        self.wfile.write(b'event: message_delta\ndata: {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 0}}\n\nevent: message_stop\ndata: {"type": "message_stop"}\n\n')
+                        self.wfile.flush()
+                        log.info("[#%d] [messages] %s stream error intercepted, synthesized end (closed %d blocks)", self._req_id, upstream_name, len(open_indices))
+                        break  # 错误后结束流
 
-                    output_blocks.append(block + b"\n\n")
-                    # 检测有内容输出
+                    # 增量转发该块
+                    out = block + b"\n\n"
+                    self.wfile.write(out); self.wfile.flush()
+                    size += len(out)
                     if b"content_block_delta" in block:
                         has_output = True
-                    # 提取 usage 和 stop_reason（message_delta 事件）
-                    if b"message_delta" in block:
+                    if b'"content_block_start"' in block:
                         try:
-                            text = block.decode("utf-8", errors="replace")
-                            for line in text.split("\n"):
+                            for line in block.decode("utf-8", errors="replace").split("\n"):
+                                if line.startswith("data: "):
+                                    open_indices.append(json.loads(line[6:]).get("index", 0))
+                        except: pass
+                    elif b'"content_block_stop"' in block:
+                        try:
+                            for line in block.decode("utf-8", errors="replace").split("\n"):
+                                if line.startswith("data: "):
+                                    idx = json.loads(line[6:]).get("index", -1)
+                                    if idx in open_indices: open_indices.remove(idx)
+                        except: pass
+                    elif b"message_delta" in block:
+                        try:
+                            for line in block.decode("utf-8", errors="replace").split("\n"):
                                 if line.startswith("data: "):
                                     p = json.loads(line[6:])
-                                    u = p.get("usage")
-                                    if u:
-                                        last_usage = u
-                                    # 检测上下文超限
-                                    sr = p.get("delta", {}).get("stop_reason", "")
-                                    if sr == "model_context_window_exceeded":
+                                    if p.get("usage"): last_usage = p["usage"]
+                                    if p.get("delta", {}).get("stop_reason") == "model_context_window_exceeded":
                                         context_exceeded = True
-                        except Exception:
-                            pass
-            if buf.strip():
-                buf = buf.replace(b"\r\n", b"\n")
-                block_count += 1
-                # 残余数据也可能是 error
-                if b"event: error" in buf:
-                    stream_error = True
-                else:
-                    output_blocks.append(buf)
-                    if b"content_block_delta" in buf:
-                        has_output = True
-
-            # 流被 error 中断但已有输出 → 合成正常结束
-            if stream_error and has_output:
-                # 计算未关闭的 content_block index
-                open_indices = []
-                for block in output_blocks:
-                    text = block.decode("utf-8", errors="replace")
-                    if '"content_block_start"' in text:
-                        try:
-                            for line in text.split("\n"):
-                                if line.startswith("data: "):
-                                    p = json.loads(line[6:])
-                                    open_indices.append(p.get("index", 0))
-                        except:
-                            pass
-                    elif '"content_block_stop"' in text:
-                        try:
-                            for line in text.split("\n"):
-                                if line.startswith("data: "):
-                                    p = json.loads(line[6:])
-                                    idx = p.get("index", -1)
-                                    if idx in open_indices:
-                                        open_indices.remove(idx)
-                        except:
-                            pass
-                # 合成关闭事件
-                synthetic = b""
-                for idx in open_indices:
-                    synthetic += (
-                        f"event: content_block_stop\ndata: {{\"type\": \"content_block_stop\", \"index\": {idx}}}\n\n"
-                    ).encode()
-                synthetic += (
-                    b"event: message_delta\n"
-                    b'data: {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 0}}\n\n'
-                    b"event: message_stop\n"
-                    b'data: {"type": "message_stop"}\n\n'
-                )
-                output_blocks.append(synthetic)
-                log.info("[messages] %s stream error intercepted, synthesized normal end (closed %d blocks)",
-                         upstream_name, len(open_indices))
-
-            if not has_output:
-                if context_exceeded:
-                    log.warning("[messages] %s context_exceeded — forwarding to client for auto-compress",
-                                upstream_name)
-                else:
-                    log.warning("[messages] %s empty output: %d bytes, %d blocks, first_block=%s",
-                                upstream_name, total_bytes, block_count,
-                                repr(output_blocks[0][:200]) if output_blocks else "none")
-
-            # 上下文超限：不转发，由 _route 统一返回 400
-            # 有内容输出：正常转发
-            if has_output:
-                try:
-                    self.send_response(200)
-                    for h in ["Content-Type", "Cache-Control"]:
-                        v = resp.headers.get(h)
-                        if v:
-                            self.send_header(h, v)
-                    self.send_header("Connection", "close")
-                    self.end_headers()
-                    for block in output_blocks:
-                        self.wfile.write(block)
-                        self.wfile.flush()
-                    self.close_connection = True
-                    size = sum(len(b) for b in output_blocks)
-                    size_str = f"{size // 1024}KB" if size >= 1024 else f"{size}B"
-                    if last_usage:
-                        inp = last_usage.get("input_tokens", 0)
-                        out = last_usage.get("output_tokens", 0)
-                        log.info("    <<< %s STREAM OK (%s) usage: input=%d output=%d total=%d",
-                                 upstream_name, size_str, inp, out, inp + out)
-                    else:
-                        log.info("    <<< %s STREAM OK (%s)", upstream_name, size_str)
-                except (ConnectionResetError, BrokenPipeError):
-                    log.warning("    <<< %s STREAM interrupted (client disconnected after send)", upstream_name)
-            elif not context_exceeded:
-                log.warning("    !!! %s STREAM empty output", upstream_name)
-
+                        except: pass
+                if stream_error:
+                    break  # 错误后退出外层 chunk 循环
+            size_str = (str(size // 1024) + "KB") if size >= 1024 else (str(size) + "B")
+            if last_usage:
+                log.info("[#%d]     <<< %s STREAM OK (%s, %dms) usage: input=%d output=%d total=%d",
+                         self._req_id, upstream_name, size_str, self._ms(), last_usage.get("input_tokens", 0),
+                         last_usage.get("output_tokens", 0),
+                         last_usage.get("input_tokens", 0) + last_usage.get("output_tokens", 0))
+            else:
+                log.info("[#%d]     <<< %s STREAM OK (%s, %dms)", self._req_id, upstream_name, size_str, self._ms())
         except (ConnectionResetError, BrokenPipeError):
-            log.warning("    <<< %s STREAM interrupted", upstream_name)
+            log.warning("[#%d]     <<< %s STREAM interrupted", self._req_id, upstream_name)
 
         return has_output, last_usage, context_exceeded, stream_error
 
@@ -1708,14 +1667,14 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write(block)
                     self.wfile.flush()
                 self.close_connection = True
-                log.info("    <<< %s [converted] STREAM OK (%d events, %dKB)",
-                         upstream_name, len(output_blocks), total_bytes // 1024)
+                log.info("[#%d]     <<< %s [converted] STREAM OK (%d events, %dKB, %dms)",
+                         self._req_id, upstream_name, len(output_blocks), total_bytes // 1024, self._ms())
                 # 保存 exchange
                 resp_text = b"".join(output_blocks).decode("utf-8", errors="replace")
                 self._save_exchange(getattr(self, '_debug_req_body', {}), resp_text, upstream_name, "converted")
 
         except (ConnectionResetError, BrokenPipeError):
-            log.warning("    <<< %s [converted] STREAM interrupted", upstream_name)
+            log.warning("[#%d]     <<< %s [converted] STREAM interrupted", self._req_id, upstream_name)
 
         return len(output_blocks), has_output
 
@@ -1768,7 +1727,7 @@ class Handler(BaseHTTPRequestHandler):
                                     err = p.get("response", {}).get("error")
                                     if err:
                                         stream_error = err
-                                        log.warning("    !!! %s response.failed: %s", upstream_name, err)
+                                        log.warning("[#%d]     !!! %s response.failed: %s", self._req_id, upstream_name, err)
                         except Exception:
                             pass
             if buf.strip():
@@ -1836,7 +1795,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write(block)
                     self.wfile.flush()
                 self.close_connection = True
-                log.info("    <<< %s STREAM OK (%d events)", upstream_name, events)
+                log.info("[#%d]     <<< %s STREAM OK (%d events, %dms)", self._req_id, upstream_name, events, self._ms())
                 if last_usage:
                     inp = last_usage.get("input_tokens", 0)
                     out = last_usage.get("output_tokens", 0)
@@ -1856,8 +1815,8 @@ class Handler(BaseHTTPRequestHandler):
                             pass
                 if stream_error:
                     # 上游明确报错 → 直接转发 response.failed 给客户端，不截断重试
-                    log.warning("    !!! %s upstream error, forwarding response.failed: %s",
-                                upstream_name, stream_error)
+                    log.warning("[#%d]     !!! %s upstream error, forwarding response.failed: %s",
+                                self._req_id, upstream_name, stream_error)
                     self.send_response(200)
                     for h in ["Content-Type", "Cache-Control"]:
                         v = resp.headers.get(h)
@@ -1871,10 +1830,10 @@ class Handler(BaseHTTPRequestHandler):
                     self.close_connection = True
                     has_output = True  # 标记已处理，阻止外层截断重试
                 else:
-                    log.warning("    !!! %s STREAM empty output (%d events)", upstream_name, events)
+                    log.warning("[#%d]     !!! %s STREAM empty output (%d events)", self._req_id, upstream_name, events)
 
         except (ConnectionResetError, BrokenPipeError):
-            log.warning("    <<< %s STREAM interrupted", upstream_name)
+            log.warning("[#%d]     <<< %s STREAM interrupted", self._req_id, upstream_name)
 
         return events, has_output, stream_error
 
@@ -1992,8 +1951,8 @@ class Handler(BaseHTTPRequestHandler):
         max_ctx = up.get("max_context_tokens", 200000)
         payload_bytes = len(json.dumps(body).encode())
         est_tokens = payload_bytes / 3.5
-        log.warning("    !!! context overflow (~%dK > %dK), returning 400 to client",
-                     int(est_tokens // 1000), max_ctx // 1000)
+        log.warning("[#%d]     !!! context overflow (~%dK > %dK), returning 400 to client",
+                     getattr(self, '_req_id', 0), int(est_tokens // 1000), max_ctx // 1000)
         err_resp = json.dumps({
             "type": "error",
             "error": {
@@ -2040,7 +1999,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.1 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.2 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
