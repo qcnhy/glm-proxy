@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.2 — codex-relay + Python 路由层
+GLM API 代理 v2.9.3 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -376,7 +376,7 @@ def _find_relay_binary():
     return None
 
 def _start_relays():
-    _RELAY_MIN = (0, 3, 0)
+    _RELAY_MIN = (0, 3, 4)
     need_install = False
     try:
         from importlib.metadata import version as _pkg_ver
@@ -422,20 +422,6 @@ def _stop_relays():
             except:
                 pass
 
-
-# ── think 标签清理 ──
-def _strip_think_tags(text):
-    """剥离推理标签"""
-    import re
-    # 移除完整的 <think...</think> 块
-    text = re.sub(r'<think.*?</think>', '', text, flags=re.DOTALL)
-    # 移除闭合标签 </think> 及后面的空白
-    text = re.sub(r'</think>' + r'\s*', '', text)
-    # 移除开始标签 <think> 及后面的空白
-    text = re.sub(r'<think>' + r'\s*', '', text)
-    # 移除不完整的开始标签 <think（无闭合）
-    text = re.sub(r'<think\b', '', text)
-    return text.strip()
 
 
 
@@ -1839,8 +1825,7 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _process_sse_block(block, upstream_name=None):
-        """透传 SSE block，修正 GLM 的 prompt_tokens:0，剥离推理标签"""
-        has_think = False
+        """透传 SSE block，修正 GLM 的 prompt_tokens:0"""
         lines = block.decode("utf-8", errors="replace").strip().split("\n")
         etype, dstr = "", ""
         for l in lines:
@@ -1855,39 +1840,6 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return block + b"\n\n", None, False
         pt = p.get("type", "")
-        # 剥离推理标签（带日志）- 同时检测开始和闭合标签
-        if pt == "response.output_text.delta":
-            delta = p.get("delta", "")
-            if "<think" in delta or "</think" in delta:
-                has_think = True
-                log.warning("    [think] delta BEFORE: %s", repr(delta[:100]))
-                stripped = _strip_think_tags(delta)
-                log.warning("    [think] delta AFTER: %s", repr(stripped[:100]))
-                p["delta"] = stripped
-        elif pt == "response.output_item.done":
-            item = p.get("item", {})
-            content = item.get("content", [])
-            for c in content:
-                if c.get("type") == "output_text":
-                    text = c.get("text", "")
-                    if "<think" in text or "</think" in text:
-                        has_think = True
-                        log.warning("    [think] output_item.done BEFORE: %s", repr(text[:200]))
-                        stripped = _strip_think_tags(text)
-                        log.warning("    [think] output_item.done AFTER: %s", repr(stripped[:200]))
-                        c["text"] = stripped
-        elif pt == "response.completed":
-            for item in p.get("response", {}).get("output", []):
-                content = item.get("content", [])
-                for c in content:
-                    if c.get("type") == "output_text":
-                        text = c.get("text", "")
-                        if "<think" in text or "</think" in text:
-                            has_think = True
-                            log.warning("    [think] response.completed BEFORE: %s", repr(text[:200]))
-                            stripped = _strip_think_tags(text)
-                            log.warning("    [think] response.completed AFTER: %s", repr(stripped[:200]))
-                            c["text"] = stripped
         # 修正 response.completed 中的 usage（GLM 流式 prompt_tokens=0，需加 cached_tokens）
         if pt == "response.completed" and upstream_name:
             raw_usage = p.get("response", {}).get("usage")
@@ -1917,7 +1869,7 @@ class Handler(BaseHTTPRequestHandler):
             if delta_usage:
                 usage = delta_usage
         out = f"event: {etype}\ndata: {json.dumps(p, ensure_ascii=False)}\n\n"
-        return out.encode(), usage, has_think
+        return out.encode(), usage, False
 
     # ── 辅助方法 ─────────────────────────────────────
     def _send_raw(self, code, data, content_type):
@@ -1999,7 +1951,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.2 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.3 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
@@ -2016,8 +1968,8 @@ if __name__ == "__main__":
     _start_relays()
     time.sleep(1)
 
-    # 健康检查线程
-    threading.Thread(target=_check_internal, daemon=True).start()
+    # 健康检查线程（暂时关闭内网探测）
+    # threading.Thread(target=_check_internal, daemon=True).start()
 
     # 优雅退出
     def _shutdown(sig, frame):
