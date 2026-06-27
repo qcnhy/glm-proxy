@@ -6,17 +6,17 @@
   "_comment_upstreams": "渠道按优先级排列。能力由URL字段决定：有openai_url=支持Completions, 有anthropic_url=支持Messages。路由flag: require_health(需健康检查), worktime_only(仅工作时间), disabled(禁用)。客户端发 key=3 强制走 official。",
   "upstreams": [
     {
-      "_comment": "内网网关：阿里云 GLM 中转，需 VPN。支持两个端点（同一key），require_health 健康检查不过则跳过。",
-      "name": "internal",
-      "openai_url": "https://your-internal-gateway/openai/v1",
-      "anthropic_url": "https://your-internal-gateway/anthropic/v1/messages",
-      "anthropic_auth": "bearer",
-      "key": "YOUR_INTERNAL_KEY",
-      "relay_port": 4444,
-      "interceptor_port": 14444,
-      "model": "glm-5",
-      "max_context_tokens": 202745,
-      "require_health": true
+      "_comment": "内网网关（已暂时关闭）：阿里云 GLM 中转，需 VPN。需要时取消注释恢复，并开启脚本里的 _check_internal 健康检查线程。require_health 健康检查不过则跳过。",
+      "_disabled_name": "internal",
+      "_openai_url": "https://your-internal-gateway/openai/v1",
+      "_anthropic_url": "https://your-internal-gateway/anthropic/v1/messages",
+      "_anthropic_auth": "bearer",
+      "_key": "YOUR_INTERNAL_KEY",
+      "_relay_port": 4444,
+      "_interceptor_port": 14444,
+      "_model": "glm-5",
+      "_max_context_tokens": 202745,
+      "_require_health": true
     },
     {
       "_comment": "中转站 Completions 端点：用 OpenAI key，仅工作时间。",
