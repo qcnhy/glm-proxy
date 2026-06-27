@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.3 — codex-relay + Python 路由层
+GLM API 代理 v2.9.4 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -50,7 +50,9 @@ UPSTREAMS = _cfg.get("upstreams", [])
 
 STATIC_MODELS = json.dumps({
     "object": "list",
-    "data": [{"id": up["model"], "object": "model", "owned_by": up.get("owned_by", "zhipu")} for up in UPSTREAMS],
+    "data": list({up["model"]: {"id": up["model"], "object": "model",
+                                "owned_by": up.get("owned_by", "zhipu")}
+                  for up in UPSTREAMS}.values()),
 }, ensure_ascii=False).encode()
 
 # ── 日志 ──────────────────────────────────────────────
@@ -223,9 +225,6 @@ class InterceptorHandler(BaseHTTPRequestHandler):
                 with open(path, "w", encoding="utf-8") as f:
                     json.dump(data, f, ensure_ascii=False, indent=2)
                 log.info("[relay] %s [DEBUG] saved translated request to %s", up["name"], path)
-            # 修复 max_tokens=None（智谱 Chat Completions 会报 1210 参数错误）
-            if data.get("max_tokens") is None:
-                data["max_tokens"] = 16384
             if is_stream:
                 data.setdefault("stream_options", {})["include_usage"] = True
                 body = json.dumps(data).encode("utf-8")
@@ -294,6 +293,35 @@ class InterceptorHandler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(err_body)
+            self.close_connection = True
+        except Exception as e:
+            err = json.dumps({"error": str(e)}).encode()
+            self.send_response(502)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(err)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(err)
+            self.close_connection = True
+
+    def do_GET(self):
+        """转发 GET（如 /v1/models）到上游，带 API key。
+        codex-relay 启动时 GET /models 探测模型类型，据此决定是否注入 thinking。"""
+        up = self.upstream_config
+        try:
+            url = up["openai_url"].rstrip("/") + self.path
+            req = Request(url, headers={
+                "Authorization": f"Bearer {up['key']}",
+                "Connection": "close",
+            }, method="GET")
+            resp = urlopen(req, timeout=30)
+            result = resp.read()
+            self.send_response(resp.status)
+            self.send_header("Content-Type", resp.headers.get("Content-Type", "application/json"))
+            self.send_header("Content-Length", str(len(result)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(result)
             self.close_connection = True
         except Exception as e:
             err = json.dumps({"error": str(e)}).encode()
@@ -376,7 +404,7 @@ def _find_relay_binary():
     return None
 
 def _start_relays():
-    _RELAY_MIN = (0, 3, 4)
+    _RELAY_MIN = (0, 3, 6)
     need_install = False
     try:
         from importlib.metadata import version as _pkg_ver
@@ -833,24 +861,6 @@ def _convert_messages_error_to_responses(err_body):
 
 
 
-    """构建 codex-relay namespace 工具名修正映射。
-    codex-relay 把 namespace 工具的子工具名拼接到 namespace 后面作为 function_call name，
-    且丢弃了 namespace 字段。正确格式：name="js", namespace="mcp__node_repl"。
-    codex-relay 格式：name="mcp__node_repljs", 无 namespace 字段。
-    返回 {mangled_name: {"name": sub_name, "namespace": ns_name}} 映射。"""
-    fix_map = {}
-    for tool in body.get("tools", []):
-        if tool.get("type") == "namespace":
-            ns_name = tool.get("name", "")
-            for sub_tool in tool.get("tools", []):
-                sub_name = sub_tool.get("name", "")
-                if ns_name and sub_name:
-                    mangled = ns_name + sub_name
-                    fix_map[mangled] = {"name": sub_name, "namespace": ns_name}
-    return fix_map
-
-
-
 # ── apply_patch 转换 ──────────────────────────────────
 def _parse_patch_to_operation(patch_text):
     """将 patch 文本解析为 Codex 的 operation 对象。
@@ -1089,8 +1099,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send_raw(400, err, "application/json")
             return
 
-        # 1) GET /v1/models → 静态返回
-        if method == "GET" and self.path.rstrip("/") == "/v1/models":
+        # 1) GET /v1/models → 静态返回（忽略查询参数，如 ?client_version=）
+        path_only = self.path.split("?")[0].rstrip("/")
+        if method == "GET" and path_only == "/v1/models":
             self._send_raw(200, STATIC_MODELS, "application/json")
             return
 
@@ -1106,9 +1117,6 @@ class Handler(BaseHTTPRequestHandler):
             raw = self.rfile.read(length)
             body = json.loads(raw)
             is_stream = body.get("stream", False)
-            # 智谱 count_tokens 不支持 max_tokens=None（Python 崩溃）
-            if "max_tokens" not in body or body.get("max_tokens") is None:
-                body["max_tokens"] = 16384
             self._debug_req_body = body
 
         # 3) 日志 + 计算 payload 大小
@@ -1840,26 +1848,6 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return block + b"\n\n", None, False
         pt = p.get("type", "")
-        # 修正 response.completed 中的 usage（GLM 流式 prompt_tokens=0，需加 cached_tokens）
-        if pt == "response.completed" and upstream_name:
-            raw_usage = p.get("response", {}).get("usage")
-            upstream_u = _upstream_usage.get(upstream_name)
-            if upstream_u and raw_usage:
-                prompt_tokens = raw_usage.get("input_tokens", 0)
-                if prompt_tokens == 0:
-                    cached = 0
-                    details = upstream_u.get("prompt_tokens_details")
-                    if details:
-                        cached = details.get("cached_tokens", 0)
-                    real_prompt = upstream_u.get("prompt_tokens", 0)
-                    completion = raw_usage.get("output_tokens", 0)
-                    corrected = real_prompt + cached
-                    raw_usage["input_tokens"] = corrected
-                    raw_usage["total_tokens"] = corrected + completion
-                    if cached > 0:
-                        raw_usage.setdefault("input_tokens_details", {})["cached_tokens"] = cached
-                    log.info("    [response.completed] corrected usage: input=%d(+%d cached) output=%d",
-                             real_prompt, cached, completion)
         # 提取 usage 用于日志
         usage = None
         if pt == "response.completed":
@@ -1951,7 +1939,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.3 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.4 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
