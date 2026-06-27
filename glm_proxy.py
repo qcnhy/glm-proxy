@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.4 — codex-relay + Python 路由层
+GLM API 代理 v2.9.5 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -51,7 +51,9 @@ UPSTREAMS = _cfg.get("upstreams", [])
 STATIC_MODELS = json.dumps({
     "object": "list",
     "data": list({up["model"]: {"id": up["model"], "object": "model",
-                                "owned_by": up.get("owned_by", "zhipu")}
+                                "owned_by": up.get("owned_by", "zhipu"),
+                                "context_window": up.get("max_context_tokens", 128000),
+                                "max_context_window": up.get("max_context_tokens", 128000)}
                   for up in UPSTREAMS}.values()),
 }, ensure_ascii=False).encode()
 
@@ -470,6 +472,42 @@ def _request_has_images(body):
                         return True
     return False
 
+
+def _to_anthropic_content(content):
+    """将 Responses API 的 content（str/list）转成 Anthropic Messages 的 content 块列表。
+    关键：input_image(data:image/...;base64,XXX) → Anthropic image 块，
+    否则 GLM 会把 base64 当文本数 token（一张图变几十万 token）。"""
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}] if content else []
+    if not isinstance(content, list):
+        return [{"type": "text", "text": str(content)}] if content else []
+    blocks = []
+    for item in content:
+        if not isinstance(item, dict):
+            blocks.append({"type": "text", "text": str(item)})
+            continue
+        t = item.get("type", "")
+        if t in ("input_text", "output_text", "text"):
+            txt = item.get("text", "")
+            if txt:
+                blocks.append({"type": "text", "text": txt})
+        elif t == "input_image":
+            url = item.get("image_url", "") or item.get("url", "")
+            if url.startswith("data:"):
+                header, _, data = url.partition(",")
+                media = "image/png"
+                for m in ("image/jpeg", "image/jpg", "image/gif", "image/webp"):
+                    if m in header:
+                        media = m
+                        break
+                if data:
+                    blocks.append({"type": "image",
+                                   "source": {"type": "base64", "media_type": media, "data": data}})
+            elif url:
+                blocks.append({"type": "image", "source": {"type": "url", "url": url}})
+    return blocks
+
+
 # ── Responses API → Messages API 请求转换 ──────────────────────────
 
 def _safe_parse_json(s):
@@ -526,10 +564,16 @@ def _append_tool_use(messages, call_item):
 
 def _append_tool_result(messages, output_item):
     """将 function_call_output 追加为 user 消息中的 tool_result 块"""
+    raw_output = output_item.get("output", "")
+    # output 可能是 str 或 list(含 input_image)；转成 Anthropic 块，避免 base64 当文本
+    if isinstance(raw_output, list):
+        content = _to_anthropic_content(raw_output)
+    else:
+        content = raw_output
     tool_result = {
         "type": "tool_result",
         "tool_use_id": output_item.get("call_id", ""),
-        "content": output_item.get("output", ""),
+        "content": content,
     }
     # 如果最后一条是 user 且 content 是 list，追加
     if messages and messages[-1].get("role") == "user":
@@ -616,7 +660,11 @@ def _convert_responses_to_messages(body):
                 if role in ("system", "developer"):
                     if text:
                         system_parts.append(text)
-                elif role in ("user", "assistant"):
+                elif role == "user":
+                    # 保留图片：转成 Anthropic image 块（无图时退化为纯文本）
+                    blocks = _to_anthropic_content(content)
+                    messages.append({"role": role, "content": blocks if blocks else text})
+                elif role == "assistant":
                     messages.append({"role": role, "content": text})
             elif item_type == "function_call":
                 _append_tool_use(messages, item)
@@ -1939,7 +1987,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.4 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.5 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
