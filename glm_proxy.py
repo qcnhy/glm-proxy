@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.5 — codex-relay + Python 路由层
+GLM API 代理 v2.9.9 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -1105,6 +1105,74 @@ def _fix_apply_patch_args(output_blocks):
         output_blocks[:] = new_blocks
 
 
+def _unwrap_patch_text(args):
+    """function_call arguments(JSON) → 原始 patch 文本，并修正 *** Begin/End Patch 格式。"""
+    try:
+        parsed = json.loads(args)
+        patch_text = parsed.get("patch", args) if isinstance(parsed, dict) else args
+    except Exception:
+        patch_text = args
+    if not patch_text.startswith("*** Begin Patch"):
+        patch_text = "*** Begin Patch\n" + patch_text
+    import re
+    patch_text = re.sub(r'^[+\- ]\*\*\* End Patch$', '*** End Patch', patch_text, flags=re.MULTILINE)
+    if not patch_text.rstrip().endswith("*** End Patch"):
+        patch_text = patch_text.rstrip() + "\n*** End Patch"
+    return patch_text
+
+
+def _build_patch_events(pb):
+    """从 apply_patch function_call 缓冲项构建 custom_tool_call 流事件列表。
+    返回 (events, call_id, patch_text)。每个 event 是 dict（含 type/sequence_number）。"""
+    call_id = pb.get("call_id", "")
+    item_id = f"ctc_{call_id}" if call_id else "ctc_apply_patch"
+    oi = pb.get("output_index", 0)
+    seq = pb.get("seq", 0)
+    patch_text = _unwrap_patch_text(pb.get("args", ""))
+    evs = []
+    seq += 1
+    evs.append({"type": "response.output_item.added", "sequence_number": seq, "output_index": oi,
+                "item": {"id": item_id, "type": "custom_tool_call", "status": "in_progress",
+                         "call_id": call_id, "name": "apply_patch"}})
+    for i in range(0, len(patch_text), 20):
+        seq += 1
+        evs.append({"type": "response.custom_tool_call_input.delta", "sequence_number": seq,
+                    "delta": patch_text[i:i + 20], "item_id": item_id, "output_index": oi})
+    seq += 1
+    evs.append({"type": "response.custom_tool_call_input.done", "sequence_number": seq,
+                "input": patch_text, "item_id": item_id, "output_index": oi})
+    seq += 1
+    evs.append({"type": "response.output_item.done", "sequence_number": seq, "output_index": oi,
+                "item": {"id": item_id, "type": "custom_tool_call", "status": "completed",
+                         "call_id": call_id, "name": "apply_patch", "input": patch_text}})
+    return evs, call_id, patch_text
+
+
+def _is_retriable_conv(code):
+    """converted 路径早期错误是否值得退避重试（1305 过载 / 5xx / 429）。"""
+    if code is None:
+        return False
+    s = str(code)
+    return s in {"1305", "overloaded", "429", "500", "502", "503", "529"} or "overload" in s.lower()
+
+
+def _est_tokens(body):
+    """估算请求 token 数：剔除 base64 图片数据（图片按分辨率约 1-3K token，不按 base64 字节长度算）。
+    避免 converted 路径图片请求的 base64 把字节估算撑到虚高（~840K/张）导致误判上下文超限、
+    挡住 failover。"""
+    import re
+    try:
+        s = json.dumps(body, ensure_ascii=False)
+    except Exception:
+        return 0
+    n_images = s.count("data:image/") + s.count('"type":"image"')
+    # 剔除 data URL 中的 base64
+    s = re.sub(r'data:image/[^;]*;base64,[A-Za-z0-9+/=\s]+', 'data:img', s)
+    # 剔除 Anthropic image block 中的 data 字段（长 base64 串）
+    s = re.sub(r'"data":"[A-Za-z0-9+/=]{80,}"', '"data":""', s)
+    return len(s.encode()) / 3.5 + n_images * 1500
+
+
 # ── HTTP 处理 ─────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -1316,19 +1384,19 @@ class Handler(BaseHTTPRequestHandler):
 
                 if is_stream:
                     if is_responses_converted:
-                        # Responses→Messages 转换路径的流式处理
-                        events, has_output = self._converted_stream(resp, up["name"])
-                        if has_output:
+                        # Responses→Messages 转换路径：增量流式 + 早期错误退避重试 + 错误转发
+                        cres = self._converted_stream_with_retry(resp, up, url, up_headers, payload, method)
+                        if cres.get("done"):
                             return
+                        # 真空输出（无错误）→ 尝试下一个上游
                     elif is_responses:
-                        events, has_output, stream_error = self._relay_stream(resp, up["name"])
-                        # 上游返回 response.failed → 直接转发错误
+                        # relay 路径：立即发头+keepalive（idle安全），早期 1305/过载退避重试
+                        events, has_output, stream_error = self._relay_stream_with_retry(
+                            resp, up, url, up_headers, payload, method)
                         if stream_error:
                             log.warning("[#%d]     !!! %s upstream error, forwarding to client: %s",
                                         self._req_id, up["name"], stream_error)
-                            return
-                        if has_output:
-                            return
+                        return  # 已发响应头，总是 done
                     elif is_messages:
                         # 增量流式：已发送响应头并边收边发，直接返回（不再回退/不发400）
                         self._messages_stream(resp, up["name"])
@@ -1407,7 +1475,7 @@ class Handler(BaseHTTPRequestHandler):
                 # 502/500 可能是上下文超限，返回标准错误触发客户端压缩
                 if e.code in (500, 502) and body and (is_responses or is_messages):
                     max_ctx = up.get("max_context_tokens", 200000)
-                    est_tokens = len(json.dumps(body).encode()) / 3.5
+                    est_tokens = _est_tokens(body)  # 剔除 base64 图片，避免虚高
                     if est_tokens > max_ctx * 0.9:
                         self._send_context_exceeded(body, up)
                         return
@@ -1562,8 +1630,8 @@ class Handler(BaseHTTPRequestHandler):
 
         return has_output, last_usage, context_exceeded, stream_error
 
-    # ── Responses→Messages 转换流式处理 ──────────────
-    def _converted_stream(self, resp, upstream_name):
+    # ── Responses→Messages 转换流式处理（旧：整段缓冲，留作兜底）──
+    def _converted_stream_buffered(self, resp, upstream_name):
         """缓冲 Anthropic Messages SSE → 逐块转换为 Responses SSE → 发给客户端"""
         import asyncio
         converter = AnthropicToOpenAIResponsesStreamAdapter()
@@ -1720,164 +1788,588 @@ class Handler(BaseHTTPRequestHandler):
 
         return len(output_blocks), has_output
 
+    # ── Responses→Messages 增量流式（边收边转边发）──
+    def _converted_stream(self, resp, upstream_name):
+        """增量流式：上游 Anthropic Messages SSE → 经 ccproxy 转换器 → Responses SSE 边转边发。
+        专用 worker 线程跑 event loop 驱动 async 转换器，主线程 get_nowait 边收边刷。
+        commit 前若遇上游 error（1305 等）不发任何字节，返回 early_error 供上层重试。
+        返回 dict: {committed, has_output, early_error, code, msg}。"""
+        import threading as _t, queue as _q, asyncio
+        converter = AnthropicToOpenAIResponsesStreamAdapter()
+        inbox = _q.Queue()    # 主线程 → 转换器（Anthropic 事件 dict；None=EOF）
+        outbox = _q.Queue()   # 转换器 → 主线程（Responses 事件 dict；SENT=结束）
+        SENT = object()
+
+        def _worker():
+            loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(loop)
+
+                async def consume():
+                    async def src():
+                        while True:
+                            try:
+                                ev = inbox.get(timeout=REQUEST_TIMEOUT + 30)
+                            except _q.Empty:
+                                return
+                            if ev is None:
+                                return
+                            yield ev
+                    try:
+                        async for out in converter.run(src()):
+                            ed = out if isinstance(out, dict) else out.model_dump(exclude_none=True, mode="json")
+                            outbox.put(ed)
+                    finally:
+                        outbox.put(SENT)
+
+                loop.run_until_complete(consume())
+            except Exception as e:
+                log.error("    [converted] worker error: %s", e)
+                outbox.put(SENT)
+            finally:
+                # 取消残留 task，避免 "Task was destroyed" 警告
+                try:
+                    pending = asyncio.all_tasks(loop)
+                    for tk in pending:
+                        tk.cancel()
+                    if pending:
+                        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                except Exception:
+                    pass
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+
+        wth = _t.Thread(target=_worker, daemon=True)
+        wth.start()
+
+        def _parse(block):
+            et, dj = None, None
+            for line in block.decode("utf-8", errors="replace").split("\n"):
+                if line.startswith("event: "):
+                    et = line[7:].strip()
+                elif line.startswith("data: "):
+                    try:
+                        dj = json.loads(line[6:])
+                    except Exception:
+                        pass
+            if dj is not None and et:
+                dj["_event_type"] = et
+            return dj, et
+
+        committed = False
+        headers_sent = False
+        has_output = False
+        early_error = None
+        total_bytes = 0
+        out_count = 0
+        pending = []           # commit 前缓冲
+        patch_buf = {}         # output_index -> {seq, call_id, item_id, output_index, args}
+        patch_done = {}        # call_id -> patch_text（用于改写 response.completed）
+        held_completed = None  # 缓冲的 response.completed 事件
+        last_usage = {}
+        event_type_counts = {}
+
+        def _send_headers():
+            nonlocal headers_sent
+            if headers_sent:
+                return
+            self.send_response(200)
+            for h in ["Content-Type", "Cache-Control"]:
+                v = resp.headers.get(h)
+                if v:
+                    self.send_header(h, v)
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            headers_sent = True
+
+        def _write_evt(ed):
+            nonlocal out_count
+            t = ed.get("type", "")
+            self.wfile.write((f"event: {t}\ndata: {json.dumps(ed, ensure_ascii=False)}\n\n").encode())
+            self.wfile.flush()
+            out_count += 1
+
+        def _is_real(ed):
+            return ed.get("type", "") in (
+                "response.output_text.delta",
+                "response.function_call_arguments.delta",
+                "response.reasoning_summary_text.delta",
+                "response.reasoning.delta",
+                "response.custom_tool_call_input.delta",
+            )
+
+        def _flush(ed):
+            """apply_patch 感知的刷出。返回是否为真实输出。"""
+            nonlocal has_output, held_completed
+            t = ed.get("type", "")
+            oi = ed.get("output_index")
+            if t == "response.output_item.added":
+                item = ed.get("item", {}) or {}
+                if item.get("name") == "apply_patch" and item.get("type") == "function_call":
+                    patch_buf[oi] = {"seq": ed.get("sequence_number", 0),
+                                     "call_id": item.get("call_id") or item.get("id", ""),
+                                     "item_id": item.get("id", ""), "output_index": oi, "args": ""}
+                    return False
+            if oi is not None and oi in patch_buf:
+                pb = patch_buf[oi]
+                if t == "response.function_call_arguments.delta":
+                    pb["args"] += ed.get("delta", "")
+                    return False
+                if t == "response.function_call_arguments.done":
+                    pb["args"] = ed.get("arguments", pb["args"])
+                    return False
+                if t == "response.output_item.done":
+                    cid, ptxt = self._emit_custom_tool_call_stream(pb)
+                    if cid:
+                        patch_done[cid] = ptxt
+                    del patch_buf[oi]
+                    has_output = True
+                    return True
+                return False  # 归属该 apply_patch 项的其他事件，丢弃
+            if t == "response.completed":
+                held_completed = ed
+                return False
+            if _is_real(ed):
+                has_output = True
+            _write_evt(ed)
+            return has_output
+
+        def _drain_nowait():
+            """非阻塞排空 outbox（FIFO 保证顺序，滞留项下一轮或 EOF 阻塞排空时取出）。"""
+            while True:
+                try:
+                    o = outbox.get_nowait()
+                except _q.Empty:
+                    return
+                if o is SENT:
+                    continue
+                if not committed:
+                    pending.append(o)
+                else:
+                    _flush(o)
+
+        try:
+            buf = b""
+            upstream_eof = False
+            converter_done = False
+            while not (upstream_eof and converter_done):
+                if early_error and not committed:
+                    break
+                # 1. 读上游
+                if not upstream_eof:
+                    chunk = resp.read(4096)
+                    if not chunk:
+                        upstream_eof = True
+                        inbox.put(None)
+                    else:
+                        total_bytes += len(chunk)
+                        buf += chunk
+                        while b"\n\n" in buf or b"\r\n\r\n" in buf:
+                            if b"\r\n\r\n" in buf:
+                                block, buf = buf.split(b"\r\n\r\n", 1)
+                            else:
+                                block, buf = buf.split(b"\n\n", 1)
+                            block = block.replace(b"\r\n", b"\n")
+                            dj, et = _parse(block)
+                            if not dj or not et:
+                                continue
+                            event_type_counts[et] = event_type_counts.get(et, 0) + 1
+                            if et == "error" and not committed:
+                                ed = dj.get("error", dj)
+                                early_error = {
+                                    "code": ed.get("code") if isinstance(ed, dict) else None,
+                                    "msg": (ed.get("message", "") if isinstance(ed, dict) else str(ed)),
+                                }
+                                log.warning("    [converted] early upstream error: code=%s msg=%s",
+                                            early_error["code"], str(early_error["msg"])[:150])
+                                inbox.put(None)
+                                upstream_eof = True
+                                break
+                            if et == "message_delta":
+                                u = dj.get("usage") or {}
+                                if u:
+                                    last_usage = u
+                            elif et == "error":
+                                log.warning("    [converted] mid-stream upstream error: %s",
+                                            str(dj.get("error", dj))[:200])
+                            inbox.put(dj)
+                # 2. 排空 outbox
+                if upstream_eof:
+                    # 阻塞排空直到转换器结束（兜底所有滞留输出）
+                    deadline_stall = 0
+                    while not converter_done:
+                        try:
+                            o = outbox.get(timeout=60)
+                        except _q.Empty:
+                            deadline_stall += 1
+                            if deadline_stall > 1:
+                                log.warning("    [converted] converter drain stall, giving up")
+                                break
+                            continue
+                        if o is SENT:
+                            converter_done = True
+                            break
+                        if not committed:
+                            pending.append(o)
+                        else:
+                            _flush(o)
+                else:
+                    _drain_nowait()
+                # 3. commit 判定（pre-commit；出现 response.created/真实输出即提交）
+                if (not committed and early_error is None and pending and
+                        any(_is_real(p) or p.get("type") in (
+                            "response.created", "response.output_item.added",
+                            "response.content_part.added",
+                            "response.reasoning_summary_part.added") for p in pending)):
+                    committed = True
+                    _send_headers()
+                    for pe in pending:
+                        _flush(pe)
+                    pending = []
+
+            # 迟到的 commit（小响应一次性读完 / 转换器输出滞后）
+            if not committed and pending and early_error is None:
+                committed = True
+                _send_headers()
+                for pe in pending:
+                    _flush(pe)
+                pending = []
+
+            # 收尾：刷出残留 apply_patch 项 + response.completed
+            if committed:
+                for oi in list(patch_buf.keys()):
+                    pb = patch_buf.pop(oi)
+                    cid, ptxt = self._emit_custom_tool_call_stream(pb)
+                    if cid:
+                        patch_done[cid] = ptxt
+                    has_output = True
+                if held_completed is not None:
+                    out_arr = held_completed.get("response", {}).get("output", []) or []
+                    for it in out_arr:
+                        cid = it.get("call_id")
+                        if it.get("name") == "apply_patch" and cid in patch_done:
+                            it["type"] = "custom_tool_call"
+                            it["id"] = f"ctc_{cid}"
+                            it["input"] = patch_done[cid]
+                            it.pop("arguments", None)
+                    _write_evt(held_completed)
+                    rstatus = held_completed.get("response", {}).get("status", "?")
+                    rusage = held_completed.get("response", {}).get("usage", {}) or {}
+                    log.info("    [converted] status=%s usage=%s", rstatus,
+                             {k: v for k, v in rusage.items() if v})
+                else:
+                    # 上游不完整（无 message_stop）：合成收尾
+                    stop_reason = "end_turn" if early_error else "max_tokens"
+                    log.warning("    [converted] no response.completed, synthesizing (stop=%s)", stop_reason)
+                    fake = {"type": "response.completed", "sequence_number": out_count + 1,
+                            "response": {"id": "resp_syn", "object": "response",
+                                         "status": "completed" if stop_reason == "end_turn" else "incomplete",
+                                         "model": upstream_name, "output": [],
+                                         "usage": last_usage or {}}}
+                    _write_evt(fake)
+                log.info("    [converted] events=%s", event_type_counts)
+                log.info("[#%d]     <<< %s [converted] STREAM OK (%d out, %dKB, %dms)",
+                         self._req_id, upstream_name, out_count, total_bytes // 1024, self._ms())
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            log.warning("[#%d]     <<< %s [converted] STREAM interrupted", self._req_id, upstream_name)
+        finally:
+            try:
+                inbox.put_nowait(None)
+            except Exception:
+                pass
+            wth.join(timeout=5)
+
+        return {"committed": committed, "has_output": has_output,
+                "early_error": early_error is not None,
+                "code": early_error["code"] if early_error else None,
+                "msg": early_error["msg"] if early_error else None}
+
+    def _emit_custom_tool_call_stream(self, pb):
+        """把一个 apply_patch function_call 缓冲项合成 custom_tool_call 流事件并写出。
+        返回 (call_id, patch_text)。"""
+        evs, call_id, patch_text = _build_patch_events(pb)
+        log.info("    [apply_patch] unwrapped: %s", repr(patch_text[:100]))
+        for e in evs:
+            t = e.get("type", "")
+            self.wfile.write((f"event: {t}\ndata: {json.dumps(e, ensure_ascii=False)}\n\n").encode())
+        self.wfile.flush()
+        log.info("    [apply_patch] emitted custom_tool_call stream (delta+done)")
+        return call_id, patch_text
+
+    def _converted_stream_with_retry(self, first_resp, up, url, up_headers, payload, method):
+        """converted 路径：早期错误（1305 等）退避重试，用尽/不可重试则把错误转发给客户端。
+        返回 {done: bool}；done=False 表示真空输出（无错误），由上层回退下一上游。"""
+        MAX = 2
+        resp = first_resp
+        for attempt in range(MAX + 1):
+            res = self._converted_stream(resp, up["name"])
+            if res.get("committed"):
+                return {"done": True}
+            if res.get("early_error"):
+                code = res.get("code")
+                msg = res.get("msg", "")
+                if attempt < MAX and _is_retriable_conv(code):
+                    wait = min(2 ** attempt, 4)
+                    log.warning("[#%d] [converted] %s early error code=%s, retry %d/%d in %ds",
+                                self._req_id, up["name"], code, attempt + 1, MAX, wait)
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+                    time.sleep(wait)
+                    try:
+                        if up["name"] == "official":
+                            _official_limiter.acquire()
+                        resp = urlopen(Request(url, data=payload, headers=up_headers, method=method),
+                                       timeout=REQUEST_TIMEOUT)
+                    except Exception as oe:
+                        log.error("[#%d] [converted] reopen failed: %s", self._req_id, oe)
+                        self._forward_conv_error({"code": None, "msg": str(oe)})
+                        return {"done": True}
+                    continue
+                log.warning("[#%d] [converted] %s forwarding error to client: code=%s msg=%s",
+                            self._req_id, up["name"], code, str(msg)[:120])
+                self._forward_conv_error(res)
+                return {"done": True}
+            # 真空输出（committed=False, 无错误）→ 回退下一上游
+            try:
+                resp.close()
+            except Exception:
+                pass
+            return {"done": False}
+        return {"done": False}
+
+    def _forward_conv_error(self, res):
+        """把上游早期错误作为 HTTP 错误响应转发给客户端（让用户看到真实原因）。"""
+        try:
+            msg = res.get("msg") or "upstream error"
+            body = json.dumps({"error": {"message": msg, "code": res.get("code"),
+                                         "type": "upstream_error"}}, ensure_ascii=False).encode()
+        except Exception:
+            body = b'{"error":"upstream error"}'
+        try:
+            self._send_raw(503, body, "application/json")
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            log.warning("client disconnected before error response")
+
     # ── 流式转发 ─────────────────────────────────────
-    def _relay_stream(self, resp, upstream_name):
-        """读取并缓冲完整 SSE 流，检测空输出。返回 (events, has_output, stream_error)"""
+    def _relay_stream_with_retry(self, first_resp, up, url, up_headers, payload, method):
+        """增量流式转发 codex-relay 的 Responses SSE：立即发响应头 + 后台 keepalive 线程
+        防 idle 超时，边收边发；apply_patch 项缓冲后合成 custom_tool_call。
+        早期（真实输出前）遇 response.failed 且为可重试错误（1305/过载/5xx/429）→ 退避重试，
+        复用同一客户端连接（期间 keepalive 持续保活，客户端只感知到稍慢开始）；
+        真实输出开始后不再重试，中途错误直接转发。
+        返回 (events, has_output, stream_error)。已发响应头即视为完成（不回退下一上游）。"""
+        import threading
+        upstream_name = up["name"]
+        MAX = 2
         events = 0
         last_usage = {}
         has_output = False
-        stream_error = None  # response.failed 中的错误
-        saw_think = False  # 是否检测到 think 标签
-        output_blocks = []
-        raw_blocks = []  # 保存原始 block 用于 debug
-        try:
-            buf = b""
-            while True:
-                chunk = resp.read(4096)
-                if not chunk:
+        stream_error = None
+        patch_buf = {}       # output_index -> apply_patch 缓冲项
+        patch_done = {}      # call_id -> patch_text（改写 response.completed 用）
+        held_completed = None
+        raw_blocks = []
+        wlock = threading.Lock()
+        stop_ka = threading.Event()
+
+        def _write(data):
+            with wlock:
+                self.wfile.write(data)
+                self.wfile.flush()
+
+        def _emit(ed):
+            _write((f"event: {ed.get('type', '')}\ndata: {json.dumps(ed, ensure_ascii=False)}\n\n").encode())
+
+        def _keepalive():
+            while not stop_ka.wait(5):
+                try:
+                    _write(b": keepalive\n\n")
+                except Exception:
                     break
-                buf += chunk
-                # SSE 分隔符兼容 \n\n 和 \r\n\r\n
-                while b"\n\n" in buf or b"\r\n\r\n" in buf:
-                    if b"\r\n\r\n" in buf:
-                        block, buf = buf.split(b"\r\n\r\n", 1)
-                    else:
-                        block, buf = buf.split(b"\n\n", 1)
-                    # 移除 block 中的 \r\n（保留内容）
-                    block = block.replace(b"\r\n", b"\n")
-                    raw_blocks.append(block)  # 记录原始
-                    # 广泛检测：原始 block 中包含任何 think 相关内容
-                    if b"<think" in block or b"</think" in block or b"&lt;think" in block or b"&lt;/think" in block:
-                        saw_think = True
-                        log.warning("    [think] RAW block: %s", repr(block[:300]))
-                    out, usage, block_has_think = self._process_sse_block(block, upstream_name)
-                    if block_has_think:
-                        saw_think = True
+
+        # 立即发响应头进入 SSE 模式（避免客户端等待响应头/首字节超时）
+        self.send_response(200)
+        for h in ["Content-Type", "Cache-Control"]:
+            v = first_resp.headers.get(h)
+            if v:
+                self.send_header(h, v)
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        kat = threading.Thread(target=_keepalive, daemon=True)
+        kat.start()
+
+        resp = first_resp
+        try:
+            for attempt in range(MAX + 1):
+                early_err = None  # (code, err, out_bytes) 真实输出前的 response.failed，候选重试
+                buf = b""
+                done = False
+                while not done:
+                    chunk = resp.read(4096)
+                    if not chunk:
+                        done = True
+                        break
+                    buf += chunk
+                    while b"\n\n" in buf or b"\r\n\r\n" in buf:
+                        if b"\r\n\r\n" in buf:
+                            block, buf = buf.split(b"\r\n\r\n", 1)
+                        else:
+                            block, buf = buf.split(b"\n\n", 1)
+                        block = block.replace(b"\r\n", b"\n")
+                        raw_blocks.append(block)
+                        out, usage, _ = self._process_sse_block(block, upstream_name)
+                        if usage:
+                            last_usage = usage
+                        events += 1
+                        etype, dstr = "", ""
+                        for l in out.decode("utf-8", errors="replace").split("\n"):
+                            if l.startswith("event: "):
+                                etype = l[7:].strip()
+                            elif l.startswith("data: "):
+                                dstr = l[6:]
+                        p = None
+                        if dstr:
+                            try:
+                                p = json.loads(dstr)
+                            except Exception:
+                                p = None
+                        t = etype or (p.get("type", "") if p else "")
+                        oi = p.get("output_index") if p else None
+                        item = (p.get("item") or {}) if p else {}
+                        # 上游错误
+                        if t == "response.failed":
+                            err = (p or {}).get("response", {}).get("error")
+                            code = err.get("code") if isinstance(err, dict) else None
+                            if not has_output:
+                                early_err = (code, err, out)  # 真实输出前 → 候选重试（暂不转发）
+                                done = True
+                                break
+                            stream_error = err
+                            log.warning("[#%d]     !!! %s response.failed (mid-stream): %s", self._req_id, upstream_name, err)
+                            _write(out)
+                            continue
+                        # apply_patch 缓冲
+                        if t == "response.output_item.added" and item.get("name") == "apply_patch" and item.get("type") == "function_call":
+                            patch_buf[oi] = {"seq": p.get("sequence_number", 0),
+                                             "call_id": item.get("call_id") or item.get("id", ""),
+                                             "output_index": oi, "args": ""}
+                            continue
+                        if oi is not None and oi in patch_buf:
+                            pb = patch_buf[oi]
+                            if t == "response.function_call_arguments.delta":
+                                pb["args"] += p.get("delta", "")
+                                continue
+                            if t == "response.function_call_arguments.done":
+                                pb["args"] = p.get("arguments", pb["args"])
+                                continue
+                            if t == "response.output_item.done":
+                                evs, cid, ptxt = _build_patch_events(pb)
+                                log.info("    [apply_patch] unwrapped: %s", repr(ptxt[:100]))
+                                for e in evs:
+                                    _emit(e)
+                                if cid:
+                                    patch_done[cid] = ptxt
+                                del patch_buf[oi]
+                                has_output = True
+                                continue
+                            continue
+                        if t == "response.completed":
+                            held_completed = p
+                            continue
+                        if b"output_text.delta" in out or b"function_call_arguments.delta" in out:
+                            has_output = True
+                        _write(out)
+                    if early_err:
+                        break
+                # 尾部残余（当前 resp 正常结束；重试时跳过）
+                if not early_err and buf.strip():
+                    buf2 = buf.replace(b"\r\n", b"\n")
+                    raw_blocks.append(buf2)
+                    out, usage, _ = self._process_sse_block(buf2, upstream_name)
                     if usage:
                         last_usage = usage
                     events += 1
-                    output_blocks.append(out)
-                    if b"output_text.delta" in block or b"function_call_arguments.delta" in block:
-                        has_output = True
-                    # 检测 response.failed（上游错误，不应截断重试）
-                    if b"response.failed" in block:
+                    _write(out)
+
+                # 早期 response.failed：决定重试 or 转发
+                if early_err and not has_output:
+                    code, err, out_bytes = early_err
+                    if attempt < MAX and _is_retriable_conv(code):
+                        wait = min(2 ** attempt, 4)
+                        log.warning("[#%d]     !!! %s early error code=%s, retry %d/%d in %ds",
+                                    self._req_id, upstream_name, code, attempt + 1, MAX, wait)
                         try:
-                            text = block.decode("utf-8", errors="replace")
-                            for line in text.split("\n"):
-                                if line.startswith("data: "):
-                                    p = json.loads(line[6:])
-                                    err = p.get("response", {}).get("error")
-                                    if err:
-                                        stream_error = err
-                                        log.warning("[#%d]     !!! %s response.failed: %s", self._req_id, upstream_name, err)
+                            resp.close()
                         except Exception:
                             pass
-            if buf.strip():
-                buf = buf.replace(b"\r\n", b"\n")
-                raw_blocks.append(buf)
-                out, usage, block_has_think = self._process_sse_block(buf, upstream_name)
-                if block_has_think:
-                    saw_think = True
-                if usage:
-                    last_usage = usage
-                events += 1
-                output_blocks.append(out)
+                        time.sleep(wait)  # 期间 keepalive 持续保活
+                        try:
+                            if upstream_name == "official":
+                                _official_limiter.acquire()
+                            resp = urlopen(Request(url, data=payload, headers=up_headers, method=method),
+                                           timeout=REQUEST_TIMEOUT)
+                        except Exception as oe:
+                            log.error("[#%d]     !!! %s reopen failed: %s", self._req_id, upstream_name, oe)
+                            _emit({"type": "response.failed", "sequence_number": events + 1,
+                                   "response": {"error": {"message": str(oe), "type": "upstream_error"}}})
+                            stream_error = str(oe)
+                            break
+                        continue  # 用新 resp 重试
+                    # 不可重试或重试用尽 → 转发 response.failed
+                    log.warning("[#%d]     !!! %s forwarding response.failed: %s", self._req_id, upstream_name, err)
+                    _write(out_bytes)
+                    stream_error = err
+                    break
+                # 正常完成或已真实输出（含中途错误已转发）→ 退出重试循环
+                break
 
-            # 检测到 think 标签时保存原始 SSE 到 debug 文件
-            if saw_think:
-                ts = time.strftime("%Y%m%d_%H%M%S")
-                path = os.path.join(LOG_DIR, f"debug_think_{ts}.txt")
-                with open(path, "w", encoding="utf-8") as f:
-                    for rb in raw_blocks:
-                        f.write(rb.decode("utf-8", errors="replace") + "\n\n")
-                log.warning("    [think] saved raw SSE to %s", path)
+            # 收尾：刷出残留 apply_patch 项（有 added 但未见 output_item.done）
+            for oi in list(patch_buf.keys()):
+                pb = patch_buf.pop(oi)
+                evs, cid, ptxt = _build_patch_events(pb)
+                for e in evs:
+                    _emit(e)
+                if cid:
+                    patch_done[cid] = ptxt
+                has_output = True
 
-            if not has_output:
-                for block in output_blocks:
-                    try:
-                        text = block.decode("utf-8", errors="replace")
-                        for line in text.split("\n"):
-                            if line.startswith("data: "):
-                                p = json.loads(line[6:])
-                                if p.get("type") == "response.completed":
-                                    if p.get("response", {}).get("output"):
-                                        has_output = True
-                    except Exception:
-                        pass
-
-            # 修复 apply_patch：function_call → custom_tool_call（与 Messages 路径一致）
-            _fix_apply_patch_args(output_blocks)
+            # response.completed：改写其中的 apply_patch 项后发出
+            if held_completed is not None:
+                out_arr = held_completed.get("response", {}).get("output", []) or []
+                for it in out_arr:
+                    cid = it.get("call_id")
+                    if it.get("name") == "apply_patch" and cid in patch_done:
+                        it["type"] = "custom_tool_call"
+                        it["id"] = f"ctc_{cid}"
+                        it["input"] = patch_done[cid]
+                        it.pop("arguments", None)
+                _emit(held_completed)
+            elif not has_output and not stream_error:
+                log.warning("[#%d]     !!! %s STREAM empty output (%d events)", self._req_id, upstream_name, events)
+                _emit({"type": "response.completed", "response": {"id": "resp_empty", "object": "response",
+                        "status": "completed", "output": [], "usage": last_usage or {}}})
 
             # 保存 exchange 用于排查
-            resp_text = b"".join(output_blocks).decode("utf-8", errors="replace")
+            resp_text = b"".join(raw_blocks).decode("utf-8", errors="replace")
             self._save_exchange(getattr(self, '_debug_req_body', {}), resp_text, upstream_name, "relay")
 
-            if has_output:
-                # 发送前检测处理后输出是否包含 think 标签
-                for ob in output_blocks:
-                    if b"<think" in ob or b"</think" in ob or b"&lt;think" in ob:
-                        saw_think = True
-                        log.warning("    [think] OUTPUT block (after process): %s", repr(ob[:300]))
-                if saw_think:
-                    # 保存完整处理后的输出
-                    ts = time.strftime("%Y%m%d_%H%M%S")
-                    path = os.path.join(LOG_DIR, f"debug_output_{ts}.txt")
-                    with open(path, "w", encoding="utf-8") as f:
-                        for ob in output_blocks:
-                            f.write(ob.decode("utf-8", errors="replace"))
-                    log.warning("    [think] saved OUTPUT to %s", path)
-                self.send_response(200)
-                for h in ["Content-Type", "Cache-Control"]:
-                    v = resp.headers.get(h)
-                    if v:
-                        self.send_header(h, v)
-                self.send_header("Connection", "close")
-                self.end_headers()
-                for block in output_blocks:
-                    self.wfile.write(block)
-                    self.wfile.flush()
-                self.close_connection = True
-                log.info("[#%d]     <<< %s STREAM OK (%d events, %dms)", self._req_id, upstream_name, events, self._ms())
-                if last_usage:
-                    inp = last_usage.get("input_tokens", 0)
-                    out = last_usage.get("output_tokens", 0)
-                    log.info("    usage: input=%d output=%d total=%d", inp, out, inp + out)
-            else:
-                # 空输出时检查是否有 response.failed 错误
-                if not stream_error:
-                    for block in output_blocks:
-                        try:
-                            text = block.decode("utf-8", errors="replace")
-                            for line in text.split("\n"):
-                                if line.startswith("data: "):
-                                    p = json.loads(line[6:])
-                                    if p.get("type") == "response.failed":
-                                        stream_error = p.get("response", {}).get("error")
-                        except Exception:
-                            pass
-                if stream_error:
-                    # 上游明确报错 → 直接转发 response.failed 给客户端，不截断重试
-                    log.warning("[#%d]     !!! %s upstream error, forwarding response.failed: %s",
-                                self._req_id, upstream_name, stream_error)
-                    self.send_response(200)
-                    for h in ["Content-Type", "Cache-Control"]:
-                        v = resp.headers.get(h)
-                        if v:
-                            self.send_header(h, v)
-                    self.send_header("Connection", "close")
-                    self.end_headers()
-                    for block in output_blocks:
-                        self.wfile.write(block)
-                        self.wfile.flush()
-                    self.close_connection = True
-                    has_output = True  # 标记已处理，阻止外层截断重试
-                else:
-                    log.warning("[#%d]     !!! %s STREAM empty output (%d events)", self._req_id, upstream_name, events)
-
-        except (ConnectionResetError, BrokenPipeError):
+            log.info("[#%d]     <<< %s STREAM OK (%d events, %dms)", self._req_id, upstream_name, events, self._ms())
+            if last_usage:
+                inp = last_usage.get("input_tokens", 0)
+                out_ = last_usage.get("output_tokens", 0)
+                log.info("    usage: input=%d output=%d total=%d", inp, out_, inp + out_)
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
             log.warning("[#%d]     <<< %s STREAM interrupted", self._req_id, upstream_name)
+        finally:
+            stop_ka.set()
 
-        return events, has_output, stream_error
+        return events, True, stream_error  # 已发响应头，总是 done（不回退下一上游）
 
     @staticmethod
     def _process_sse_block(block, upstream_name=None):
@@ -1937,8 +2429,7 @@ class Handler(BaseHTTPRequestHandler):
     def _send_context_exceeded(self, body, up):
         """上下文超限时返回 400 invalid_request_error，触发客户端自动压缩。"""
         max_ctx = up.get("max_context_tokens", 200000)
-        payload_bytes = len(json.dumps(body).encode())
-        est_tokens = payload_bytes / 3.5
+        est_tokens = _est_tokens(body)  # 剔除 base64 图片，避免虚高
         log.warning("[#%d]     !!! context overflow (~%dK > %dK), returning 400 to client",
                      getattr(self, '_req_id', 0), int(est_tokens // 1000), max_ctx // 1000)
         err_resp = json.dumps({
@@ -1987,7 +2478,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.5 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.9 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
