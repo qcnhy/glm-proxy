@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.9 — codex-relay + Python 路由层
+GLM API 代理 v2.9.10 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -1526,6 +1526,7 @@ class Handler(BaseHTTPRequestHandler):
         has_output = False
         context_exceeded = False
         stream_error = False
+        saw_message_stop = False
         last_usage = {}
         open_indices = []
         total_bytes = 0
@@ -1579,13 +1580,22 @@ class Handler(BaseHTTPRequestHandler):
                                         self._req_id, upstream_name, pe,
                                         repr(block.decode("utf-8", errors="replace")[:500]))
                         stream_error = True
-                        # 就地合成正常结束（关闭未关闭的 content_block）
-                        for idx in open_indices:
-                            self.wfile.write(("event: content_block_stop\ndata: {\"type\": \"content_block_stop\", \"index\": " + str(idx) + "}\n\n").encode())
-                        self.wfile.write(b'event: message_delta\ndata: {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 0}}\n\nevent: message_stop\ndata: {"type": "message_stop"}\n\n')
-                        self.wfile.flush()
-                        log.info("[#%d] [messages] %s stream error intercepted, synthesized end (closed %d blocks)", self._req_id, upstream_name, len(open_indices))
-                        break  # 错误后结束流
+                        break  # 错误后由收尾逻辑合成正常结束
+
+                    # 校验 data JSON 合法性，避免转发畸形块导致客户端解码失败
+                    if (b"\ndata: " in block or block.startswith(b"data: ")) and b"event: ping" not in block:
+                        malformed = False
+                        for line in block.decode("utf-8", errors="replace").split("\n"):
+                            if line.startswith("data: "):
+                                try:
+                                    json.loads(line[6:])
+                                except Exception:
+                                    malformed = True
+                                    break
+                        if malformed:
+                            log.warning("[#%d] [messages] %s dropping malformed block: %s",
+                                        self._req_id, upstream_name, repr(block[:200]))
+                            continue
 
                     # 增量转发该块
                     out = block + b"\n\n"
@@ -1606,6 +1616,8 @@ class Handler(BaseHTTPRequestHandler):
                                     idx = json.loads(line[6:]).get("index", -1)
                                     if idx in open_indices: open_indices.remove(idx)
                         except: pass
+                    elif b"message_stop" in block:
+                        saw_message_stop = True
                     elif b"message_delta" in block:
                         try:
                             for line in block.decode("utf-8", errors="replace").split("\n"):
@@ -1617,6 +1629,15 @@ class Handler(BaseHTTPRequestHandler):
                         except: pass
                 if stream_error:
                     break  # 错误后退出外层 chunk 循环
+            # 上游流不完整（EOF 但未见 message_stop，如中转中途断流）→ 合成正常收尾，
+            # 否则客户端会 "stream disconnected / error decoding response body"
+            if not saw_message_stop:
+                log.warning("[#%d] [messages] %s upstream incomplete (no message_stop), synthesizing close (open=%d, err=%s, %dKB)",
+                            self._req_id, upstream_name, len(open_indices), stream_error, total_bytes // 1024)
+                for idx in open_indices:
+                    self.wfile.write(("event: content_block_stop\ndata: {\"type\": \"content_block_stop\", \"index\": " + str(idx) + "}\n\n").encode())
+                self.wfile.write(b'event: message_delta\ndata: {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 0}}\n\nevent: message_stop\ndata: {"type": "message_stop"}\n\n')
+                self.wfile.flush()
             size_str = (str(size // 1024) + "KB") if size >= 1024 else (str(size) + "B")
             if last_usage:
                 log.info("[#%d]     <<< %s STREAM OK (%s, %dms) usage: input=%d output=%d total=%d",
@@ -1625,8 +1646,20 @@ class Handler(BaseHTTPRequestHandler):
                          last_usage.get("input_tokens", 0) + last_usage.get("output_tokens", 0))
             else:
                 log.info("[#%d]     <<< %s STREAM OK (%s, %dms)", self._req_id, upstream_name, size_str, self._ms())
-        except (ConnectionResetError, BrokenPipeError):
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
             log.warning("[#%d]     <<< %s STREAM interrupted", self._req_id, upstream_name)
+        except Exception as e:
+            # 任何其他异常：合成干净收尾，避免客户端解码失败
+            log.error("[#%d] [messages] %s stream exception: %s — synthesizing clean close",
+                      self._req_id, upstream_name, e)
+            try:
+                for idx in open_indices:
+                    self.wfile.write(("event: content_block_stop\ndata: {\"type\": \"content_block_stop\", \"index\": " + str(idx) + "}\n\n").encode())
+                if not saw_message_stop:
+                    self.wfile.write(b'event: message_delta\ndata: {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 0}}\n\nevent: message_stop\ndata: {"type": "message_stop"}\n\n')
+                self.wfile.flush()
+            except Exception:
+                pass
 
         return has_output, last_usage, context_exceeded, stream_error
 
@@ -2478,7 +2511,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.9 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.10 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
