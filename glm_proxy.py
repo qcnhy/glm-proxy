@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.10 — codex-relay + Python 路由层
+GLM API 代理 v2.9.11 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -2310,6 +2310,7 @@ class Handler(BaseHTTPRequestHandler):
                                     patch_done[cid] = ptxt
                                 del patch_buf[oi]
                                 has_output = True
+                                stop_ka.set()
                                 continue
                             continue
                         if t == "response.completed":
@@ -2317,6 +2318,7 @@ class Handler(BaseHTTPRequestHandler):
                             continue
                         if b"output_text.delta" in out or b"function_call_arguments.delta" in out:
                             has_output = True
+                            stop_ka.set()  # 真实输出已开始，停 keepalive（避免终止事件后继续写注释让客户端干等）
                         _write(out)
                     if early_err:
                         break
@@ -2383,10 +2385,13 @@ class Handler(BaseHTTPRequestHandler):
                         it["input"] = patch_done[cid]
                         it.pop("arguments", None)
                 _emit(held_completed)
-            elif not has_output and not stream_error:
-                log.warning("[#%d]     !!! %s STREAM empty output (%d events)", self._req_id, upstream_name, events)
-                _emit({"type": "response.completed", "response": {"id": "resp_empty", "object": "response",
-                        "status": "completed", "output": [], "usage": last_usage or {}}})
+            elif not stream_error:
+                # 上游未发 response.completed（不完整流）→ 合成收尾，避免客户端"响应结束但一直转"
+                log.warning("[#%d]     !!! %s no response.completed, synthesizing (has_output=%s, events=%d)",
+                            self._req_id, upstream_name, has_output, events)
+                _emit({"type": "response.completed", "sequence_number": events + 1,
+                       "response": {"id": "resp_syn", "object": "response",
+                                    "status": "completed", "output": [], "usage": last_usage or {}}})
 
             # 保存 exchange 用于排查
             resp_text = b"".join(raw_blocks).decode("utf-8", errors="replace")
@@ -2511,7 +2516,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.10 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.11 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
