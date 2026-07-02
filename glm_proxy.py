@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.11 — codex-relay + Python 路由层
+GLM API 代理 v2.9.12 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -67,6 +67,13 @@ def _setup_logger():
     ch = logging.StreamHandler()
     ch.setFormatter(fmt)
     log.addHandler(ch)
+    # 进程内直接写文件（不依赖启动命令的 stderr 重定向，Windows 也有日志）
+    try:
+        fh = logging.FileHandler(os.path.join(LOG_DIR, "proxy.log"), encoding="utf-8")
+        fh.setFormatter(fmt)
+        log.addHandler(fh)
+    except Exception as e:
+        print(f"[FileHandler failed: {e}]", file=sys.stderr)
     return log
 
 log = _setup_logger()
@@ -2516,7 +2523,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.11 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.12 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
