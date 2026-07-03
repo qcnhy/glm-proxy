@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.13 — codex-relay + Python 路由层
+GLM API 代理 v2.9.14 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -1846,8 +1846,15 @@ class Handler(BaseHTTPRequestHandler):
         has_output = [False]
 
         def _resp_obj(status):
+            # Responses usage 必须含 total_tokens（Codex 严格解析，缺失会 "failed to parse ResponseCompleted"）
+            u = dict(usage[0])
+            inp = u.get("input_tokens", 0) or 0
+            out = u.get("output_tokens", 0) or 0
+            u["input_tokens"] = inp
+            u["output_tokens"] = out
+            u["total_tokens"] = inp + out
             return {"id": rid[0] or "resp_syn", "object": "response", "created_at": created_at[0],
-                    "status": status, "model": model[0] or "glm-5.2", "output": output_items, "usage": usage[0]}
+                    "status": status, "model": model[0] or "glm-5.2", "output": output_items, "usage": u}
 
         def _emit_created():
             if created_sent[0]:
@@ -2747,7 +2754,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.13 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.14 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
