@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.12 — codex-relay + Python 路由层
+GLM API 代理 v2.9.13 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -1828,6 +1828,205 @@ class Handler(BaseHTTPRequestHandler):
 
         return len(output_blocks), has_output
 
+    def _converted_stream_sync(self, resp, upstream_name, _write, _emit, stop_ka):
+        """同步翻译 Anthropic Messages SSE → OpenAI Responses SSE，边收边发。
+        纯同步、无 worker 线程/async loop，不可能挂起；收到 message_stop 就地发 response.completed。
+        返回 (done, early_err)，early_err=(code,msg) 为真实输出前的上游错误（供上层重试）。"""
+        seq = [0]
+        def nseq():
+            seq[0] += 1
+            return seq[0]
+        rid = [None]
+        model = [None]
+        created_at = [int(time.time())]
+        usage = [{}]
+        blocks = {}        # anthropic content_block index -> 状态 dict
+        output_items = []  # response.completed 的 output 数组
+        created_sent = [False]
+        has_output = [False]
+
+        def _resp_obj(status):
+            return {"id": rid[0] or "resp_syn", "object": "response", "created_at": created_at[0],
+                    "status": status, "model": model[0] or "glm-5.2", "output": output_items, "usage": usage[0]}
+
+        def _emit_created():
+            if created_sent[0]:
+                return
+            ro = _resp_obj("in_progress")
+            _emit({"sequence_number": nseq(), "type": "response.created", "response": ro})
+            _emit({"sequence_number": nseq(), "type": "response.in_progress", "response": ro})
+            created_sent[0] = True
+
+        def _on_event(et, d):
+            # 返回 "done" / ("error",code,msg) / None
+            if et == "message_start":
+                msg = d.get("message", {}) or {}
+                rid[0] = msg.get("id")
+                model[0] = msg.get("model")
+                u = msg.get("usage", {}) or {}
+                if u:
+                    usage[0].update(u)
+                _emit_created()
+            elif et == "content_block_start":
+                _emit_created()
+                idx = d.get("index", 0)
+                cb = d.get("content_block", {}) or {}
+                btype = cb.get("type")
+                oi = idx
+                if btype == "text":
+                    iid = "msg_" + (rid[0] or "x")
+                    blocks[idx] = {"type": "text", "iid": iid, "oi": oi, "text": ""}
+                    _emit({"sequence_number": nseq(), "type": "response.output_item.added", "output_index": oi,
+                           "item": {"id": iid, "type": "message", "status": "in_progress", "role": "assistant", "content": []}})
+                    _emit({"sequence_number": nseq(), "type": "response.content_part.added", "item_id": iid,
+                           "output_index": oi, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}})
+                elif btype == "thinking":
+                    iid = "rs_" + (rid[0] or "x")
+                    blocks[idx] = {"type": "thinking", "iid": iid, "oi": oi, "text": ""}
+                    _emit({"sequence_number": nseq(), "type": "response.output_item.added", "output_index": oi,
+                           "item": {"id": iid, "type": "reasoning", "status": "in_progress", "summary": []}})
+                    _emit({"sequence_number": nseq(), "type": "response.reasoning_summary_part.added", "item_id": iid,
+                           "output_index": oi, "summary_index": 0, "part": {"type": "summary_text", "text": ""}})
+                elif btype == "tool_use":
+                    call_id = cb.get("id", "call_x")
+                    name = cb.get("name", "")
+                    iid = "fc_" + call_id
+                    blocks[idx] = {"type": "tool_use", "iid": iid, "oi": oi, "call_id": call_id, "name": name, "args": ""}
+                    # apply_patch 缓冲到 stop 时合成 custom_tool_call，此处不发 function_call 事件
+                    if name != "apply_patch":
+                        _emit({"sequence_number": nseq(), "type": "response.output_item.added", "output_index": oi,
+                               "item": {"id": iid, "type": "function_call", "status": "in_progress", "call_id": call_id, "name": name}})
+            elif et == "content_block_delta":
+                idx = d.get("index", 0)
+                b = blocks.get(idx)
+                if not b:
+                    return None
+                delta = d.get("delta", {}) or {}
+                dt = delta.get("type")
+                if dt == "text_delta":
+                    t = delta.get("text", "")
+                    b["text"] += t
+                    _emit({"sequence_number": nseq(), "type": "response.output_text.delta", "item_id": b["iid"],
+                           "output_index": b["oi"], "content_index": 0, "delta": t})
+                    has_output[0] = True; stop_ka.set()
+                elif dt == "thinking_delta":
+                    t = delta.get("thinking", "")
+                    b["text"] += t
+                    _emit({"sequence_number": nseq(), "type": "response.reasoning_summary_text.delta", "item_id": b["iid"],
+                           "output_index": b["oi"], "summary_index": 0, "delta": t})
+                    has_output[0] = True; stop_ka.set()
+                elif dt == "input_json_delta":
+                    t = delta.get("partial_json", "")
+                    b["args"] += t
+                    # apply_patch 的 args 缓冲（不发 delta，stop 时一次性合成 custom_tool_call）
+                    if b.get("name") != "apply_patch":
+                        _emit({"sequence_number": nseq(), "type": "response.function_call_arguments.delta", "item_id": b["iid"],
+                               "output_index": b["oi"], "delta": t})
+                        has_output[0] = True; stop_ka.set()
+            elif et == "content_block_stop":
+                idx = d.get("index", 0)
+                b = blocks.get(idx)
+                if not b:
+                    return None
+                if b["type"] == "text":
+                    _emit({"sequence_number": nseq(), "type": "response.output_text.done", "item_id": b["iid"],
+                           "output_index": b["oi"], "content_index": 0, "text": b["text"]})
+                    _emit({"sequence_number": nseq(), "type": "response.content_part.done", "item_id": b["iid"],
+                           "output_index": b["oi"], "content_index": 0, "part": {"type": "output_text", "text": b["text"], "annotations": []}})
+                    item = {"id": b["iid"], "type": "message", "status": "completed", "role": "assistant",
+                            "content": [{"type": "output_text", "text": b["text"], "annotations": []}]}
+                    _emit({"sequence_number": nseq(), "type": "response.output_item.done", "output_index": b["oi"], "item": item})
+                    output_items.append(item)
+                elif b["type"] == "thinking":
+                    _emit({"sequence_number": nseq(), "type": "response.reasoning_summary_part.done", "item_id": b["iid"],
+                           "output_index": b["oi"], "summary_index": 0, "part": {"type": "summary_text", "text": b["text"]}})
+                    item = {"id": b["iid"], "type": "reasoning", "status": "completed",
+                            "summary": [{"type": "summary_text", "text": b["text"]}]}
+                    _emit({"sequence_number": nseq(), "type": "response.output_item.done", "output_index": b["oi"], "item": item})
+                    output_items.append(item)
+                elif b["type"] == "tool_use":
+                    if b.get("name") == "apply_patch":
+                        pb = {"call_id": b["call_id"], "output_index": b["oi"], "args": b["args"]}
+                        evs, cid, ptxt = _build_patch_events(pb)
+                        for e in evs:
+                            e["sequence_number"] = nseq()
+                            _emit(e)
+                        output_items.append({"id": f"ctc_{cid}", "type": "custom_tool_call", "status": "completed",
+                                             "call_id": cid, "name": "apply_patch", "input": ptxt})
+                        has_output[0] = True
+                    else:
+                        _emit({"sequence_number": nseq(), "type": "response.function_call_arguments.done",
+                               "item_id": b["iid"], "output_index": b["oi"], "arguments": b["args"]})
+                        item = {"id": b["iid"], "type": "function_call", "status": "completed",
+                                "call_id": b["call_id"], "name": b["name"], "arguments": b["args"]}
+                        _emit({"sequence_number": nseq(), "type": "response.output_item.done", "output_index": b["oi"], "item": item})
+                        output_items.append(item)
+            elif et == "message_delta":
+                u = d.get("usage", {}) or {}
+                if u:
+                    usage[0].update(u)
+            elif et == "message_stop":
+                _emit_created()
+                _emit({"sequence_number": nseq(), "type": "response.completed", "response": _resp_obj("completed")})
+                return "done"
+            elif et == "error":
+                err = d.get("error", d)
+                code = err.get("code") if isinstance(err, dict) else None
+                msg = (err.get("message", "") if isinstance(err, dict) else str(err))
+                return ("error", code, msg)
+            return None
+
+        buf = b""
+        done = False
+        early_err = None
+        try:
+            while not done and early_err is None:
+                chunk = resp.read(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n\n" in buf or b"\r\n\r\n" in buf:
+                    if b"\r\n\r\n" in buf:
+                        block, buf = buf.split(b"\r\n\r\n", 1)
+                    else:
+                        block, buf = buf.split(b"\n\n", 1)
+                    block = block.replace(b"\r\n", b"\n")
+                    et, dj = None, None
+                    for line in block.decode("utf-8", errors="replace").split("\n"):
+                        if line.startswith("event: "):
+                            et = line[7:].strip()
+                        elif line.startswith("data: "):
+                            try:
+                                dj = json.loads(line[6:])
+                            except Exception:
+                                pass
+                    if not et or not dj:
+                        continue
+                    r = _on_event(et, dj)
+                    if r == "done":
+                        done = True
+                        break
+                    if isinstance(r, tuple) and r[0] == "error":
+                        if not has_output[0]:
+                            early_err = (r[1], r[2])
+                        else:
+                            _emit({"sequence_number": nseq(), "type": "response.failed",
+                                   "response": {"error": {"message": (r[2] or "upstream error"), "code": r[1], "type": "upstream_error"}}})
+                            done = True
+                        break
+            # 上游 EOF 但未发 message_stop：合成完成（避免客户端干等，这是治"响应结束仍等待"的关键）
+            if not done and early_err is None:
+                log.warning("[#%d] [converted] %s upstream EOF without message_stop, synthesizing completed",
+                            self._req_id, upstream_name)
+                _emit_created()
+                _emit({"sequence_number": nseq(), "type": "response.completed", "response": _resp_obj("completed")})
+                done = True
+            log.info("[#%d]     <<< %s [converted] STREAM OK (sync, %dms, out=%d)",
+                     self._req_id, upstream_name, self._ms(), len(output_items))
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            log.warning("[#%d]     <<< %s [converted] STREAM interrupted", self._req_id, upstream_name)
+        return done, early_err
+
     # ── Responses→Messages 增量流式（边收边转边发）──
     def _converted_stream(self, resp, upstream_name):
         """增量流式：上游 Anthropic Messages SSE → 经 ccproxy 转换器 → Responses SSE 边转边发。
@@ -2140,47 +2339,72 @@ class Handler(BaseHTTPRequestHandler):
         return call_id, patch_text
 
     def _converted_stream_with_retry(self, first_resp, up, url, up_headers, payload, method):
-        """converted 路径：早期错误（1305 等）退避重试，用尽/不可重试则把错误转发给客户端。
-        返回 {done: bool}；done=False 表示真空输出（无错误），由上层回退下一上游。"""
+        """converted 路径：立即发响应头 + keepalive（防 TTFT 期 idle 超时），同步翻译
+        Anthropic→Responses（无 async，不可能挂），早期错误退避重试，用尽则流内转发。
+        返回 {done: bool}（已发响应头，总是 done）。"""
+        import threading
+        upstream_name = up["name"]
         MAX = 2
+        wlock = threading.Lock()
+        stop_ka = threading.Event()
+        def _write(data):
+            with wlock:
+                self.wfile.write(data); self.wfile.flush()
+        def _emit(ed):
+            _write((f"event: {ed.get('type', '')}\ndata: {json.dumps(ed, ensure_ascii=False)}\n\n").encode())
+        def _keepalive():
+            while not stop_ka.wait(5):
+                try:
+                    _write(b": keepalive\n\n")
+                except Exception:
+                    break
+        # 立即发响应头进入 SSE 模式 + 启动 keepalive
+        self.send_response(200)
+        for h in ["Content-Type", "Cache-Control"]:
+            v = first_resp.headers.get(h)
+            if v:
+                self.send_header(h, v)
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        kat = threading.Thread(target=_keepalive, daemon=True)
+        kat.start()
         resp = first_resp
-        for attempt in range(MAX + 1):
-            res = self._converted_stream(resp, up["name"])
-            if res.get("committed"):
+        try:
+            for attempt in range(MAX + 1):
+                done, early_err = self._converted_stream_sync(resp, upstream_name, _write, _emit, stop_ka)
+                if done:
+                    return {"done": True}
+                if early_err:
+                    code, msg = early_err
+                    if attempt < MAX and _is_retriable_conv(code):
+                        wait = min(2 ** attempt, 4)
+                        log.warning("[#%d] [converted] %s early error code=%s, retry %d/%d in %ds",
+                                    self._req_id, upstream_name, code, attempt + 1, MAX, wait)
+                        try:
+                            resp.close()
+                        except Exception:
+                            pass
+                        time.sleep(wait)  # 期间 keepalive 持续保活
+                        try:
+                            if upstream_name == "official":
+                                _official_limiter.acquire()
+                            resp = urlopen(Request(url, data=payload, headers=up_headers, method=method),
+                                           timeout=REQUEST_TIMEOUT)
+                        except Exception as oe:
+                            log.error("[#%d] [converted] reopen failed: %s", self._req_id, oe)
+                            _emit({"sequence_number": 0, "type": "response.failed",
+                                   "response": {"error": {"message": str(oe), "type": "upstream_error"}}})
+                            return {"done": True}
+                        continue
+                    _emit({"sequence_number": 0, "type": "response.failed",
+                           "response": {"error": {"message": msg or "upstream error", "code": code, "type": "upstream_error"}}})
+                    return {"done": True}
                 return {"done": True}
-            if res.get("early_error"):
-                code = res.get("code")
-                msg = res.get("msg", "")
-                if attempt < MAX and _is_retriable_conv(code):
-                    wait = min(2 ** attempt, 4)
-                    log.warning("[#%d] [converted] %s early error code=%s, retry %d/%d in %ds",
-                                self._req_id, up["name"], code, attempt + 1, MAX, wait)
-                    try:
-                        resp.close()
-                    except Exception:
-                        pass
-                    time.sleep(wait)
-                    try:
-                        if up["name"] == "official":
-                            _official_limiter.acquire()
-                        resp = urlopen(Request(url, data=payload, headers=up_headers, method=method),
-                                       timeout=REQUEST_TIMEOUT)
-                    except Exception as oe:
-                        log.error("[#%d] [converted] reopen failed: %s", self._req_id, oe)
-                        self._forward_conv_error({"code": None, "msg": str(oe)})
-                        return {"done": True}
-                    continue
-                log.warning("[#%d] [converted] %s forwarding error to client: code=%s msg=%s",
-                            self._req_id, up["name"], code, str(msg)[:120])
-                self._forward_conv_error(res)
-                return {"done": True}
-            # 真空输出（committed=False, 无错误）→ 回退下一上游
-            try:
-                resp.close()
-            except Exception:
-                pass
-            return {"done": False}
-        return {"done": False}
+        finally:
+            stop_ka.set()
+        return {"done": True}
+
 
     def _forward_conv_error(self, res):
         """把上游早期错误作为 HTTP 错误响应转发给客户端（让用户看到真实原因）。"""
@@ -2523,7 +2747,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.12 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.13 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
