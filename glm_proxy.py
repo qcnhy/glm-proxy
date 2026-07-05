@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.14 — codex-relay + Python 路由层
+GLM API 代理 v2.9.15 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -1536,6 +1536,7 @@ class Handler(BaseHTTPRequestHandler):
         saw_message_stop = False
         last_usage = {}
         open_indices = []
+        skip_indices = set()  # 客户端不支持的 server_tool_use 等内容块 index，转发时跳过
         total_bytes = 0
         block_count = 0
         size = 0
@@ -1603,6 +1604,37 @@ class Handler(BaseHTTPRequestHandler):
                             log.warning("[#%d] [messages] %s dropping malformed block: %s",
                                         self._req_id, upstream_name, repr(block[:200]))
                             continue
+
+                    # 过滤客户端不支持的 server_tool_use 等服务端工具内容块
+                    # （GLM 偶发产出，Claude Code 不认 → "Unsupported content type"）
+                    _SERVER_TOOL_TYPES = {
+                        "server_tool_use", "web_search_tool_result",
+                        "code_execution_tool_use", "code_execution_tool_result",
+                        "computer_tool_use", "computer_tool_result",
+                        "bash_tool_use", "bash_tool_result",
+                        "text_editor_tool_use", "text_editor_tool_result",
+                    }
+                    try:
+                        _elines = block.decode("utf-8", errors="replace").split("\n")
+                        _etype = next((l[7:].strip() for l in _elines if l.startswith("event: ")), None)
+                        _dj = None
+                        for _l in _elines:
+                            if _l.startswith("data: "):
+                                _dj = json.loads(_l[6:]); break
+                        if _etype == "content_block_start" and isinstance(_dj, dict):
+                            _cbt = (_dj.get("content_block") or {}).get("type", "")
+                            if _cbt in _SERVER_TOOL_TYPES:
+                                skip_indices.add(_dj.get("index", 0))
+                                log.warning("[#%d] [messages] %s dropping unsupported content_block type=%s idx=%s",
+                                            self._req_id, upstream_name, _cbt, _dj.get("index"))
+                                continue
+                        elif _etype in ("content_block_delta", "content_block_stop") and isinstance(_dj, dict):
+                            if _dj.get("index", 0) in skip_indices:
+                                if _etype == "content_block_stop":
+                                    skip_indices.discard(_dj.get("index", 0))
+                                continue
+                    except Exception:
+                        pass
 
                     # 增量转发该块
                     out = block + b"\n\n"
@@ -2754,7 +2786,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.14 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.15 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
