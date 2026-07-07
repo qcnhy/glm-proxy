@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.15 — codex-relay + Python 路由层
+GLM API 代理 v2.9.18 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -115,74 +115,43 @@ def _send_feishu(msg):
     except:
         pass
 
-# ── 内网健康检查（模型验证）──────────────────────────────
-internal_alive = False
-
-def _check_internal():
-    global internal_alive
-    up = UPSTREAMS[0]
-    url = up["openai_url"].rstrip("/") + "/chat/completions"
+# ── 内网健康检查（仅启动时一次，用于确认真实模型）──────────────────────────────
+def _check_internal_once():
+    """启动时检查一次内网渠道，记录真实模型信息（不影响路由逻辑，仅作日志）。"""
+    # 找 internal 渠道
+    internal_up = None
+    for up in UPSTREAMS:
+        if up.get("name") == "internal":
+            internal_up = up
+            break
+    if not internal_up:
+        return
+    url = internal_up["openai_url"].rstrip("/") + "/chat/completions"
     body = json.dumps({
-        "model": up["model"],
+        "model": internal_up["model"],
         "messages": [
             {"role": "system", "content": "你必须在回复的第一行说出你的确切模型名称和版本号。不要说其他内容。"},
             {"role": "user", "content": "你的模型名称和版本号？"},
         ],
-        "max_tokens": 50,
+        "max_tokens": 80,
         "stream": False,
     }).encode()
-    expected = up["model"].lower().replace("-", "").replace(" ", "")
-    first = True
-    while True:
-        prev = internal_alive
-        reason = ""
-        try:
-            req = Request(url, data=body, headers={
-                "Authorization": f"Bearer {up['key']}",
-                "Content-Type": "application/json",
-            }, method="POST")
-            resp = urlopen(req, timeout=60)
-            r = json.loads(resp.read())
-            returned_model = r.get("model", "")
-            choices = r.get("choices", [])
-            has_content = choices and choices[0].get("message", {}).get("content")
-            model_match = returned_model and (returned_model == up["model"] or up["model"].startswith(returned_model))
-            identity_ok = False
-            if has_content:
-                answer = choices[0]["message"]["content"].strip().split("\n")[0].lower().replace("-", "").replace(" ", "")
-                identity_ok = expected in answer
-            if has_content and model_match and identity_ok:
-                internal_alive = True
-            else:
-                internal_alive = False
-                if not model_match:
-                    reason = f"model 字段不匹配 (expected={up['model']}, got={returned_model})"
-                    log.warning("[health] internal model field mismatch: expected=%s, got=%s", up["model"], returned_model)
-                elif not identity_ok:
-                    answer_raw = choices[0]["message"]["content"].strip().split("\n")[0] if has_content else ""
-                    reason = f"模型自称不匹配 (got={answer_raw})"
-                    log.warning("[health] internal identity mismatch: %s", answer_raw)
-                else:
-                    reason = "空响应"
-                    log.warning("[health] internal empty response")
-        except HTTPError as e:
-            internal_alive = False
-            reason = f"HTTP {e.code}"
-            log.warning("[health] internal HTTP %d", e.code)
-        except Exception as e:
-            internal_alive = False
-            reason = f"连接失败 ({type(e).__name__})"
-            log.warning("[health] internal check failed: %s: %s", type(e).__name__, e)
-        if first or internal_alive != prev:
-            log.info("[health] internal %s (identity=%s)", "UP" if internal_alive else "DOWN",
-                     choices[0]["message"]["content"].strip().split("\n")[0] if internal_alive and choices else reason)
-            if internal_alive == False and prev == True:
-                _send_feishu("GLM proxy DOWN: " + reason + " " + up["openai_url"])
-            elif internal_alive == True and prev == False:
-                _send_feishu("GLM proxy UP: " + up["openai_url"])
-        first = False
-        time.sleep(300)
-
+    try:
+        req = Request(url, data=body, headers={
+            "Authorization": f"Bearer {internal_up['key']}",
+            "Content-Type": "application/json",
+        }, method="POST")
+        resp = urlopen(req, timeout=60)
+        r = json.loads(resp.read())
+        returned_model = r.get("model", "")
+        choices = r.get("choices", [])
+        has_content = choices and choices[0].get("message", {}).get("content")
+        answer = choices[0]["message"]["content"].strip() if has_content else ""
+        log.info("[health] internal check (startup only): model=%s, answer=%s", returned_model, answer.split('\n')[0][:50])
+    except HTTPError as e:
+        log.warning("[health] internal HTTP %d (startup check)", e.code)
+    except Exception as e:
+        log.warning("[health] internal check failed: %s: %s (startup check)", type(e).__name__, e)
 
 
 # ── codex-relay 拦截器（注入 stream_options + 跟踪 usage + 日志）──
@@ -1280,8 +1249,6 @@ class Handler(BaseHTTPRequestHandler):
             if up.get("disabled"):
                 continue
             if force_official and up["name"] != "official":
-                continue
-            if up.get("require_health") and not internal_alive:
                 continue
             if up.get("worktime_only") and not is_worktime:
                 continue
@@ -2786,7 +2753,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.15 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.18 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
@@ -2803,8 +2770,8 @@ if __name__ == "__main__":
     _start_relays()
     time.sleep(1)
 
-    # 健康检查线程（暂时关闭内网探测）
-    # threading.Thread(target=_check_internal, daemon=True).start()
+    # 内网健康检查（仅启动时一次，确认真实模型）
+    threading.Thread(target=_check_internal_once, daemon=True).start()
 
     # 优雅退出
     def _shutdown(sig, frame):
