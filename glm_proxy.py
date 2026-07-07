@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.18 — codex-relay + Python 路由层
+GLM API 代理 v2.9.19 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -117,7 +117,8 @@ def _send_feishu(msg):
 
 # ── 内网健康检查（仅启动时一次，用于确认真实模型）──────────────────────────────
 def _check_internal_once():
-    """启动时检查一次内网渠道，记录真实模型信息（不影响路由逻辑，仅作日志）。"""
+    """启动时检查一次内网渠道，记录真实模型信息（不影响路由逻辑，仅作日志）。
+    优先用 /models 端点探测（秒回，不生成），失败再退化到 chat/completions。"""
     # 找 internal 渠道
     internal_up = None
     for up in UPSTREAMS:
@@ -126,6 +127,22 @@ def _check_internal_once():
             break
     if not internal_up:
         return
+    # 优先用 /models 端点探测（秒回，不生成），失败再退化到 chat/completions
+    models_url = internal_up["openai_url"].rstrip("/") + "/models"
+    try:
+        req = Request(models_url, headers={
+            "Authorization": f"Bearer {internal_up['key']}",
+        }, method="GET")
+        resp = urlopen(req, timeout=15)
+        r = json.loads(resp.read())
+        models = [m.get("id") for m in r.get("data", []) if m.get("id")]
+        log.info("[health] internal /models (startup): 可用模型=%s", models[:8] if models else "(空)")
+        return
+    except HTTPError as e:
+        log.warning("[health] internal /models HTTP %d，退化到 chat/completions", e.code)
+    except Exception as e:
+        log.warning("[health] internal /models 失败(%s)，退化到 chat/completions", type(e).__name__)
+
     url = internal_up["openai_url"].rstrip("/") + "/chat/completions"
     body = json.dumps({
         "model": internal_up["model"],
@@ -141,7 +158,7 @@ def _check_internal_once():
             "Authorization": f"Bearer {internal_up['key']}",
             "Content-Type": "application/json",
         }, method="POST")
-        resp = urlopen(req, timeout=60)
+        resp = urlopen(req, timeout=120)
         r = json.loads(resp.read())
         returned_model = r.get("model", "")
         choices = r.get("choices", [])
@@ -2753,7 +2770,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.18 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.19 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
