@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.20 — codex-relay + Python 路由层
+GLM API 代理 v2.9.22 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -1231,7 +1231,21 @@ class Handler(BaseHTTPRequestHandler):
 
         # 客户端发特定 key（"3"）强制走 official
         client_key = self.headers.get("Authorization", "").replace("Bearer ", "").strip()
-        force_official = (client_key == "3")
+        # key 路由：1=内网千问, 2=外部中转(codex→external-openai, claude→external-claude), 3=官方
+        force_channel = None
+        if client_key == "1":
+            force_channel = "internal"
+        elif client_key == "2":
+            force_channel = "external"
+        elif client_key == "3":
+            force_channel = "official"
+
+        # 模型名路由（优先于 key）：模型名严格匹配 internal 渠道配置的 model → 走内网千问
+        if isinstance(body, dict):
+            req_model = body.get("model") or ""
+            internal_model = next((up["model"] for up in UPSTREAMS if up.get("name") == "internal"), None)
+            if internal_model and req_model == internal_model:
+                force_channel = "internal"
 
         hour = datetime.now().hour
         weekday = datetime.now().weekday()  # 0=Mon, 6=Sun
@@ -1250,9 +1264,18 @@ class Handler(BaseHTTPRequestHandler):
         for up in UPSTREAMS:
             if up.get("disabled"):
                 continue
-            if force_official and up["name"] != "official":
+            # key 路由：强制指定渠道时只走对应渠道
+            if force_channel == "internal" and up["name"] != "internal":
                 continue
-            if up.get("worktime_only") and not is_worktime:
+            if force_channel == "official" and up["name"] != "official":
+                continue
+            if force_channel == "external":
+                # codex(/v1/responses→completions)走 external-openai, claude(/v1/messages)走 external-claude
+                if needs_completions and up["name"] != "external-openai":
+                    continue
+                if needs_messages and up["name"] != "external-claude":
+                    continue
+            if not force_channel and up.get("worktime_only") and not is_worktime:
                 continue
             # 能力检查：渠道必须支持本次请求需要的端点类型
             if needs_completions and "openai_url" not in up:
@@ -2755,7 +2778,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.20 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.22 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
