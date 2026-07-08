@@ -30,6 +30,15 @@ def _block_channel_on_429(err_body, upstream_name, req_id=0):
     import re
     try:
         err_text = err_body.decode("utf-8", errors="replace") if isinstance(err_body, bytes) else str(err_body)
+        # 先尝试 json.loads 提取 message 字段（解决 unicode 转义 \uXXXX 的问题）
+        try:
+            parsed = json.loads(err_text)
+            if isinstance(parsed, dict):
+                err_obj = parsed.get("error", parsed)
+                if isinstance(err_obj, dict):
+                    err_text = err_obj.get("message", err_text)
+        except Exception:
+            pass
         match = re.search(r"限额将在 (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) 重置", err_text)
         if match and upstream_name == "official":
             reset_str = match.group(1)
