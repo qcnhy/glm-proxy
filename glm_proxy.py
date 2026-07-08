@@ -1411,8 +1411,10 @@ class Handler(BaseHTTPRequestHandler):
                                         self._req_id, up["name"], cres.get("stream_error"))
                         return  # 已发响应头，总是 done
                     elif is_messages:
-                        # 增量流式：已发送响应头并边收边发，直接返回（不再回退/不发400）
-                        self._messages_stream(resp, up["name"])
+                        # 增量流式：检查 stream_error，429 则 fallback 到下一 upstream
+                        has_output, last_usage, ctx_exceeded, stream_error = self._messages_stream(resp, up["name"])
+                        if stream_error:
+                            continue  # 429 等错误 → 下一 upstream
                         return
                     else:
                         self._pipe_stream(resp, up["name"])
@@ -1574,6 +1576,7 @@ class Handler(BaseHTTPRequestHandler):
 
                     # 检测 error 事件（如 1234 overloaded）
                     if b"event: error" in block:
+                        err = None  # 在 try 前初始化
                         try:
                             text = block.decode("utf-8", errors="replace")
                             err_code, err_msg, data_raw = None, None, None
