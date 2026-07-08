@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.25 — codex-relay + Python 路由层
+GLM API 代理 v2.9.26 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -1594,6 +1594,30 @@ class Handler(BaseHTTPRequestHandler):
                                         self._req_id, upstream_name, pe,
                                         repr(block.decode("utf-8", errors="replace")[:500]))
                         stream_error = True
+                        # 429 rate_limit → 解析重置时间并封锁 official+external
+                        if err_code == 429 or (isinstance(err, dict) and err.get("type") == "rate_limit_error"):
+                            import re
+                            err_msg = err.get("message", "") if isinstance(err, dict) else str(err)
+                            # 尝试 parse 内层 JSON（双重编码的情况）
+                            try:
+                                inner = json.loads(err_msg)
+                                if isinstance(inner, dict):
+                                    err_msg = inner.get("message", err_msg)
+                            except Exception:
+                                pass
+                            match = re.search(r"限额将在 (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) 重置", err_msg)
+                            if match and upstream_name == "official":
+                                reset_str = match.group(1)
+                                try:
+                                    reset_dt = datetime.strptime(reset_str, "%Y-%m-%d %H:%M:%S")
+                                    reset_ts = reset_dt.timestamp()
+                                    _channel_blocked_until["official"] = reset_ts
+                                    _channel_blocked_until["external"] = reset_ts  # 共享账户
+                                    log.warning("[#%d] [messages] %s rate limit blocked until %s",
+                                                self._req_id, upstream_name, reset_str)
+                                except Exception as e:
+                                    log.warning("[#%d] [messages] %s rate limit parse reset time failed: %s",
+                                                self._req_id, upstream_name, e)
                         break  # 错误后由收尾逻辑合成正常结束
 
                     # 校验 data JSON 合法性，避免转发畸形块导致客户端解码失败
@@ -2836,7 +2860,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.25 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.26 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
