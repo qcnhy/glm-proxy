@@ -31,6 +31,7 @@ def _block_channel_on_429(err_body, upstream_name, req_id=0):
     import re
     try:
         err_text = err_body.decode("utf-8", errors="replace") if isinstance(err_body, bytes) else str(err_body)
+        log.info("[#%d]     [429] _block_channel_on_429 called: upstream=%s err_body_len=%d", req_id, upstream_name, len(err_text))
         # 先尝试 json.loads 提取 message 字段（解决 unicode 转义 \uXXXX 的问题）
         try:
             parsed = json.loads(err_text)
@@ -38,17 +39,22 @@ def _block_channel_on_429(err_body, upstream_name, req_id=0):
                 err_obj = parsed.get("error", parsed)
                 if isinstance(err_obj, dict):
                     err_text = err_obj.get("message", err_text)
+                    log.info("[#%d]     [429] parsed message: %s", req_id, err_text[:100])
         except Exception:
             pass
         match = re.search(r"限额将在 (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) 重置", err_text)
+        log.info("[#%d]     [429] regex match=%s upstream=%s", req_id, bool(match), upstream_name)
         if match and upstream_name == "official":
             reset_str = match.group(1)
             reset_dt = datetime.strptime(reset_str, "%Y-%m-%d %H:%M:%S")
             reset_ts = reset_dt.timestamp()
             _channel_blocked_until["official"] = reset_ts
             _channel_blocked_until["external"] = reset_ts  # official 封锁时联动 external
-            log.warning("[#%d]     !!! %s rate limit blocked until %s", req_id, upstream_name, reset_str)
-        # external 渠道 429 不封锁，直接 fallback 到 official
+            log.warning("[#%d]     !!! %s rate limit blocked until %s (official+external)", req_id, upstream_name, reset_str)
+        elif upstream_name.startswith("external"):
+            log.info("[#%d]     [429] external 429, not blocking (will fallback to official)", req_id)
+        else:
+            log.info("[#%d]     [429] no match or not official, no block set", req_id)
     except Exception as ex:
         log.warning("[#%d]     !!! %s 429 block failed: %s", req_id, upstream_name, ex)
 
@@ -1282,6 +1288,13 @@ class Handler(BaseHTTPRequestHandler):
         weekday = datetime.now().weekday()  # 0=Mon, 6=Sun
         is_worktime = weekday < 5 and 9 <= hour < 18  # 工作日 9:00-18:00
 
+        # 调试日志：路由决策完整信息
+        blocked_active = {k: datetime.fromtimestamp(v).strftime("%H:%M") for k, v in _channel_blocked_until.items() if v > time.time()}
+        log.info("[#%d] ROUTE: key=%s model=%s force=%s worktime=%s blocked=%s needs_comp=%s needs_msg=%s",
+                 self._req_id, client_key[:20] or "(empty)", req_model or "?",
+                 force_channel, is_worktime, blocked_active or "{}",
+                 is_responses and use_completions, needs_messages)
+
         # 检测图片：有图片强制走 Messages（Completions 不支持图片，Messages 支持）
         has_images = is_responses and isinstance(body, dict) and _request_has_images(body)
         use_completions = RESPONSES_USE_COMPLETIONS and not has_images
@@ -1312,6 +1325,9 @@ class Handler(BaseHTTPRequestHandler):
             if not force_channel:
                 block_key = "external" if up["name"].startswith("external") else up["name"]
                 if _channel_blocked_until.get(block_key, 0) > time.time():
+                    log.info("[#%d]     [skip] %s blocked until %s",
+                             self._req_id, up["name"],
+                             datetime.fromtimestamp(_channel_blocked_until[block_key]).strftime("%H:%M"))
                     continue
             # 能力检查：渠道必须支持本次请求需要的端点类型
             if needs_completions and "openai_url" not in up:
@@ -1506,11 +1522,13 @@ class Handler(BaseHTTPRequestHandler):
             except HTTPError as e:
                 err_body = e.read()
                 last_err = (e.code, err_body)
-                log.error("[#%d]     !!! %s %d: %s", self._req_id, up["name"], e.code, err_body[:200].decode(errors="replace"))
-                # 429 rate_limit → 解析重置时间，封锁 external+official（这是 HTTP 错误，
-                # 所有路径 relay/messages/converted 的 429 都经过此处）
+                log.error("[#%d]     !!! %s HTTP %d: %s", self._req_id, up["name"], e.code, err_body[:300].decode(errors="replace"))
+                # 429 rate_limit → 解析重置时间，封锁 official+external（HTTP 错误，所有路径都经过此处）
                 if e.code == 429:
+                    log.info("[#%d]     [429] HTTPError 429 from %s, calling _block_channel_on_429", self._req_id, up["name"])
                     _block_channel_on_429(err_body, up["name"], self._req_id)
+                    log.info("[#%d]     [429] after block: %s", self._req_id,
+                             {k: datetime.fromtimestamp(v).strftime("%H:%M") for k, v in _channel_blocked_until.items() if v > time.time()})
                 # 502/500 可能是上下文超限，返回标准错误触发客户端压缩
                 if e.code in (500, 502) and body and (is_responses or is_messages):
                     max_ctx = up.get("max_context_tokens", 200000)
@@ -2662,7 +2680,11 @@ class Handler(BaseHTTPRequestHandler):
                     if isinstance(err, dict):
                         ec = str(err.get("code", ""))
                         if ec == "429" or err.get("type") == "rate_limit_error":
+                            log.info("[#%d]     [429] SSE response.failed code=%s from %s, calling _block_channel_on_429",
+                                     self._req_id, ec, upstream_name)
                             _block_channel_on_429(json.dumps(err).encode(), upstream_name, self._req_id)
+                            log.info("[#%d]     [429] after block: %s", self._req_id,
+                                     {k: datetime.fromtimestamp(v).strftime("%H:%M") for k, v in _channel_blocked_until.items() if v > time.time()})
                     log.warning("[#%d]     !!! %s forwarding response.failed: %s", self._req_id, upstream_name, err)
                     _write(out_bytes)
                     stream_error = err
