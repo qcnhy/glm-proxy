@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.24 — codex-relay + Python 路由层
+GLM API 代理 v2.9.25 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -2649,9 +2649,17 @@ class Handler(BaseHTTPRequestHandler):
                     # 不可重试或重试用尽 → 429 rate_limit 则 fallback 到下一 upstream，否则转发错误
                     if code == 429 or (isinstance(err, dict) and err.get("type") == "rate_limit_error"):
                         # 解析官方 429 的重置时间（格式：[1308][...限额将在 2026-07-08 18:59:28 重置。]）
+                        # 注意：message 可能是双重 JSON 编码的字符串，需要先 parse 内层
                         import re
                         err_dict = err if isinstance(err, dict) else {}
                         msg = err_dict.get("message", "")
+                        # 尝试 parse 内层 JSON（双重编码的情况）
+                        try:
+                            inner = json.loads(msg)
+                            if isinstance(inner, dict):
+                                msg = inner.get("message", msg)
+                        except Exception:
+                            pass  # 不是 JSON 就用原字符串
                         match = re.search(r"限额将在 (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) 重置", msg)
                         if match and upstream_name == "official":
                             reset_str = match.group(1)
@@ -2828,7 +2836,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.24 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.25 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
