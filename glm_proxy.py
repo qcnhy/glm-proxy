@@ -26,7 +26,8 @@ from datetime import datetime
 _channel_blocked_until = {}  # {"external": timestamp, "official": timestamp}
 
 def _block_channel_on_429(err_body, upstream_name, req_id=0):
-    """检测 429 错误体，解析重置时间，封锁 external+official 渠道。"""
+    """检测 429 错误体，解析重置时间，封锁 official+external 渠道。
+    external 渠道 429 不封锁（直接 fallback 到 official）；official 封锁时联动 external。"""
     import re
     try:
         err_text = err_body.decode("utf-8", errors="replace") if isinstance(err_body, bytes) else str(err_body)
@@ -45,12 +46,9 @@ def _block_channel_on_429(err_body, upstream_name, req_id=0):
             reset_dt = datetime.strptime(reset_str, "%Y-%m-%d %H:%M:%S")
             reset_ts = reset_dt.timestamp()
             _channel_blocked_until["official"] = reset_ts
-            _channel_blocked_until["external"] = reset_ts  # 共享账户
+            _channel_blocked_until["external"] = reset_ts  # official 封锁时联动 external
             log.warning("[#%d]     !!! %s rate limit blocked until %s", req_id, upstream_name, reset_str)
-        elif upstream_name.startswith("external"):
-            # 外部渠道 429（无重置时间）→ 短期封锁 5 分钟
-            _channel_blocked_until["external"] = time.time() + 300
-            log.warning("[#%d]     !!! %s rate limit, blocked 5min", req_id, upstream_name)
+        # external 渠道 429 不封锁，直接 fallback 到 official
     except Exception as ex:
         log.warning("[#%d]     !!! %s 429 block failed: %s", req_id, upstream_name, ex)
 
