@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.26 — codex-relay + Python 路由层
+GLM API 代理 v2.9.27 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -1595,7 +1595,7 @@ class Handler(BaseHTTPRequestHandler):
                                         repr(block.decode("utf-8", errors="replace")[:500]))
                         stream_error = True
                         # 429 rate_limit → 解析重置时间并封锁 official+external
-                        if err_code == 429 or (isinstance(err, dict) and err.get("type") == "rate_limit_error"):
+                        if err_code in (429, "429", 1308, "1308") or (isinstance(err, dict) and err.get("type") == "rate_limit_error"):
                             import re
                             err_msg = err.get("message", "") if isinstance(err, dict) else str(err)
                             # 尝试 parse 内层 JSON（双重编码的情况）
@@ -2860,7 +2860,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.26 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.27 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
