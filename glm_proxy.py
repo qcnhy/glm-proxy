@@ -2654,7 +2654,7 @@ class Handler(BaseHTTPRequestHandler):
                     # 不可重试或重试用尽 → 检查 429 并封锁，然后转发 response.failed
                     if isinstance(err, dict):
                         ec = str(err.get("code", ""))
-                        if ec in ("429", "1308") or err.get("type") == "rate_limit_error":
+                        if ec == "429" or err.get("type") == "rate_limit_error":
                             _block_channel_on_429(json.dumps(err).encode(), upstream_name, self._req_id)
                     log.warning("[#%d]     !!! %s forwarding response.failed: %s", self._req_id, upstream_name, err)
                     _write(out_bytes)
