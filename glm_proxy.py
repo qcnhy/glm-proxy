@@ -1288,22 +1288,20 @@ class Handler(BaseHTTPRequestHandler):
         weekday = datetime.now().weekday()  # 0=Mon, 6=Sun
         is_worktime = weekday < 5 and 9 <= hour < 18  # 工作日 9:00-18:00
 
-        # 调试日志：路由决策完整信息
+        # 检测图片：有图片强制走 Messages（Completions 不支持图片，Messages 支持）
+        has_images = is_responses and isinstance(body, dict) and _request_has_images(body)
+        use_completions = RESPONSES_USE_COMPLETIONS and not has_images
+
+        # 调试日志：路由决策完整信息（必须在 use_completions 定义之后）
+        needs_completions = is_responses and use_completions
+        needs_messages = is_messages or (is_responses and not use_completions)
         blocked_active = {k: datetime.fromtimestamp(v).strftime("%H:%M") for k, v in _channel_blocked_until.items() if v > time.time()}
         log.info("[#%d] ROUTE: key=%s model=%s force=%s worktime=%s blocked=%s needs_comp=%s needs_msg=%s",
                  self._req_id, client_key[:20] or "(empty)", req_model or "?",
                  force_channel, is_worktime, blocked_active or "{}",
-                 is_responses and use_completions, needs_messages)
-
-        # 检测图片：有图片强制走 Messages（Completions 不支持图片，Messages 支持）
-        has_images = is_responses and isinstance(body, dict) and _request_has_images(body)
-        use_completions = RESPONSES_USE_COMPLETIONS and not has_images
+                 needs_completions, needs_messages)
         if has_images:
             log.info("    [image] 含图片 → 走 Messages 路径")
-
-        # 确定本次请求需要的能力
-        needs_completions = is_responses and use_completions
-        needs_messages = is_messages or (is_responses and not use_completions)
 
         for up in UPSTREAMS:
             if up.get("disabled"):
