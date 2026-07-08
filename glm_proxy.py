@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.22 — codex-relay + Python 路由层
+GLM API 代理 v2.9.23 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -21,6 +21,9 @@ from socketserver import ThreadingMixIn
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 from datetime import datetime
+
+# ── 全局渠道封锁标志（官方 429 限额时封锁 external+official，直到重置时间）──
+_channel_blocked_until = {}  # {"external": timestamp, "official": timestamp}
 
 # ── 配置 ──────────────────────────────────────────────
 _CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -1385,16 +1388,22 @@ class Handler(BaseHTTPRequestHandler):
                     if is_responses_converted:
                         # Responses→Messages 转换路径：增量流式 + 早期错误退避重试 + 错误转发
                         cres = self._converted_stream_with_retry(resp, up, url, up_headers, payload, method)
+                        if isinstance(cres, dict) and cres.get("fallback"):
+                            # 429 rate limit → 继续下一 upstream
+                            continue
                         if cres.get("done"):
                             return
                         # 真空输出（无错误）→ 尝试下一个上游
                     elif is_responses:
-                        # relay 路径：立即发头+keepalive（idle安全），早期 1305/过载退避重试
-                        events, has_output, stream_error = self._relay_stream_with_retry(
+                        # relay 路径：立即发头 +keepalive（idle 安全），早期 1305/过载退避重试
+                        cres = self._relay_stream_with_retry(
                             resp, up, url, up_headers, payload, method)
-                        if stream_error:
+                        if isinstance(cres, dict) and cres.get("fallback"):
+                            # 429 rate limit → 继续下一 upstream
+                            continue
+                        if cres.get("stream_error"):
                             log.warning("[#%d]     !!! %s upstream error, forwarding to client: %s",
-                                        self._req_id, up["name"], stream_error)
+                                        self._req_id, up["name"], cres.get("stream_error"))
                         return  # 已发响应头，总是 done
                     elif is_messages:
                         # 增量流式：已发送响应头并边收边发，直接返回（不再回退/不发400）
@@ -2428,6 +2437,20 @@ class Handler(BaseHTTPRequestHandler):
                                    "response": {"error": {"message": str(oe), "type": "upstream_error"}}})
                             return {"done": True}
                         continue
+                    # 429 rate_limit → 解析重置时间并封锁，然后 fallback
+                    import re
+                    if code == 429:
+                        match = re.search(r"限额将在 (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) 重置", msg or "")
+                        if match and upstream_name == "official":
+                            reset_dt = datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
+                            _channel_blocked_until["official"] = reset_dt.timestamp()
+                            _channel_blocked_until["external"] = _channel_blocked_until["official"]
+                            log.warning("[#%d] [converted] %s rate limit blocked until %s",
+                                        self._req_id, upstream_name, match.group(1))
+                        log.warning("[#%d] [converted] %s rate limit, fallback to next upstream",
+                                    self._req_id, upstream_name)
+                        return {"fallback": True, "code": code}
+                    # 其他错误 → 转发
                     _emit({"sequence_number": 0, "type": "response.failed",
                            "response": {"error": {"message": msg or "upstream error", "code": code, "type": "upstream_error"}}})
                     return {"done": True}
@@ -2618,7 +2641,28 @@ class Handler(BaseHTTPRequestHandler):
                             stream_error = str(oe)
                             break
                         continue  # 用新 resp 重试
-                    # 不可重试或重试用尽 → 转发 response.failed
+                    # 不可重试或重试用尽 → 429 rate_limit 则 fallback 到下一 upstream，否则转发错误
+                    if code == 429 or (isinstance(err, dict) and err.get("type") == "rate_limit_error"):
+                        # 解析官方 429 的重置时间（格式：[1308][...限额将在 2026-07-08 18:59:28 重置。]）
+                        import re
+                        msg = err.get("message", "") if isinstance(err, dict) else str(err)
+                        match = re.search(r"限额将在 (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) 重置", msg)
+                        if match and upstream_name == "official":
+                            reset_str = match.group(1)
+                            try:
+                                reset_dt = datetime.strptime(reset_str, "%Y-%m-%d %H:%M:%S")
+                                reset_ts = reset_dt.timestamp()
+                                _channel_blocked_until["official"] = reset_ts
+                                _channel_blocked_until["external"] = reset_ts  # 共享账户
+                                log.warning("[#%d]     !!! %s rate limit blocked until %s",
+                                            self._req_id, upstream_name, reset_str)
+                            except Exception as e:
+                                log.warning("[#%d]     !!! %s rate limit parse reset time failed: %s",
+                                            self._req_id, upstream_name, e)
+                        log.warning("[#%d]     !!! %s rate limit (code=%s), fallback to next upstream",
+                                    self._req_id, upstream_name, code)
+                        return {"fallback": True, "code": code}
+                    # 其他错误 → 转发 response.failed
                     log.warning("[#%d]     !!! %s forwarding response.failed: %s", self._req_id, upstream_name, err)
                     _write(out_bytes)
                     stream_error = err
@@ -2778,7 +2822,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.22 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.23 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
