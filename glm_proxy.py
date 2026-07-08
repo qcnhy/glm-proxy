@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.27 — codex-relay + Python 路由层
+GLM API 代理 v2.9.29 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -22,8 +22,29 @@ from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 from datetime import datetime
 
-# ── 全局渠道封锁标志（官方 429 限额时封锁 external+official，直到重置时间）──
+# ── 渠道封锁标志（429 限额时封锁 external+official，直到重置时间）──
 _channel_blocked_until = {}  # {"external": timestamp, "official": timestamp}
+
+def _block_channel_on_429(err_body, upstream_name, req_id=0):
+    """检测 429 错误体，解析重置时间，封锁 external+official 渠道。"""
+    import re
+    try:
+        err_text = err_body.decode("utf-8", errors="replace") if isinstance(err_body, bytes) else str(err_body)
+        match = re.search(r"限额将在 (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) 重置", err_text)
+        if match and upstream_name == "official":
+            reset_str = match.group(1)
+            reset_dt = datetime.strptime(reset_str, "%Y-%m-%d %H:%M:%S")
+            reset_ts = reset_dt.timestamp()
+            _channel_blocked_until["official"] = reset_ts
+            _channel_blocked_until["external"] = reset_ts  # 共享账户
+            log.warning("[#%d]     !!! %s rate limit blocked until %s", req_id, upstream_name, reset_str)
+        elif upstream_name.startswith("external"):
+            # 外部渠道 429（无重置时间）→ 短期封锁 5 分钟
+            _channel_blocked_until["external"] = time.time() + 300
+            log.warning("[#%d]     !!! %s rate limit, blocked 5min", req_id, upstream_name)
+    except Exception as ex:
+        log.warning("[#%d]     !!! %s 429 block failed: %s", req_id, upstream_name, ex)
+
 
 # ── 配置 ──────────────────────────────────────────────
 _CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -1252,11 +1273,6 @@ class Handler(BaseHTTPRequestHandler):
 
         hour = datetime.now().hour
         weekday = datetime.now().weekday()  # 0=Mon, 6=Sun
-        # DEBUG 调试日志：打印路由决策
-        req_model_debug = body.get("model","?") if isinstance(body,dict) else "?";
-        blocked_active = {k:v for k,v in _channel_blocked_until.items() if v>time.time()}
-        log.info("[#%d] DEBUG: key=%s model=%s force=%s blocked=%s",
-                 self._req_id, client_key or "(empty)", req_model_debug, force_channel, blocked_active)
         is_worktime = weekday < 5 and 9 <= hour < 18  # 工作日 9:00-18:00
 
         # 检测图片：有图片强制走 Messages（Completions 不支持图片，Messages 支持）
@@ -1285,6 +1301,11 @@ class Handler(BaseHTTPRequestHandler):
                     continue
             if not force_channel and up.get("worktime_only") and not is_worktime:
                 continue
+            # 渠道封锁检查：429 限额封锁期内跳过 external 和 official
+            if not force_channel:
+                block_key = "external" if up["name"].startswith("external") else up["name"]
+                if _channel_blocked_until.get(block_key, 0) > time.time():
+                    continue
             # 能力检查：渠道必须支持本次请求需要的端点类型
             if needs_completions and "openai_url" not in up:
                 continue
@@ -1393,28 +1414,20 @@ class Handler(BaseHTTPRequestHandler):
                     if is_responses_converted:
                         # Responses→Messages 转换路径：增量流式 + 早期错误退避重试 + 错误转发
                         cres = self._converted_stream_with_retry(resp, up, url, up_headers, payload, method)
-                        if isinstance(cres, dict) and cres.get("fallback"):
-                            # 429 rate limit → 继续下一 upstream
-                            continue
                         if cres.get("done"):
                             return
                         # 真空输出（无错误）→ 尝试下一个上游
                     elif is_responses:
-                        # relay 路径：立即发头 +keepalive（idle 安全），早期 1305/过载退避重试
-                        cres = self._relay_stream_with_retry(
+                        # relay 路径：立即发头+keepalive（idle安全），早期 1305/过载退避重试
+                        events, has_output, stream_error = self._relay_stream_with_retry(
                             resp, up, url, up_headers, payload, method)
-                        if isinstance(cres, dict) and cres.get("fallback"):
-                            # 429 rate limit → 继续下一 upstream
-                            continue
-                        if cres.get("stream_error"):
+                        if stream_error:
                             log.warning("[#%d]     !!! %s upstream error, forwarding to client: %s",
-                                        self._req_id, up["name"], cres.get("stream_error"))
+                                        self._req_id, up["name"], stream_error)
                         return  # 已发响应头，总是 done
                     elif is_messages:
-                        # 增量流式：检查 stream_error，429 则 fallback 到下一 upstream
-                        has_output, last_usage, ctx_exceeded, stream_error = self._messages_stream(resp, up["name"])
-                        if stream_error:
-                            continue  # 429 等错误 → 下一 upstream
+                        # 增量流式：已发送响应头并边收边发，直接返回（不再回退/不发400）
+                        self._messages_stream(resp, up["name"])
                         return
                     else:
                         self._pipe_stream(resp, up["name"])
@@ -1487,6 +1500,10 @@ class Handler(BaseHTTPRequestHandler):
                 err_body = e.read()
                 last_err = (e.code, err_body)
                 log.error("[#%d]     !!! %s %d: %s", self._req_id, up["name"], e.code, err_body[:200].decode(errors="replace"))
+                # 429 rate_limit → 解析重置时间，封锁 external+official（这是 HTTP 错误，
+                # 所有路径 relay/messages/converted 的 429 都经过此处）
+                if e.code == 429:
+                    _block_channel_on_429(err_body, up["name"], self._req_id)
                 # 502/500 可能是上下文超限，返回标准错误触发客户端压缩
                 if e.code in (500, 502) and body and (is_responses or is_messages):
                     max_ctx = up.get("max_context_tokens", 200000)
@@ -1576,7 +1593,6 @@ class Handler(BaseHTTPRequestHandler):
 
                     # 检测 error 事件（如 1234 overloaded）
                     if b"event: error" in block:
-                        err = None  # 在 try 前初始化
                         try:
                             text = block.decode("utf-8", errors="replace")
                             err_code, err_msg, data_raw = None, None, None
@@ -1597,30 +1613,6 @@ class Handler(BaseHTTPRequestHandler):
                                         self._req_id, upstream_name, pe,
                                         repr(block.decode("utf-8", errors="replace")[:500]))
                         stream_error = True
-                        # 429 rate_limit → 解析重置时间并封锁 official+external
-                        if err_code in (429, "429", 1308, "1308") or (isinstance(err, dict) and err.get("type") == "rate_limit_error"):
-                            import re
-                            err_msg = err.get("message", "") if isinstance(err, dict) else str(err)
-                            # 尝试 parse 内层 JSON（双重编码的情况）
-                            try:
-                                inner = json.loads(err_msg)
-                                if isinstance(inner, dict):
-                                    err_msg = inner.get("message", err_msg)
-                            except Exception:
-                                pass
-                            match = re.search(r"限额将在 (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) 重置", err_msg)
-                            if match and upstream_name == "official":
-                                reset_str = match.group(1)
-                                try:
-                                    reset_dt = datetime.strptime(reset_str, "%Y-%m-%d %H:%M:%S")
-                                    reset_ts = reset_dt.timestamp()
-                                    _channel_blocked_until["official"] = reset_ts
-                                    _channel_blocked_until["external"] = reset_ts  # 共享账户
-                                    log.warning("[#%d] [messages] %s rate limit blocked until %s",
-                                                self._req_id, upstream_name, reset_str)
-                                except Exception as e:
-                                    log.warning("[#%d] [messages] %s rate limit parse reset time failed: %s",
-                                                self._req_id, upstream_name, e)
                         break  # 错误后由收尾逻辑合成正常结束
 
                     # 校验 data JSON 合法性，避免转发畸形块导致客户端解码失败
@@ -2469,20 +2461,6 @@ class Handler(BaseHTTPRequestHandler):
                                    "response": {"error": {"message": str(oe), "type": "upstream_error"}}})
                             return {"done": True}
                         continue
-                    # 429 rate_limit → 解析重置时间并封锁，然后 fallback
-                    import re
-                    if code == 429:
-                        match = re.search(r"限额将在 (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) 重置", msg or "")
-                        if match and upstream_name == "official":
-                            reset_dt = datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
-                            _channel_blocked_until["official"] = reset_dt.timestamp()
-                            _channel_blocked_until["external"] = _channel_blocked_until["official"]
-                            log.warning("[#%d] [converted] %s rate limit blocked until %s",
-                                        self._req_id, upstream_name, match.group(1))
-                        log.warning("[#%d] [converted] %s rate limit, fallback to next upstream",
-                                    self._req_id, upstream_name)
-                        return {"fallback": True, "code": code}
-                    # 其他错误 → 转发
                     _emit({"sequence_number": 0, "type": "response.failed",
                            "response": {"error": {"message": msg or "upstream error", "code": code, "type": "upstream_error"}}})
                     return {"done": True}
@@ -2673,37 +2651,11 @@ class Handler(BaseHTTPRequestHandler):
                             stream_error = str(oe)
                             break
                         continue  # 用新 resp 重试
-                    # 不可重试或重试用尽 → 429 rate_limit 则 fallback 到下一 upstream，否则转发错误
-                    if code == 429 or (isinstance(err, dict) and err.get("type") == "rate_limit_error"):
-                        # 解析官方 429 的重置时间（格式：[1308][...限额将在 2026-07-08 18:59:28 重置。]）
-                        # 注意：message 可能是双重 JSON 编码的字符串，需要先 parse 内层
-                        import re
-                        err_dict = err if isinstance(err, dict) else {}
-                        msg = err_dict.get("message", "")
-                        # 尝试 parse 内层 JSON（双重编码的情况）
-                        try:
-                            inner = json.loads(msg)
-                            if isinstance(inner, dict):
-                                msg = inner.get("message", msg)
-                        except Exception:
-                            pass  # 不是 JSON 就用原字符串
-                        match = re.search(r"限额将在 (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) 重置", msg)
-                        if match and upstream_name == "official":
-                            reset_str = match.group(1)
-                            try:
-                                reset_dt = datetime.strptime(reset_str, "%Y-%m-%d %H:%M:%S")
-                                reset_ts = reset_dt.timestamp()
-                                _channel_blocked_until["official"] = reset_ts
-                                _channel_blocked_until["external"] = reset_ts  # 共享账户
-                                log.warning("[#%d]     !!! %s rate limit blocked until %s",
-                                            self._req_id, upstream_name, reset_str)
-                            except Exception as e:
-                                log.warning("[#%d]     !!! %s rate limit parse reset time failed: %s",
-                                            self._req_id, upstream_name, e)
-                        log.warning("[#%d]     !!! %s rate limit (code=%s), fallback to next upstream",
-                                    self._req_id, upstream_name, code)
-                        return {"fallback": True, "code": code}
-                    # 其他错误 → 转发 response.failed
+                    # 不可重试或重试用尽 → 检查 429 并封锁，然后转发 response.failed
+                    if isinstance(err, dict):
+                        ec = str(err.get("code", ""))
+                        if ec in ("429", "1308") or err.get("type") == "rate_limit_error":
+                            _block_channel_on_429(json.dumps(err).encode(), upstream_name, self._req_id)
                     log.warning("[#%d]     !!! %s forwarding response.failed: %s", self._req_id, upstream_name, err)
                     _write(out_bytes)
                     stream_error = err
@@ -2863,7 +2815,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.27 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.29 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
