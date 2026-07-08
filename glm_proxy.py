@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.23 — codex-relay + Python 路由层
+GLM API 代理 v2.9.24 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -1252,6 +1252,11 @@ class Handler(BaseHTTPRequestHandler):
 
         hour = datetime.now().hour
         weekday = datetime.now().weekday()  # 0=Mon, 6=Sun
+        # DEBUG 调试日志：打印路由决策
+        req_model_debug = body.get("model","?") if isinstance(body,dict) else "?";
+        blocked_active = {k:v for k,v in _channel_blocked_until.items() if v>time.time()}
+        log.info("[#%d] DEBUG: key=%s model=%s force=%s blocked=%s",
+                 self._req_id, client_key or "(empty)", req_model_debug, force_channel, blocked_active)
         is_worktime = weekday < 5 and 9 <= hour < 18  # 工作日 9:00-18:00
 
         # 检测图片：有图片强制走 Messages（Completions 不支持图片，Messages 支持）
@@ -2645,7 +2650,8 @@ class Handler(BaseHTTPRequestHandler):
                     if code == 429 or (isinstance(err, dict) and err.get("type") == "rate_limit_error"):
                         # 解析官方 429 的重置时间（格式：[1308][...限额将在 2026-07-08 18:59:28 重置。]）
                         import re
-                        msg = err.get("message", "") if isinstance(err, dict) else str(err)
+                        err_dict = err if isinstance(err, dict) else {}
+                        msg = err_dict.get("message", "")
                         match = re.search(r"限额将在 (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) 重置", msg)
                         if match and upstream_name == "official":
                             reset_str = match.group(1)
@@ -2822,7 +2828,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.23 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.24 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
