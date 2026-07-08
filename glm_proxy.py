@@ -421,7 +421,7 @@ def _find_relay_binary():
     return None
 
 def _start_relays():
-    _RELAY_MIN = (0, 3, 6)
+    _RELAY_MIN = (0, 5, 0)
     need_install = False
     try:
         from importlib.metadata import version as _pkg_ver
