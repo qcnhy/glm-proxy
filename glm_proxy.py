@@ -2263,6 +2263,7 @@ class Handler(BaseHTTPRequestHandler):
         stream_error = None
         held_completed = None
         _apply_patch_oi = set()  # output_index 集合：apply_patch function_call 需转 custom_tool_call
+        _apply_patch_args = {}  # output_index -> 累积的 JSON arguments 字符串
         raw_blocks = []
         wlock = threading.Lock()
         stop_ka = threading.Event()
@@ -2347,24 +2348,46 @@ class Handler(BaseHTTPRequestHandler):
                         if t == "response.completed":
                             held_completed = p
                             continue
-                        # apply_patch fallback: codex-relay 输出 function_call，转成 custom_tool_call
+                        # apply_patch fallback: 缓冲 JSON arguments，结束时解包成 custom_tool_call
                         if t == "response.output_item.added" and item.get("name") == "apply_patch" and item.get("type") == "function_call":
                             item["type"] = "custom_tool_call"
                             _apply_patch_oi.add(oi)
+                            _apply_patch_args[oi] = ""  # 开始缓冲
                             out = (f"event: {t}\ndata: {json.dumps(p, ensure_ascii=False)}\n\n").encode()
-                        elif oi in _apply_patch_oi and t in ("response.function_call_arguments.delta", "response.function_call_arguments.done", "response.output_item.done"):
+                        elif oi in _apply_patch_oi:
                             if t == "response.function_call_arguments.delta":
-                                p["type"] = "response.custom_tool_call_input.delta"
-                            elif t == "response.function_call_arguments.done":
-                                p["type"] = "response.custom_tool_call_input.done"
-                                p["input"] = p.pop("arguments", "")
-                            elif t == "response.output_item.done":
+                                _apply_patch_args[oi] += p.get("delta", "")
+                                continue  # 缓冲，不发
+                            if t == "response.function_call_arguments.done":
+                                _apply_patch_args[oi] += p.get("arguments", "")
+                                continue  # 缓冲，不发
+                            if t == "response.output_item.done":
+                                # 解包 JSON {"patch":"..."} → 原始 patch 文本
+                                raw_args = _apply_patch_args.pop(oi, "")
+                                try:
+                                    parsed = json.loads(raw_args)
+                                    patch_text = parsed.get("patch", raw_args) if isinstance(parsed, dict) else raw_args
+                                except Exception:
+                                    patch_text = raw_args
+                                if not patch_text.startswith("*** Begin Patch"):
+                                    patch_text = "*** Begin Patch\n" + patch_text
+                                if not patch_text.rstrip().endswith("*** End Patch"):
+                                    patch_text = patch_text.rstrip() + "\n*** End Patch"
+                                seq = p.get("sequence_number", events + 1)
+                                for ck in [patch_text[i:i+20] for i in range(0, len(patch_text), 20)]:
+                                    seq += 1
+                                    _emit({"type": "response.custom_tool_call_input.delta", "sequence_number": seq,
+                                           "delta": ck, "item_id": item.get("id",""), "output_index": oi})
+                                seq += 1
+                                _emit({"type": "response.custom_tool_call_input.done", "sequence_number": seq,
+                                       "input": patch_text, "item_id": item.get("id",""), "output_index": oi})
                                 item["type"] = "custom_tool_call"
-                                if "arguments" in item:
-                                    item["input"] = item.pop("arguments")
-                            t = p.get("type", t)
-                            out = (f"event: {t}\ndata: {json.dumps(p, ensure_ascii=False)}\n\n").encode()
-                        if b"output_text.delta" in out or b"function_call_arguments.delta" in out or b"custom_tool_call" in out:
+                                item["input"] = patch_text
+                                item.pop("arguments", None)
+                                out = (f"event: response.output_item.done\ndata: {json.dumps(p, ensure_ascii=False)}\n\n").encode()
+                                has_output = True
+                                stop_ka.set()
+                        if b"output_text.delta" in out or b"custom_tool_call" in out:
                             has_output = True
                             stop_ka.set()
                         _write(out)
