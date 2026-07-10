@@ -2262,6 +2262,7 @@ class Handler(BaseHTTPRequestHandler):
         has_output = False
         stream_error = None
         held_completed = None
+        _apply_patch_oi = set()  # output_index 集合：apply_patch function_call 需转 custom_tool_call
         raw_blocks = []
         wlock = threading.Lock()
         stop_ka = threading.Event()
@@ -2346,9 +2347,26 @@ class Handler(BaseHTTPRequestHandler):
                         if t == "response.completed":
                             held_completed = p
                             continue
-                        if b"output_text.delta" in out or b"function_call_arguments.delta" in out:
+                        # apply_patch fallback: codex-relay 输出 function_call，转成 custom_tool_call
+                        if t == "response.output_item.added" and item.get("name") == "apply_patch" and item.get("type") == "function_call":
+                            item["type"] = "custom_tool_call"
+                            _apply_patch_oi.add(oi)
+                            out = (f"event: {t}\ndata: {json.dumps(p, ensure_ascii=False)}\n\n").encode()
+                        elif oi in _apply_patch_oi and t in ("response.function_call_arguments.delta", "response.function_call_arguments.done", "response.output_item.done"):
+                            if t == "response.function_call_arguments.delta":
+                                p["type"] = "response.custom_tool_call_input.delta"
+                            elif t == "response.function_call_arguments.done":
+                                p["type"] = "response.custom_tool_call_input.done"
+                                p["input"] = p.pop("arguments", "")
+                            elif t == "response.output_item.done":
+                                item["type"] = "custom_tool_call"
+                                if "arguments" in item:
+                                    item["input"] = item.pop("arguments")
+                            t = p.get("type", t)
+                            out = (f"event: {t}\ndata: {json.dumps(p, ensure_ascii=False)}\n\n").encode()
+                        if b"output_text.delta" in out or b"function_call_arguments.delta" in out or b"custom_tool_call" in out:
                             has_output = True
-                            stop_ka.set()  # 真实输出已开始，停 keepalive（避免终止事件后继续写注释让客户端干等）
+                            stop_ka.set()
                         _write(out)
                     if early_err:
                         break
@@ -2402,8 +2420,20 @@ class Handler(BaseHTTPRequestHandler):
                 # 正常完成或已真实输出（含中途错误已转发）→ 退出重试循环
                 break
 
-            # response.completed
+            # response.completed（apply_patch 项改写 function_call→custom_tool_call）
             if held_completed is not None:
+                if _apply_patch_oi:
+                    for it in held_completed.get("response", {}).get("output", []) or []:
+                        if it.get("name") == "apply_patch" and it.get("type") == "function_call":
+                            it["type"] = "custom_tool_call"
+                            if "arguments" in it:
+                                import json as _json
+                                try:
+                                    args = _json.loads(it["arguments"])
+                                    it["input"] = args.get("patch", it["arguments"])
+                                except Exception:
+                                    it["input"] = it["arguments"]
+                                it.pop("arguments", None)
                 _emit(held_completed)
             elif not stream_error:
                 # 上游未发 response.completed（不完整流）→ 合成收尾，避免客户端"响应结束但一直转"
