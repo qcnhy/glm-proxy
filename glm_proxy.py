@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.30 — codex-relay + Python 路由层
+GLM API 代理 v2.9.31 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -1553,160 +1553,6 @@ class Handler(BaseHTTPRequestHandler):
         return has_output, last_usage, context_exceeded, stream_error
 
     # ── Responses→Messages 转换流式处理（旧：整段缓冲，留作兜底）──
-    def _converted_stream_buffered(self, resp, upstream_name):
-        """缓冲 Anthropic Messages SSE → 逐块转换为 Responses SSE → 发给客户端"""
-        import asyncio
-        converter = AnthropicToOpenAIResponsesStreamAdapter()
-        output_blocks = []
-        has_output = False
-        total_bytes = 0
-        raw_blocks = []  # Anthropic 原始 SSE blocks
-
-        try:
-            buf = b""
-            while True:
-                chunk = resp.read(4096)
-                if not chunk:
-                    break
-                total_bytes += len(chunk)
-                buf += chunk
-                while b"\n\n" in buf or b"\r\n\r\n" in buf:
-                    if b"\r\n\r\n" in buf:
-                        block, buf = buf.split(b"\r\n\r\n", 1)
-                    else:
-                        block, buf = buf.split(b"\n\n", 1)
-                    block = block.replace(b"\r\n", b"\n")
-                    raw_blocks.append(block)
-
-            if buf.strip():
-                buf = buf.replace(b"\r\n", b"\n")
-                raw_blocks.append(buf)
-
-            # 将 Anthropic SSE 事件解析为 dict 列表
-            events = []
-            event_type_counts = {}
-            for block in raw_blocks:
-                event_type = None
-                data_json = None
-                for line in block.decode("utf-8", errors="replace").split("\n"):
-                    if line.startswith("event: "):
-                        event_type = line[7:].strip()
-                    elif line.startswith("data: "):
-                        try:
-                            data_json = json.loads(line[6:])
-                        except Exception:
-                            pass
-                if data_json and event_type:
-                    # 用 dict 而非 Pydantic 模型（避免 Python 3.12 兼容问题）
-                    data_json["_event_type"] = event_type
-                    events.append(data_json)
-                    event_type_counts[event_type] = event_type_counts.get(event_type, 0) + 1
-                    # 记录上游错误事件详情
-                    if event_type == "error":
-                        log.warning("    [converted] upstream error event: %s", data_json)
-                    # 提取 message_delta 中的 stop_reason
-                    if event_type == "message_delta":
-                        stop = data_json.get("delta", {}).get("stop_reason")
-                        if stop:
-                            log.info("    [converted] upstream stop_reason=%s", stop)
-
-            log.info("    [converted] upstream events: %s", event_type_counts)
-
-            # 修复不完整的 Anthropic SSE 流（部分上游不发送关闭事件）
-            has_message_stop = event_type_counts.get("message_stop", 0) > 0
-            has_block_stop = event_type_counts.get("content_block_stop", 0) > 0
-            has_error = event_type_counts.get("error", 0) > 0
-            if not has_message_stop:
-                log.warning("    [converted] upstream stream incomplete, synthesizing closing events")
-                # 找到最后一个 content_block_start 的 index
-                last_block_idx = 0
-                for i, evt in enumerate(events):
-                    if evt.get("_event_type") == "content_block_start":
-                        last_block_idx = evt.get("index", 0)
-                if not has_block_stop:
-                    events.append({"_event_type": "content_block_stop", "type": "content_block_stop", "index": last_block_idx})
-                # 内容审查错误 → end_turn（让 CLI 正常接受已完成部分）
-                # 其他截断 → max_tokens（让 CLI 自动续写）
-                stop_reason = "end_turn" if has_error else "max_tokens"
-                events.append({"_event_type": "message_delta", "type": "message_delta",
-                               "delta": {"stop_reason": stop_reason}, "usage": {"output_tokens": 0}})
-                events.append({"_event_type": "message_stop", "type": "message_stop"})
-
-            # 用 ccproxy 的转换器处理（同步包装异步）
-            async def _convert():
-                nonlocal has_output
-                converted_blocks = []
-
-                async def _gen():
-                    for evt in events:
-                        yield evt  # dict with _event_type key
-
-                gen = converter.run(_gen())
-                try:
-                    async for out_event in gen:
-                        # out_event 是 openai_models.StreamEventType (dict-like)
-                        evt_dict = out_event if isinstance(out_event, dict) else out_event.model_dump(exclude_none=True, mode="json")
-                        evt_type = evt_dict.get("type", "")
-                        sse_block = f"event: {evt_type}\ndata: {json.dumps(evt_dict, ensure_ascii=False)}\n\n".encode()
-                        converted_blocks.append(sse_block)
-                        if b"output_text.delta" in sse_block or b"function_call_arguments.delta" in sse_block:
-                            has_output = True
-                finally:
-                    try:
-                        await gen.aclose()
-                    except Exception:
-                        pass
-                return converted_blocks
-
-            try:
-                loop = asyncio.new_event_loop()
-                output_blocks = loop.run_until_complete(_convert())
-                loop.close()
-            except Exception as e:
-                log.error("    [converted] stream conversion error: %s", e)
-
-            log.info("    [converted] raw=%d events → converted=%d blocks, has_output=%s",
-                     len(events), len(output_blocks), has_output)
-
-            # 从 response.completed 事件中提取 status 和 usage
-            for block in output_blocks:
-                try:
-                    text = block.decode("utf-8", errors="replace")
-                    if "response.completed" in text:
-                        for line in text.split("\n"):
-                            if line.startswith("data: "):
-                                p = json.loads(line[6:])
-                                resp_obj = p.get("response", {})
-                                status = resp_obj.get("status", "?")
-                                usage = resp_obj.get("usage", {})
-                                log.info("    [converted] status=%s usage=%s", status,
-                                         {k: v for k, v in usage.items() if v})
-                except Exception:
-                    pass
-
-            if has_output or output_blocks:
-                self.send_response(200)
-                for h in ["Content-Type", "Cache-Control"]:
-                    v = resp.headers.get(h)
-                    if v:
-                        self.send_header(h, v)
-                self.send_header("Connection", "close")
-                self.end_headers()
-                for block in output_blocks:
-                    self.wfile.write(block)
-                    self.wfile.flush()
-                self.close_connection = True
-                log.info("[#%d]     <<< %s [converted] STREAM OK (%d events, %dKB, %dms)",
-                         self._req_id, upstream_name, len(output_blocks), total_bytes // 1024, self._ms())
-                # 保存 exchange
-                resp_text = b"".join(output_blocks).decode("utf-8", errors="replace")
-                self._save_exchange(getattr(self, '_debug_req_body', {}), resp_text, upstream_name, "converted")
-
-        except (ConnectionResetError, BrokenPipeError):
-            log.warning("[#%d]     <<< %s [converted] STREAM interrupted", self._req_id, upstream_name)
-
-        return len(output_blocks), has_output
-
     def _converted_stream_sync(self, resp, upstream_name, _write, _emit, stop_ka):
         """同步翻译 Anthropic Messages SSE → OpenAI Responses SSE，边收边发。
         纯同步、无 worker 线程/async loop，不可能挂起；收到 message_stop 就地发 response.completed。
@@ -2589,7 +2435,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.30 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.31 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
