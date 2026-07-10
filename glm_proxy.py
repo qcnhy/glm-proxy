@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.29 — codex-relay + Python 路由层
+GLM API 代理 v2.9.30 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -421,7 +421,7 @@ def _find_relay_binary():
     return None
 
 def _start_relays():
-    _RELAY_MIN = (0, 5, 0)
+    _RELAY_MIN = (0, 5, 1)
     need_install = False
     try:
         from importlib.metadata import version as _pkg_ver
@@ -963,204 +963,6 @@ def _parse_patch_to_operation(patch_text):
     if diff.strip():
         result["diff"] = diff
     return result
-
-
-def _fix_apply_patch_args(output_blocks):
-    """将 function_call(apply_patch) 改写为 custom_tool_call 格式。
-    GPT 返回的格式: type=custom_tool_call, name=apply_patch, input=原始patch文本"""
-    # 1. 找到 apply_patch 的 call_id 和完整 arguments
-    patch_calls = []
-    for block in output_blocks:
-        if not block:
-            continue
-        text = block.decode("utf-8", errors="replace")
-        if '"apply_patch"' not in text:
-            continue
-        for line in text.split("\n"):
-            if not line.startswith("data: "):
-                continue
-            try:
-                p = json.loads(line[6:])
-                item = p.get("item", {})
-                if item.get("name") == "apply_patch" and item.get("type") == "function_call" and item.get("arguments"):
-                    patch_calls.append({
-                        "call_id": item.get("call_id", item.get("id", "")),
-                        "ids": {x for x in (item.get("id"), item.get("call_id")) if x},
-                        "arguments": item["arguments"],
-                    })
-            except:
-                pass
-
-    if not patch_calls:
-        return
-
-    for pc in patch_calls:
-        call_id = pc["call_id"]
-        ids = pc["ids"]
-        args = pc["arguments"]
-        if not args:
-            continue
-
-        # 2. 解包 JSON {"patch":"..."} → 原始 patch 文本
-        try:
-            parsed = json.loads(args)
-            patch_text = parsed.get("patch", args) if isinstance(parsed, dict) else args
-        except:
-            patch_text = args
-
-        # 如果 patch 内容无效（只有 {} 等），跳过转换
-        cleaned = patch_text.replace("*** Begin Patch", "").replace("*** End Patch", "").strip()
-        if not cleaned or cleaned in ("{}",):
-            log.warning("    [apply_patch] invalid patch content: %s", repr(patch_text[:100]))
-            # 不跳过，仍然转成 custom_tool_call 让 Codex 返回错误给模型
-
-        # 自动修复：确保 patch 格式正确
-        if not patch_text.startswith("*** Begin Patch"):
-            patch_text = "*** Begin Patch\n" + patch_text
-        # 清理被模型加了 +/-/空格前缀的 *** End Patch 行
-        import re
-        patch_text = re.sub(r'^[+\- ]\*\*\* End Patch$', '*** End Patch', patch_text, flags=re.MULTILINE)
-        if not patch_text.rstrip().endswith("*** End Patch"):
-            patch_text = patch_text.rstrip() + "\n*** End Patch"
-
-        log.info("    [apply_patch] unwrapped: %s", repr(patch_text[:100]))
-
-        # 3. 改写所有相关的 block（匹配 id 或 call_id，因为 delta 用 item_id 而非 call_id）
-        id_bytes = [i.encode() for i in ids]
-        new_blocks = []
-        for block in output_blocks:
-            if not block or not any(ib in block for ib in id_bytes):
-                new_blocks.append(block)
-                continue
-
-            text = block.decode("utf-8", errors="replace")
-            evt_type = ""
-            for ln in text.split("\n"):
-                if ln.startswith("event: "):
-                    evt_type = ln[7:].strip()
-                    break
-
-            # 跳过 argument delta
-            if "function_call_arguments.delta" in evt_type:
-                continue
-
-            # 改写 output_item.added → custom_tool_call
-            if "output_item.added" in evt_type and "apply_patch" in text:
-                for ln in text.split("\n"):
-                    if ln.startswith("data: "):
-                        try:
-                            p = json.loads(ln[6:])
-                            seq = p.get("sequence_number", 0)
-                            item_id = f"ctc_{call_id}"
-                            # 1. output_item.added
-                            p["item"] = {"id": item_id, "type": "custom_tool_call",
-                                         "status": "in_progress", "call_id": call_id, "name": "apply_patch"}
-                            new_blocks.append(f"event: response.output_item.added\ndata: {json.dumps(p, ensure_ascii=False)}\n\n".encode())
-                            # 2. custom_tool_call_input.delta（分块流式）
-                            for chunk in [patch_text[i:i+20] for i in range(0, len(patch_text), 20)]:
-                                seq += 1
-                                d = {"type": "response.custom_tool_call_input.delta",
-                                     "sequence_number": seq, "delta": chunk, "item_id": item_id,
-                                     "output_index": p.get("output_index", 0)}
-                                new_blocks.append(f"event: response.custom_tool_call_input.delta\ndata: {json.dumps(d, ensure_ascii=False)}\n\n".encode())
-                            # 3. custom_tool_call_input.done
-                            seq += 1
-                            dn = {"type": "response.custom_tool_call_input.done",
-                                  "sequence_number": seq, "input": patch_text, "item_id": item_id,
-                                  "output_index": p.get("output_index", 0)}
-                            new_blocks.append(f"event: response.custom_tool_call_input.done\ndata: {json.dumps(dn, ensure_ascii=False)}\n\n".encode())
-                            log.info("    [apply_patch] emitted custom_tool_call stream (delta+done)")
-                        except:
-                            new_blocks.append(block)
-                        break
-                continue
-
-            # 跳过 arguments.done（custom_tool_call 用 input 字段，不用 arguments）
-            if "function_call_arguments.done" in evt_type:
-                continue
-
-            # 改写 output_item.done → custom_tool_call + input
-            if "output_item.done" in evt_type and call_id in text:
-                for ln in text.split("\n"):
-                    if ln.startswith("data: "):
-                        try:
-                            p = json.loads(ln[6:])
-                            p["item"] = {"id": f"ctc_{call_id}", "type": "custom_tool_call",
-                                         "status": "completed", "call_id": call_id,
-                                         "name": "apply_patch", "input": patch_text}
-                            new_blocks.append(f"event: response.output_item.done\ndata: {json.dumps(p, ensure_ascii=False)}\n\n".encode())
-                            log.info("    [apply_patch] rewrote output_item.done as custom_tool_call")
-                        except:
-                            new_blocks.append(block)
-                        break
-                continue
-
-            # 改写 response.completed
-            if "response.completed" in evt_type:
-                for ln in text.split("\n"):
-                    if ln.startswith("data: "):
-                        try:
-                            p = json.loads(ln[6:])
-                            for out_item in p.get("response", {}).get("output", []):
-                                if out_item.get("call_id") == call_id:
-                                    out_item["type"] = "custom_tool_call"
-                                    out_item["id"] = f"ctc_{call_id}"
-                                    out_item["name"] = "apply_patch"
-                                    out_item["input"] = patch_text
-                                    out_item.pop("arguments", None)
-                            new_blocks.append(f"event: response.completed\ndata: {json.dumps(p, ensure_ascii=False)}\n\n".encode())
-                            log.info("    [apply_patch] rewrote response.completed as custom_tool_call")
-                        except:
-                            new_blocks.append(block)
-                        break
-                continue
-
-            new_blocks.append(block)
-
-        output_blocks[:] = new_blocks
-
-
-def _unwrap_patch_text(args):
-    """function_call arguments(JSON) → 原始 patch 文本，并修正 *** Begin/End Patch 格式。"""
-    try:
-        parsed = json.loads(args)
-        patch_text = parsed.get("patch", args) if isinstance(parsed, dict) else args
-    except Exception:
-        patch_text = args
-    if not patch_text.startswith("*** Begin Patch"):
-        patch_text = "*** Begin Patch\n" + patch_text
-    import re
-    patch_text = re.sub(r'^[+\- ]\*\*\* End Patch$', '*** End Patch', patch_text, flags=re.MULTILINE)
-    if not patch_text.rstrip().endswith("*** End Patch"):
-        patch_text = patch_text.rstrip() + "\n*** End Patch"
-    return patch_text
-
-
-def _build_patch_events(pb):
-    """从 apply_patch function_call 缓冲项构建 custom_tool_call 流事件列表。
-    返回 (events, call_id, patch_text)。每个 event 是 dict（含 type/sequence_number）。"""
-    call_id = pb.get("call_id", "")
-    item_id = f"ctc_{call_id}" if call_id else "ctc_apply_patch"
-    oi = pb.get("output_index", 0)
-    seq = pb.get("seq", 0)
-    patch_text = _unwrap_patch_text(pb.get("args", ""))
-    evs = []
-    seq += 1
-    evs.append({"type": "response.output_item.added", "sequence_number": seq, "output_index": oi,
-                "item": {"id": item_id, "type": "custom_tool_call", "status": "in_progress",
-                         "call_id": call_id, "name": "apply_patch"}})
-    for i in range(0, len(patch_text), 20):
-        seq += 1
-        evs.append({"type": "response.custom_tool_call_input.delta", "sequence_number": seq,
-                    "delta": patch_text[i:i + 20], "item_id": item_id, "output_index": oi})
-    seq += 1
-    evs.append({"type": "response.custom_tool_call_input.done", "sequence_number": seq,
-                "input": patch_text, "item_id": item_id, "output_index": oi})
-    seq += 1
-    evs.append({"type": "response.output_item.done", "sequence_number": seq, "output_index": oi,
-                "item": {"id": item_id, "type": "custom_tool_call", "status": "completed",
-                         "call_id": call_id, "name": "apply_patch", "input": patch_text}})
-    return evs, call_id, patch_text
 
 
 def _is_retriable_conv(code):
@@ -1866,9 +1668,6 @@ class Handler(BaseHTTPRequestHandler):
             log.info("    [converted] raw=%d events → converted=%d blocks, has_output=%s",
                      len(events), len(output_blocks), has_output)
 
-            # 修复 apply_patch：function_call → apply_patch_call
-            _fix_apply_patch_args(output_blocks)
-
             # 从 response.completed 事件中提取 status 和 usage
             for block in output_blocks:
                 try:
@@ -2032,22 +1831,12 @@ class Handler(BaseHTTPRequestHandler):
                     _emit({"sequence_number": nseq(), "type": "response.output_item.done", "output_index": b["oi"], "item": item})
                     output_items.append(item)
                 elif b["type"] == "tool_use":
-                    if b.get("name") == "apply_patch":
-                        pb = {"call_id": b["call_id"], "output_index": b["oi"], "args": b["args"]}
-                        evs, cid, ptxt = _build_patch_events(pb)
-                        for e in evs:
-                            e["sequence_number"] = nseq()
-                            _emit(e)
-                        output_items.append({"id": f"ctc_{cid}", "type": "custom_tool_call", "status": "completed",
-                                             "call_id": cid, "name": "apply_patch", "input": ptxt})
-                        has_output[0] = True
-                    else:
-                        _emit({"sequence_number": nseq(), "type": "response.function_call_arguments.done",
-                               "item_id": b["iid"], "output_index": b["oi"], "arguments": b["args"]})
-                        item = {"id": b["iid"], "type": "function_call", "status": "completed",
-                                "call_id": b["call_id"], "name": b["name"], "arguments": b["args"]}
-                        _emit({"sequence_number": nseq(), "type": "response.output_item.done", "output_index": b["oi"], "item": item})
-                        output_items.append(item)
+                    _emit({"sequence_number": nseq(), "type": "response.function_call_arguments.done",
+                           "item_id": b["iid"], "output_index": b["oi"], "arguments": b["args"]})
+                    item = {"id": b["iid"], "type": "function_call", "status": "completed",
+                            "call_id": b["call_id"], "name": b["name"], "arguments": b["args"]}
+                    _emit({"sequence_number": nseq(), "type": "response.output_item.done", "output_index": b["oi"], "item": item})
+                    output_items.append(item)
             elif et == "message_delta":
                 u = d.get("usage", {}) or {}
                 if u:
@@ -2191,8 +1980,6 @@ class Handler(BaseHTTPRequestHandler):
         total_bytes = 0
         out_count = 0
         pending = []           # commit 前缓冲
-        patch_buf = {}         # output_index -> {seq, call_id, item_id, output_index, args}
-        patch_done = {}        # call_id -> patch_text（用于改写 response.completed）
         held_completed = None  # 缓冲的 response.completed 事件
         last_usage = {}
         event_type_counts = {}
@@ -2233,28 +2020,7 @@ class Handler(BaseHTTPRequestHandler):
             t = ed.get("type", "")
             oi = ed.get("output_index")
             if t == "response.output_item.added":
-                item = ed.get("item", {}) or {}
-                if item.get("name") == "apply_patch" and item.get("type") == "function_call":
-                    patch_buf[oi] = {"seq": ed.get("sequence_number", 0),
-                                     "call_id": item.get("call_id") or item.get("id", ""),
-                                     "item_id": item.get("id", ""), "output_index": oi, "args": ""}
-                    return False
-            if oi is not None and oi in patch_buf:
-                pb = patch_buf[oi]
-                if t == "response.function_call_arguments.delta":
-                    pb["args"] += ed.get("delta", "")
-                    return False
-                if t == "response.function_call_arguments.done":
-                    pb["args"] = ed.get("arguments", pb["args"])
-                    return False
-                if t == "response.output_item.done":
-                    cid, ptxt = self._emit_custom_tool_call_stream(pb)
-                    if cid:
-                        patch_done[cid] = ptxt
-                    del patch_buf[oi]
-                    has_output = True
-                    return True
-                return False  # 归属该 apply_patch 项的其他事件，丢弃
+                pass  # codex-relay 0.5.1+ 原生输出 custom_tool_call，无需拦截
             if t == "response.completed":
                 held_completed = ed
                 return False
@@ -2364,23 +2130,9 @@ class Handler(BaseHTTPRequestHandler):
                     _flush(pe)
                 pending = []
 
-            # 收尾：刷出残留 apply_patch 项 + response.completed
+            # 收尾：response.completed
             if committed:
-                for oi in list(patch_buf.keys()):
-                    pb = patch_buf.pop(oi)
-                    cid, ptxt = self._emit_custom_tool_call_stream(pb)
-                    if cid:
-                        patch_done[cid] = ptxt
-                    has_output = True
                 if held_completed is not None:
-                    out_arr = held_completed.get("response", {}).get("output", []) or []
-                    for it in out_arr:
-                        cid = it.get("call_id")
-                        if it.get("name") == "apply_patch" and cid in patch_done:
-                            it["type"] = "custom_tool_call"
-                            it["id"] = f"ctc_{cid}"
-                            it["input"] = patch_done[cid]
-                            it.pop("arguments", None)
                     _write_evt(held_completed)
                     rstatus = held_completed.get("response", {}).get("status", "?")
                     rusage = held_completed.get("response", {}).get("usage", {}) or {}
@@ -2412,18 +2164,6 @@ class Handler(BaseHTTPRequestHandler):
                 "early_error": early_error is not None,
                 "code": early_error["code"] if early_error else None,
                 "msg": early_error["msg"] if early_error else None}
-
-    def _emit_custom_tool_call_stream(self, pb):
-        """把一个 apply_patch function_call 缓冲项合成 custom_tool_call 流事件并写出。
-        返回 (call_id, patch_text)。"""
-        evs, call_id, patch_text = _build_patch_events(pb)
-        log.info("    [apply_patch] unwrapped: %s", repr(patch_text[:100]))
-        for e in evs:
-            t = e.get("type", "")
-            self.wfile.write((f"event: {t}\ndata: {json.dumps(e, ensure_ascii=False)}\n\n").encode())
-        self.wfile.flush()
-        log.info("    [apply_patch] emitted custom_tool_call stream (delta+done)")
-        return call_id, patch_text
 
     def _converted_stream_with_retry(self, first_resp, up, url, up_headers, payload, method):
         """converted 路径：立即发响应头 + keepalive（防 TTFT 期 idle 超时），同步翻译
@@ -2521,8 +2261,6 @@ class Handler(BaseHTTPRequestHandler):
         last_usage = {}
         has_output = False
         stream_error = None
-        patch_buf = {}       # output_index -> apply_patch 缓冲项
-        patch_done = {}      # call_id -> patch_text（改写 response.completed 用）
         held_completed = None
         raw_blocks = []
         wlock = threading.Lock()
@@ -2605,32 +2343,6 @@ class Handler(BaseHTTPRequestHandler):
                             log.warning("[#%d]     !!! %s response.failed (mid-stream): %s", self._req_id, upstream_name, err)
                             _write(out)
                             continue
-                        # apply_patch 缓冲
-                        if t == "response.output_item.added" and item.get("name") == "apply_patch" and item.get("type") == "function_call":
-                            patch_buf[oi] = {"seq": p.get("sequence_number", 0),
-                                             "call_id": item.get("call_id") or item.get("id", ""),
-                                             "output_index": oi, "args": ""}
-                            continue
-                        if oi is not None and oi in patch_buf:
-                            pb = patch_buf[oi]
-                            if t == "response.function_call_arguments.delta":
-                                pb["args"] += p.get("delta", "")
-                                continue
-                            if t == "response.function_call_arguments.done":
-                                pb["args"] = p.get("arguments", pb["args"])
-                                continue
-                            if t == "response.output_item.done":
-                                evs, cid, ptxt = _build_patch_events(pb)
-                                log.info("    [apply_patch] unwrapped: %s", repr(ptxt[:100]))
-                                for e in evs:
-                                    _emit(e)
-                                if cid:
-                                    patch_done[cid] = ptxt
-                                del patch_buf[oi]
-                                has_output = True
-                                stop_ka.set()
-                                continue
-                            continue
                         if t == "response.completed":
                             held_completed = p
                             continue
@@ -2690,26 +2402,8 @@ class Handler(BaseHTTPRequestHandler):
                 # 正常完成或已真实输出（含中途错误已转发）→ 退出重试循环
                 break
 
-            # 收尾：刷出残留 apply_patch 项（有 added 但未见 output_item.done）
-            for oi in list(patch_buf.keys()):
-                pb = patch_buf.pop(oi)
-                evs, cid, ptxt = _build_patch_events(pb)
-                for e in evs:
-                    _emit(e)
-                if cid:
-                    patch_done[cid] = ptxt
-                has_output = True
-
-            # response.completed：改写其中的 apply_patch 项后发出
+            # response.completed
             if held_completed is not None:
-                out_arr = held_completed.get("response", {}).get("output", []) or []
-                for it in out_arr:
-                    cid = it.get("call_id")
-                    if it.get("name") == "apply_patch" and cid in patch_done:
-                        it["type"] = "custom_tool_call"
-                        it["id"] = f"ctc_{cid}"
-                        it["input"] = patch_done[cid]
-                        it.pop("arguments", None)
                 _emit(held_completed)
             elif not stream_error:
                 # 上游未发 response.completed（不完整流）→ 合成收尾，避免客户端"响应结束但一直转"
@@ -2842,7 +2536,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.29 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.30 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
