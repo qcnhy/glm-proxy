@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.31 — codex-relay + Python 路由层
+GLM API 代理 v2.9.32 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -749,162 +749,6 @@ def _convert_responses_to_messages(body):
     return result
 
 
-def _convert_custom_tools_for_completions(body):
-    """codex-relay 路径（Responses→Chat Completions）的工具转换：
-    把 custom/grammar 工具（如 apply_patch）转成 OpenAI function 格式，
-    否则 codex-relay/GLM 不认识，GLM 会改用 shell_command。"""
-    tools = body.get("tools")
-    if not isinstance(tools, list):
-        return body
-    new_tools = []
-    for tool in tools:
-        if not isinstance(tool, dict):
-            new_tools.append(tool)
-            continue
-        t = tool.get("type", "")
-        if t == "custom":
-            name = tool.get("name", "")
-            new_tools.append({
-                "type": "function",
-                "name": name,
-                "description": _make_apply_patch_tool_description(tool.get("description", "")),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "patch": {"type": "string", "description": "The patch content in V4A format"},
-                    },
-                    "required": ["patch"],
-                },
-            })
-        else:
-            new_tools.append(tool)
-    body["tools"] = new_tools
-
-    # 转换 input 里的 custom_tool_call / custom_tool_call_output（往返结果）
-    # codex-relay 不认识 custom 类型，需转成标准 function_call / function_call_output
-    inp = body.get("input")
-    if isinstance(inp, list):
-        new_input = []
-        for item in inp:
-            if isinstance(item, dict):
-                t = item.get("type", "")
-                if t == "custom_tool_call":
-                    new_item = dict(item)
-                    new_item["type"] = "function_call"
-                    if "input" in new_item and "arguments" not in new_item:
-                        # custom_tool_call.input 是原始文本（apply_patch 的 patch），
-                        # 但 function_call.arguments 必须是 JSON，包成 {"patch": ...}
-                        raw_input = new_item.pop("input")
-                        try:
-                            json.loads(raw_input)  # 已是合法JSON则原样用
-                            new_item["arguments"] = raw_input
-                        except Exception:
-                            new_item["arguments"] = json.dumps({"patch": raw_input}, ensure_ascii=False)
-                    new_input.append(new_item)
-                elif t == "custom_tool_call_output":
-                    new_item = dict(item)
-                    new_item["type"] = "function_call_output"
-                    new_input.append(new_item)
-                else:
-                    new_input.append(item)
-            else:
-                new_input.append(item)
-        body["input"] = new_input
-    return body
-    """将 OpenAI Responses API 请求转换为 Anthropic Messages API 请求。
-    ccproxy-api 的转换器不处理 function_call/function_call_output，
-    所以这里自己实现完整的转换。"""
-    messages = []
-    system_parts = []
-
-    # 提取 system prompt
-    instructions = body.get("instructions")
-    if isinstance(instructions, str) and instructions:
-        system_parts.append(instructions)
-
-    # 转换 input 数组
-    input_items = body.get("input", [])
-    if isinstance(input_items, str):
-        messages.append({"role": "user", "content": input_items})
-    elif isinstance(input_items, list):
-        for item in input_items:
-            item_type = item.get("type", "")
-            if item_type == "message":
-                role = item.get("role", "user")
-                content = item.get("content", [])
-                text = _extract_text_from_content(content)
-                if role in ("system", "developer"):
-                    if text:
-                        system_parts.append(text)
-                elif role in ("user", "assistant"):
-                    messages.append({"role": role, "content": text})
-            elif item_type == "function_call":
-                _append_tool_use(messages, item)
-            elif item_type == "function_call_output":
-                _append_tool_result(messages, item)
-            elif item_type == "custom_tool_call":
-                # custom_tool_call → function_call（apply_patch 等）
-                _append_tool_use(messages, {**item, "type": "function_call",
-                                            "arguments": item.get("input", "")})
-            elif item_type == "custom_tool_call_output":
-                # custom_tool_call_output → function_call_output
-                _append_tool_result(messages, item)
-
-    # 构建输出
-    result = {"model": body.get("model", "glm-5")}
-    if system_parts:
-        result["system"] = "\n\n".join(system_parts)
-    result["messages"] = messages
-
-    # 转换 tools
-    tools_out = []
-    for tool in body.get("tools", []):
-        t = tool.get("type", "")
-        if t == "function":
-            tools_out.append({
-                "type": "custom",
-                "name": tool.get("name", ""),
-                "input_schema": tool.get("parameters", tool.get("input_schema", {})),
-            })
-        elif t == "custom":
-            # apply_patch 等 custom/grammar 工具 → 转为 function 格式让 GLM 能调用
-            name = tool.get("name", "")
-            desc = _make_apply_patch_tool_description(tool.get("description", ""))
-            tools_out.append({
-                "type": "custom",
-                "name": name,
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "patch": {"type": "string", "description": desc},
-                    },
-                    "required": ["patch"],
-                },
-            })
-        elif t == "namespace":
-            # 展平 namespace 子工具
-            ns_name = tool.get("name", "")
-            for sub in tool.get("tools", []):
-                sub_name = sub.get("name", "")
-                tools_out.append({
-                    "type": "custom",
-                    "name": f"{ns_name}.{sub_name}" if ns_name else sub_name,
-                    "input_schema": sub.get("parameters", sub.get("input_schema", {})),
-                })
-    if tools_out:
-        result["tools"] = tools_out
-
-    # 字段映射
-    max_tokens = body.get("max_output_tokens")
-    result["max_tokens"] = max_tokens if max_tokens else 16384
-    if body.get("stream"):
-        result["stream"] = True
-    if body.get("temperature") is not None:
-        result["temperature"] = body["temperature"]
-
-    return result
-
-
 def _convert_messages_error_to_responses(err_body):
     """将 Anthropic Messages API 错误格式转为 Responses API 错误格式"""
     try:
@@ -925,46 +769,6 @@ def _convert_messages_error_to_responses(err_body):
 
 
 # ── apply_patch 转换 ──────────────────────────────────
-def _parse_patch_to_operation(patch_text):
-    """将 patch 文本解析为 Codex 的 operation 对象。
-    Codex 期望: {type: create_file|update_file|delete_file, path, diff}"""
-    lines = patch_text.split("\n")
-    path = ""
-    diff_lines = []
-    op_type = None
-    in_content = False
-
-    for line in lines:
-        if line.startswith("*** Add File: "):
-            op_type = "create_file"
-            path = line[len("*** Add File: "):].strip()
-            in_content = True
-            continue
-        elif line.startswith("*** Update File: "):
-            op_type = "update_file"
-            path = line[len("*** Update File: "):].strip()
-            in_content = True
-            continue
-        elif line.startswith("*** Delete File: "):
-            return {"type": "delete_file", "path": line[len("*** Delete File: "):].strip()}
-        elif line.strip() in ("*** Begin Patch", "*** End Patch", ""):
-            continue
-        elif in_content:
-            if line.startswith("+") or line.startswith("-") or line.startswith(" "):
-                diff_lines.append(line)
-            else:
-                diff_lines.append("+" + line if line else "")
-
-    if not op_type or not path:
-        return None
-
-    diff = "\n".join(diff_lines)
-    result = {"type": op_type, "path": path}
-    if diff.strip():
-        result["diff"] = diff
-    return result
-
-
 def _is_retriable_conv(code):
     """converted 路径早期错误是否值得退避重试（1305 过载 / 5xx / 429）。"""
     if code is None:
@@ -1218,8 +1022,7 @@ class Handler(BaseHTTPRequestHandler):
                              converted.get("max_tokens", 0),
                              body.get("max_output_tokens"))
                 else:
-                    # codex-relay 路径：转换 custom 工具（apply_patch 等）为 function 格式
-                    _convert_custom_tools_for_completions(body)
+                    # codex-relay 路径：codex-relay 0.5.1+ 原生处理 custom tool 转换，无需预处理
                     payload = json.dumps(body).encode()
                 if "Content-Type" not in up_headers and payload is not None:
                     up_headers["Content-Type"] = "application/json"
@@ -2435,7 +2238,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.31 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.32 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
