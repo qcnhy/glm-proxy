@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.34 — codex-relay + Python 路由层
+GLM API 代理 v2.9.35 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -202,7 +202,7 @@ class InterceptorHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
 
-        # 解析请求，注入 stream_options 使上游返回 usage
+        # 解析请求（日志用）
         is_stream = False
         try:
             data = json.loads(body)
@@ -232,7 +232,6 @@ class InterceptorHandler(BaseHTTPRequestHandler):
                     json.dump(data, f, ensure_ascii=False, indent=2)
                 log.info("[relay] %s [DEBUG] saved translated request to %s", up["name"], path)
             if is_stream:
-                data.setdefault("stream_options", {})["include_usage"] = True
                 body = json.dumps(data).encode("utf-8")
         except Exception:
             log.info("[relay] %s translated: %dKB (parse failed)", up["name"], len(body) // 1024)
@@ -1936,7 +1935,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.34 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.35 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
