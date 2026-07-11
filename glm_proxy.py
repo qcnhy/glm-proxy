@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.33 — codex-relay + Python 路由层
+GLM API 代理 v2.9.34 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -589,51 +589,6 @@ def _append_tool_result(messages, output_item):
 
 
 # apply_patch 的 patch 格式规则（GLM 不原生支持 FREEFORM 工具，靠描述教它）
-_APPLY_PATCH_RULES = (
-    "\n\nSTOP! Your previous apply_patch calls were ALL WRONG (empty {} or invalid format). "
-    "IGNORE all previous attempts. Follow ONLY the rules below:\n"
-    "MANDATORY: You MUST use apply_patch for ALL file operations — creating, editing, "
-    "or deleting files. Do NOT use shell commands (echo, sed, powershell Set-Content, etc.) "
-    "to write or modify files. apply_patch is the ONLY correct way to change files.\n\n"
-    "CRITICAL RULES for patch format:\n"
-    "1. In *** Update File sections, EVERY content line MUST start with one of:\n"
-    "   - space ( ) = context line (unchanged, shown for reference)\n"
-    "   - minus (-) = line to REMOVE from the file\n"
-    "   - plus (+) = line to ADD to the file\n"
-    "2. NEVER write bare text lines without a prefix character!\n"
-    "3. Start each change section with @@ (just @@ alone, NO curly braces or anything after it)\n"
-    "4. Do NOT use --- separator, it is NOT valid\n"
-    "5. *** Begin Patch and *** End Patch are COMMANDS, NOT content. "
-    "Do NOT add +/-/space prefix to them!\n"
-    "6. You CANNOT append to a file with multiple Add File operations. "
-    "Each file can only be Added ONCE. If you need a large file, "
-    "write ALL content in a SINGLE *** Add File operation. "
-    "To modify an existing file, use *** Update File instead.\n\n"
-    "To change line 2 from 'old' to 'new' in a file:\n"
-    "*** Begin Patch\n"
-    "*** Update File: path/to/file.txt\n"
-    "@@\n"
-    " line 1\n"
-    "-old\n"
-    "+new\n"
-    " line 3\n"
-    "*** End Patch\n\n"
-    "To create a new file (NO @@ in Add File):\n"
-    "*** Begin Patch\n"
-    "*** Add File: path/new.txt\n"
-    "+line 1\n"
-    "+line 2\n"
-    "*** End Patch\n\n"
-    "To delete a file:\n"
-    "*** Begin Patch\n"
-    "*** Delete File: path/old.txt\n"
-    "*** End Patch"
-)
-
-
-def _make_apply_patch_tool_description(original_desc):
-    """给 apply_patch 工具描述追加 patch 格式规则"""
-    return (original_desc or "") + _APPLY_PATCH_RULES
 
 
 def _convert_responses_to_messages(body):
@@ -709,7 +664,7 @@ def _convert_responses_to_messages(body):
                     "type": "object",
                     "properties": {
                         "patch": {"type": "string",
-                                  "description": _make_apply_patch_tool_description(tool.get("description", ""))},
+                                  "description": tool.get("description", "")},
                     },
                     "required": ["patch"],
                 },
@@ -1469,12 +1424,41 @@ class Handler(BaseHTTPRequestHandler):
                     _emit({"sequence_number": nseq(), "type": "response.output_item.done", "output_index": b["oi"], "item": item})
                     output_items.append(item)
                 elif b["type"] == "tool_use":
-                    _emit({"sequence_number": nseq(), "type": "response.function_call_arguments.done",
-                           "item_id": b["iid"], "output_index": b["oi"], "arguments": b["args"]})
-                    item = {"id": b["iid"], "type": "function_call", "status": "completed",
-                            "call_id": b["call_id"], "name": b["name"], "arguments": b["args"]}
-                    _emit({"sequence_number": nseq(), "type": "response.output_item.done", "output_index": b["oi"], "item": item})
-                    output_items.append(item)
+                    if b.get("name") == "apply_patch":
+                        raw_args = b["args"]
+                        try:
+                            parsed = json.loads(raw_args)
+                            patch_text = parsed.get("patch", raw_args) if isinstance(parsed, dict) else raw_args
+                        except Exception:
+                            patch_text = raw_args
+                        if not patch_text.startswith("*** Begin Patch"):
+                            patch_text = "*** Begin Patch\n" + patch_text
+                        if not patch_text.rstrip().endswith("*** End Patch"):
+                            patch_text = patch_text.rstrip() + "\n*** End Patch"
+                        ctc_id = "ctc_" + b["call_id"]
+                        s = nseq()
+                        _emit({"sequence_number": s, "type": "response.output_item.added", "output_index": b["oi"],
+                               "item": {"id": ctc_id, "type": "custom_tool_call", "status": "in_progress", "call_id": b["call_id"], "name": "apply_patch"}})
+                        for ck in [patch_text[i:i+20] for i in range(0, len(patch_text), 20)]:
+                            s += 1
+                            _emit({"sequence_number": s, "type": "response.custom_tool_call_input.delta",
+                                   "delta": ck, "item_id": ctc_id, "output_index": b["oi"]})
+                        s += 1
+                        _emit({"sequence_number": s, "type": "response.custom_tool_call_input.done",
+                               "input": patch_text, "item_id": ctc_id, "output_index": b["oi"]})
+                        s += 1
+                        item = {"id": ctc_id, "type": "custom_tool_call", "status": "completed",
+                                "call_id": b["call_id"], "name": "apply_patch", "input": patch_text}
+                        _emit({"sequence_number": s, "type": "response.output_item.done", "output_index": b["oi"], "item": item})
+                        output_items.append(item)
+                        has_output[0] = True
+                    else:
+                        _emit({"sequence_number": nseq(), "type": "response.function_call_arguments.done",
+                               "item_id": b["iid"], "output_index": b["oi"], "arguments": b["args"]})
+                        item = {"id": b["iid"], "type": "function_call", "status": "completed",
+                                "call_id": b["call_id"], "name": b["name"], "arguments": b["args"]}
+                        _emit({"sequence_number": nseq(), "type": "response.output_item.done", "output_index": b["oi"], "item": item})
+                        output_items.append(item)
             elif et == "message_delta":
                 u = d.get("usage", {}) or {}
                 if u:
@@ -1952,7 +1936,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.33 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.34 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
