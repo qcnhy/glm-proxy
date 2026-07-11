@@ -2,7 +2,6 @@
   "_comment": "复制本文件为 config.json 并填入真实密钥。config.json 不会被提交到 git。",
   "responses_use_completions": true,
   "_comment_responses": "Responses API 路由：true=Completions 端点 (主，codex-relay), false=Messages 端点 (备，ccproxy-api)",
-  "feishu_webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/YOUR_WEBHOOK_ID",
   "_comment_upstreams": "渠道按优先级排列。能力由 URL 字段决定：有 openai_url=支持 Completions, 有 anthropic_url=支持 Messages。路由 flag: require_health(需健康检查), worktime_only(仅工作时间), disabled(禁用)。客户端发 key=3 强制走 official。内网渠道放在最后作为兜底。",
   "upstreams": [
     {

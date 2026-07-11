@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.32 — codex-relay + Python 路由层
+GLM API 代理 v2.9.33 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -8,7 +8,7 @@ GLM API 代理 v2.9.32 — codex-relay + Python 路由层
 
 功能：
     - codex-relay 负责 Responses API ↔ Chat Completions 翻译（社区维护）
-    - Python 层负责：模型覆盖、密钥注入、多上游回退、健康检查、飞书通知
+    - Python 层负责：模型覆盖、密钥注入、多上游回退、健康检查
     - /v1/models 返回静态模型列表
     - 日志和错误请求保存到 logs/ 目录
 
@@ -66,7 +66,7 @@ def _load_config():
     """从 config.json 加载配置（密钥等敏感信息）。不存在则用示例。"""
     if not os.path.exists(_CONFIG_PATH):
         log.warning("config.json 不存在，请复制 config.example.json 并填入密钥")
-        return {"upstreams": [], "feishu_webhook": ""}
+        return {"upstreams": []}
     with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -80,8 +80,6 @@ LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 #   True  → codex-relay（Responses→Chat Completions，主路径）
 #   False → ccproxy-api（Responses→Anthropic Messages，备用路径）
 RESPONSES_USE_COMPLETIONS = _cfg.get("responses_use_completions", True)
-
-FEISHU_WEBHOOK = _cfg.get("feishu_webhook", "")
 
 UPSTREAMS = _cfg.get("upstreams", [])
 
@@ -142,15 +140,6 @@ _official_limiter = RateLimiter(rate=1.5, burst=2)  # 官方 API 限速
 # 请求序号（多会话日志关联用）
 import itertools
 _req_counter = itertools.count(1)
-
-# ── 飞书通知 ──────────────────────────────────────────
-def _send_feishu(msg):
-    try:
-        payload = json.dumps({"msg_type": "text", "content": {"text": msg}}).encode()
-        req = Request(FEISHU_WEBHOOK, data=payload, headers={"Content-Type": "application/json"})
-        urlopen(req, timeout=5)
-    except:
-        pass
 
 # ── 内网健康检查（仅启动时一次，用于确认真实模型）──────────────────────────────
 def _check_internal_once():
@@ -1552,268 +1541,6 @@ class Handler(BaseHTTPRequestHandler):
             log.warning("[#%d]     <<< %s [converted] STREAM interrupted", self._req_id, upstream_name)
         return done, early_err
 
-    # ── Responses→Messages 增量流式（边收边转边发）──
-    def _converted_stream(self, resp, upstream_name):
-        """增量流式：上游 Anthropic Messages SSE → 经 ccproxy 转换器 → Responses SSE 边转边发。
-        专用 worker 线程跑 event loop 驱动 async 转换器，主线程 get_nowait 边收边刷。
-        commit 前若遇上游 error（1305 等）不发任何字节，返回 early_error 供上层重试。
-        返回 dict: {committed, has_output, early_error, code, msg}。"""
-        import threading as _t, queue as _q, asyncio
-        converter = AnthropicToOpenAIResponsesStreamAdapter()
-        inbox = _q.Queue()    # 主线程 → 转换器（Anthropic 事件 dict；None=EOF）
-        outbox = _q.Queue()   # 转换器 → 主线程（Responses 事件 dict；SENT=结束）
-        SENT = object()
-
-        def _worker():
-            loop = asyncio.new_event_loop()
-            try:
-                asyncio.set_event_loop(loop)
-
-                async def consume():
-                    async def src():
-                        while True:
-                            try:
-                                ev = inbox.get(timeout=REQUEST_TIMEOUT + 30)
-                            except _q.Empty:
-                                return
-                            if ev is None:
-                                return
-                            yield ev
-                    try:
-                        async for out in converter.run(src()):
-                            ed = out if isinstance(out, dict) else out.model_dump(exclude_none=True, mode="json")
-                            outbox.put(ed)
-                    finally:
-                        outbox.put(SENT)
-
-                loop.run_until_complete(consume())
-            except Exception as e:
-                log.error("    [converted] worker error: %s", e)
-                outbox.put(SENT)
-            finally:
-                # 取消残留 task，避免 "Task was destroyed" 警告
-                try:
-                    pending = asyncio.all_tasks(loop)
-                    for tk in pending:
-                        tk.cancel()
-                    if pending:
-                        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-                except Exception:
-                    pass
-                try:
-                    loop.close()
-                except Exception:
-                    pass
-
-        wth = _t.Thread(target=_worker, daemon=True)
-        wth.start()
-
-        def _parse(block):
-            et, dj = None, None
-            for line in block.decode("utf-8", errors="replace").split("\n"):
-                if line.startswith("event: "):
-                    et = line[7:].strip()
-                elif line.startswith("data: "):
-                    try:
-                        dj = json.loads(line[6:])
-                    except Exception:
-                        pass
-            if dj is not None and et:
-                dj["_event_type"] = et
-            return dj, et
-
-        committed = False
-        headers_sent = False
-        has_output = False
-        early_error = None
-        total_bytes = 0
-        out_count = 0
-        pending = []           # commit 前缓冲
-        held_completed = None  # 缓冲的 response.completed 事件
-        last_usage = {}
-        event_type_counts = {}
-
-        def _send_headers():
-            nonlocal headers_sent
-            if headers_sent:
-                return
-            self.send_response(200)
-            for h in ["Content-Type", "Cache-Control"]:
-                v = resp.headers.get(h)
-                if v:
-                    self.send_header(h, v)
-            self.send_header("Connection", "close")
-            self.end_headers()
-            self.close_connection = True
-            headers_sent = True
-
-        def _write_evt(ed):
-            nonlocal out_count
-            t = ed.get("type", "")
-            self.wfile.write((f"event: {t}\ndata: {json.dumps(ed, ensure_ascii=False)}\n\n").encode())
-            self.wfile.flush()
-            out_count += 1
-
-        def _is_real(ed):
-            return ed.get("type", "") in (
-                "response.output_text.delta",
-                "response.function_call_arguments.delta",
-                "response.reasoning_summary_text.delta",
-                "response.reasoning.delta",
-                "response.custom_tool_call_input.delta",
-            )
-
-        def _flush(ed):
-            """apply_patch 感知的刷出。返回是否为真实输出。"""
-            nonlocal has_output, held_completed
-            t = ed.get("type", "")
-            oi = ed.get("output_index")
-            if t == "response.output_item.added":
-                pass  # codex-relay 0.5.1+ 原生输出 custom_tool_call，无需拦截
-            if t == "response.completed":
-                held_completed = ed
-                return False
-            if _is_real(ed):
-                has_output = True
-            _write_evt(ed)
-            return has_output
-
-        def _drain_nowait():
-            """非阻塞排空 outbox（FIFO 保证顺序，滞留项下一轮或 EOF 阻塞排空时取出）。"""
-            while True:
-                try:
-                    o = outbox.get_nowait()
-                except _q.Empty:
-                    return
-                if o is SENT:
-                    continue
-                if not committed:
-                    pending.append(o)
-                else:
-                    _flush(o)
-
-        try:
-            buf = b""
-            upstream_eof = False
-            converter_done = False
-            while not (upstream_eof and converter_done):
-                if early_error and not committed:
-                    break
-                # 1. 读上游
-                if not upstream_eof:
-                    chunk = resp.read(4096)
-                    if not chunk:
-                        upstream_eof = True
-                        inbox.put(None)
-                    else:
-                        total_bytes += len(chunk)
-                        buf += chunk
-                        while b"\n\n" in buf or b"\r\n\r\n" in buf:
-                            if b"\r\n\r\n" in buf:
-                                block, buf = buf.split(b"\r\n\r\n", 1)
-                            else:
-                                block, buf = buf.split(b"\n\n", 1)
-                            block = block.replace(b"\r\n", b"\n")
-                            dj, et = _parse(block)
-                            if not dj or not et:
-                                continue
-                            event_type_counts[et] = event_type_counts.get(et, 0) + 1
-                            if et == "error" and not committed:
-                                ed = dj.get("error", dj)
-                                early_error = {
-                                    "code": ed.get("code") if isinstance(ed, dict) else None,
-                                    "msg": (ed.get("message", "") if isinstance(ed, dict) else str(ed)),
-                                }
-                                log.warning("    [converted] early upstream error: code=%s msg=%s",
-                                            early_error["code"], str(early_error["msg"])[:150])
-                                inbox.put(None)
-                                upstream_eof = True
-                                break
-                            if et == "message_delta":
-                                u = dj.get("usage") or {}
-                                if u:
-                                    last_usage = u
-                            elif et == "error":
-                                log.warning("    [converted] mid-stream upstream error: %s",
-                                            str(dj.get("error", dj))[:200])
-                            inbox.put(dj)
-                # 2. 排空 outbox
-                if upstream_eof:
-                    # 阻塞排空直到转换器结束（兜底所有滞留输出）
-                    deadline_stall = 0
-                    while not converter_done:
-                        try:
-                            o = outbox.get(timeout=60)
-                        except _q.Empty:
-                            deadline_stall += 1
-                            if deadline_stall > 1:
-                                log.warning("    [converted] converter drain stall, giving up")
-                                break
-                            continue
-                        if o is SENT:
-                            converter_done = True
-                            break
-                        if not committed:
-                            pending.append(o)
-                        else:
-                            _flush(o)
-                else:
-                    _drain_nowait()
-                # 3. commit 判定（pre-commit；出现 response.created/真实输出即提交）
-                if (not committed and early_error is None and pending and
-                        any(_is_real(p) or p.get("type") in (
-                            "response.created", "response.output_item.added",
-                            "response.content_part.added",
-                            "response.reasoning_summary_part.added") for p in pending)):
-                    committed = True
-                    _send_headers()
-                    for pe in pending:
-                        _flush(pe)
-                    pending = []
-
-            # 迟到的 commit（小响应一次性读完 / 转换器输出滞后）
-            if not committed and pending and early_error is None:
-                committed = True
-                _send_headers()
-                for pe in pending:
-                    _flush(pe)
-                pending = []
-
-            # 收尾：response.completed
-            if committed:
-                if held_completed is not None:
-                    _write_evt(held_completed)
-                    rstatus = held_completed.get("response", {}).get("status", "?")
-                    rusage = held_completed.get("response", {}).get("usage", {}) or {}
-                    log.info("    [converted] status=%s usage=%s", rstatus,
-                             {k: v for k, v in rusage.items() if v})
-                else:
-                    # 上游不完整（无 message_stop）：合成收尾
-                    stop_reason = "end_turn" if early_error else "max_tokens"
-                    log.warning("    [converted] no response.completed, synthesizing (stop=%s)", stop_reason)
-                    fake = {"type": "response.completed", "sequence_number": out_count + 1,
-                            "response": {"id": "resp_syn", "object": "response",
-                                         "status": "completed" if stop_reason == "end_turn" else "incomplete",
-                                         "model": upstream_name, "output": [],
-                                         "usage": last_usage or {}}}
-                    _write_evt(fake)
-                log.info("    [converted] events=%s", event_type_counts)
-                log.info("[#%d]     <<< %s [converted] STREAM OK (%d out, %dKB, %dms)",
-                         self._req_id, upstream_name, out_count, total_bytes // 1024, self._ms())
-        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
-            log.warning("[#%d]     <<< %s [converted] STREAM interrupted", self._req_id, upstream_name)
-        finally:
-            try:
-                inbox.put_nowait(None)
-            except Exception:
-                pass
-            wth.join(timeout=5)
-
-        return {"committed": committed, "has_output": has_output,
-                "early_error": early_error is not None,
-                "code": early_error["code"] if early_error else None,
-                "msg": early_error["msg"] if early_error else None}
-
     def _converted_stream_with_retry(self, first_resp, up, url, up_headers, payload, method):
         """converted 路径：立即发响应头 + keepalive（防 TTFT 期 idle 超时），同步翻译
         Anthropic→Responses（无 async，不可能挂），早期错误退避重试，用尽则流内转发。
@@ -1881,19 +1608,6 @@ class Handler(BaseHTTPRequestHandler):
             stop_ka.set()
         return {"done": True}
 
-
-    def _forward_conv_error(self, res):
-        """把上游早期错误作为 HTTP 错误响应转发给客户端（让用户看到真实原因）。"""
-        try:
-            msg = res.get("msg") or "upstream error"
-            body = json.dumps({"error": {"message": msg, "code": res.get("code"),
-                                         "type": "upstream_error"}}, ensure_ascii=False).encode()
-        except Exception:
-            body = b'{"error":"upstream error"}'
-        try:
-            self._send_raw(503, body, "application/json")
-        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
-            log.warning("client disconnected before error response")
 
     # ── 流式转发 ─────────────────────────────────────
     def _relay_stream_with_retry(self, first_resp, up, url, up_headers, payload, method):
@@ -2238,7 +1952,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.32 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.33 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
