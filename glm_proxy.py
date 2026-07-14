@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.35 — codex-relay + Python 路由层
+GLM API 代理 v2.9.36 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -1611,25 +1611,15 @@ class Handler(BaseHTTPRequestHandler):
         _apply_patch_oi = set()  # output_index 集合：apply_patch function_call 需转 custom_tool_call
         _apply_patch_args = {}  # output_index -> 累积的 JSON arguments 字符串
         raw_blocks = []
-        wlock = threading.Lock()
-        stop_ka = threading.Event()
 
         def _write(data):
-            with wlock:
-                self.wfile.write(data)
-                self.wfile.flush()
+            self.wfile.write(data)
+            self.wfile.flush()
 
         def _emit(ed):
             _write((f"event: {ed.get('type', '')}\ndata: {json.dumps(ed, ensure_ascii=False)}\n\n").encode())
 
-        def _keepalive():
-            while not stop_ka.wait(5):
-                try:
-                    _write(b": keepalive\n\n")
-                except Exception:
-                    break
-
-        # 立即发响应头进入 SSE 模式（避免客户端等待响应头/首字节超时）
+        # 立即发响应头进入 SSE 模式（codex-relay 0.5.2+ 自带 keepalive + 立即 flush response.created）
         self.send_response(200)
         for h in ["Content-Type", "Cache-Control"]:
             v = first_resp.headers.get(h)
@@ -1638,8 +1628,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
-        kat = threading.Thread(target=_keepalive, daemon=True)
-        kat.start()
 
         resp = first_resp
         try:
@@ -1732,10 +1720,8 @@ class Handler(BaseHTTPRequestHandler):
                                 item.pop("arguments", None)
                                 out = (f"event: response.output_item.done\ndata: {json.dumps(p, ensure_ascii=False)}\n\n").encode()
                                 has_output = True
-                                stop_ka.set()
                         if b"output_text.delta" in out or b"custom_tool_call" in out:
                             has_output = True
-                            stop_ka.set()
                         _write(out)
                     if early_err:
                         break
@@ -1823,8 +1809,6 @@ class Handler(BaseHTTPRequestHandler):
                 log.info("    usage: input=%d output=%d total=%d", inp, out_, inp + out_)
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
             log.warning("[#%d]     <<< %s STREAM interrupted", self._req_id, upstream_name)
-        finally:
-            stop_ka.set()
 
         return events, True, stream_error  # 已发响应头，总是 done（不回退下一上游）
 
@@ -1935,7 +1919,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.35 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.36 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
