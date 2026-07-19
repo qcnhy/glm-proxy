@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.42 — codex-relay + Python 路由层
+GLM API 代理 v2.9.43 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -113,29 +113,6 @@ def _setup_logger():
 
 log = _setup_logger()
 
-# ── 全局频率控制（防止 1305 过载）──────────────────────
-class RateLimiter:
-    """令牌桶：每秒补充 token，请求前消费，桶空则等待"""
-    def __init__(self, rate=2, burst=3):
-        self.rate = rate          # 每秒允许请求数
-        self.burst = burst        # 突发上限
-        self.tokens = burst
-        self.last = time.monotonic()
-        self.lock = threading.Lock()
-
-    def acquire(self):
-        with self.lock:
-            now = time.monotonic()
-            self.tokens = min(self.burst, self.tokens + (now - self.last) * self.rate)
-            self.last = now
-            if self.tokens < 1:
-                wait = (1 - self.tokens) / self.rate
-                time.sleep(wait)
-                self.tokens = 0
-            else:
-                self.tokens -= 1
-
-_official_limiter = RateLimiter(rate=1.5, burst=2)  # 官方 API 限速
 
 # 请求序号（多会话日志关联用）
 import itertools
@@ -1048,9 +1025,6 @@ class Handler(BaseHTTPRequestHandler):
             log.info("[#%d]     -> %s", self._req_id, up["name"])
 
             try:
-                # 官方 API 限速
-                if up["name"] == "official":
-                    _official_limiter.acquire()
                 req = Request(url, data=payload, headers=up_headers, method=method)
                 resp = urlopen(req, timeout=REQUEST_TIMEOUT)
 
@@ -1374,10 +1348,37 @@ class Handler(BaseHTTPRequestHandler):
         return has_output, last_usage, context_exceeded, stream_error
 
     # ── Responses→Messages 转换流式处理（旧：整段缓冲，留作兜底）──
-    def _converted_stream_sync(self, resp, upstream_name, _write, _emit, stop_ka):
-        """同步翻译 Anthropic Messages SSE → OpenAI Responses SSE，边收边发。
-        纯同步、无 worker 线程/async loop，不可能挂起；收到 message_stop 就地发 response.completed。
-        返回 (done, early_err)，early_err=(code,msg) 为真实输出前的上游错误（供上层重试）。"""
+    def _converted_stream_with_retry(self, first_resp, up, url, up_headers, payload, method):
+        """converted 路径：立即发响应头 + keepalive，同步翻译 Anthropic→Responses，
+        早期错误退避重试。合并了原 sync + retry 两层。"""
+        import threading
+        upstream_name = up["name"]
+        MAX = 2
+        wlock = threading.Lock()
+        stop_ka = threading.Event()
+        def _write(data):
+            with wlock:
+                self.wfile.write(data); self.wfile.flush()
+        def _emit(ed):
+            _write((f"event: {ed.get('type', '')}\ndata: {json.dumps(ed, ensure_ascii=False)}\n\n").encode())
+        def _keepalive():
+            while not stop_ka.wait(5):
+                try:
+                    _write(b": keepalive\n\n")
+                except Exception:
+                    break
+        # 立即发响应头 + 启动 keepalive
+        self.send_response(200)
+        for h in ["Content-Type", "Cache-Control"]:
+            v = first_resp.headers.get(h)
+            if v:
+                self.send_header(h, v)
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        kat = threading.Thread(target=_keepalive, daemon=True)
+        kat.start()
+
         seq = [0]
         def nseq():
             seq[0] += 1
@@ -1604,73 +1605,71 @@ class Handler(BaseHTTPRequestHandler):
                      self._req_id, upstream_name, self._ms(), len(output_items))
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
             log.warning("[#%d]     <<< %s [converted] STREAM interrupted", self._req_id, upstream_name)
-        return done, early_err
 
-    def _converted_stream_with_retry(self, first_resp, up, url, up_headers, payload, method):
-        """converted 路径：立即发响应头 + keepalive（防 TTFT 期 idle 超时），同步翻译
-        Anthropic→Responses（无 async，不可能挂），早期错误退避重试，用尽则流内转发。
-        返回 {done: bool}（已发响应头，总是 done）。"""
-        import threading
-        upstream_name = up["name"]
-        MAX = 2
-        wlock = threading.Lock()
-        stop_ka = threading.Event()
-        def _write(data):
-            with wlock:
-                self.wfile.write(data); self.wfile.flush()
-        def _emit(ed):
-            _write((f"event: {ed.get('type', '')}\ndata: {json.dumps(ed, ensure_ascii=False)}\n\n").encode())
-        def _keepalive():
-            while not stop_ka.wait(5):
-                try:
-                    _write(b": keepalive\n\n")
-                except Exception:
+        # 早期错误重试（真实输出前的上游错误）
+        if early_err and not has_output[0]:
+            code, msg = early_err
+            for attempt in range(MAX):
+                if not _is_retriable_conv(code):
                     break
-        # 立即发响应头进入 SSE 模式 + 启动 keepalive
-        self.send_response(200)
-        for h in ["Content-Type", "Cache-Control"]:
-            v = first_resp.headers.get(h)
-            if v:
-                self.send_header(h, v)
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.close_connection = True
-        kat = threading.Thread(target=_keepalive, daemon=True)
-        kat.start()
-        resp = first_resp
-        try:
-            for attempt in range(MAX + 1):
-                done, early_err = self._converted_stream_sync(resp, upstream_name, _write, _emit, stop_ka)
-                if done:
-                    return {"done": True}
-                if early_err:
-                    code, msg = early_err
-                    if attempt < MAX and _is_retriable_conv(code):
-                        wait = min(2 ** attempt, 4)
-                        log.warning("[#%d] [converted] %s early error code=%s, retry %d/%d in %ds",
-                                    self._req_id, upstream_name, code, attempt + 1, MAX, wait)
-                        try:
-                            resp.close()
-                        except Exception:
-                            pass
-                        time.sleep(wait)  # 期间 keepalive 持续保活
-                        try:
-                            if upstream_name == "official":
-                                _official_limiter.acquire()
-                            resp = urlopen(Request(url, data=payload, headers=up_headers, method=method),
-                                           timeout=REQUEST_TIMEOUT)
-                        except Exception as oe:
-                            log.error("[#%d] [converted] reopen failed: %s", self._req_id, oe)
-                            _emit({"sequence_number": 0, "type": "response.failed",
-                                   "response": {"error": {"message": str(oe), "type": "upstream_error"}}})
-                            return {"done": True}
-                        continue
-                    _emit({"sequence_number": 0, "type": "response.failed",
-                           "response": {"error": {"message": msg or "upstream error", "code": code, "type": "upstream_error"}}})
-                    return {"done": True}
-                return {"done": True}
-        finally:
-            stop_ka.set()
+                wait = min(2 ** attempt, 4)
+                log.warning("[#%d] [converted] %s early error code=%s, retry %d/%d in %ds",
+                            self._req_id, upstream_name, code, attempt + 1, MAX, wait)
+                try:
+                    first_resp.close()
+                except Exception:
+                    pass
+                time.sleep(wait)
+                try:
+                    first_resp = urlopen(Request(url, data=payload, headers=up_headers, method=method),
+                                         timeout=REQUEST_TIMEOUT)
+                except Exception as oe:
+                    log.error("[#%d] [converted] reopen failed: %s", self._req_id, oe)
+                    break
+                # 重新初始化状态，重试
+                seq[0] = 0; rid[0] = None; model[0] = None; usage[0] = {}
+                blocks.clear(); output_items.clear(); created_sent[0] = False; has_output[0] = False
+                done = False; early_err = None
+                try:
+                    buf = b""
+                    upstream_eof = False
+                    while not done and not early_err:
+                        chunk = first_resp.read(4096)
+                        if not chunk: break
+                        buf += chunk
+                        while b"\n\n" in buf or b"\r\n\r\n" in buf:
+                            if b"\r\n\r\n" in buf: block, buf = buf.split(b"\r\n\r\n", 1)
+                            else: block, buf = buf.split(b"\n\n", 1)
+                            block = block.replace(b"\r\n", b"\n")
+                            dj, et = _parse(block)
+                            if not dj or not et: continue
+                            event_type_counts[et] = event_type_counts.get(et, 0) + 1
+                            if et == "error" and not has_output[0]:
+                                ed = dj.get("error", dj)
+                                early_err = (ed.get("code") if isinstance(ed, dict) else None,
+                                             (ed.get("message", "") if isinstance(ed, dict) else str(ed)))
+                                break
+                            if et == "message_delta":
+                                u = dj.get("usage", {}) or {}
+                                if u: usage[0].update(u)
+                            r = _on_event(et, dj)
+                            if r == "done": done = True; break
+                            if isinstance(r, tuple) and r[0] == "error":
+                                if not has_output[0]: early_err = (r[1], r[2])
+                                else: done = True
+                                break
+                    if not done and early_err is None:
+                        _emit_created()
+                        _emit({"sequence_number": nseq(), "type": "response.completed", "response": _resp_obj("completed")})
+                        done = True
+                    if done: break
+                except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                    pass
+            if not done and early_err:
+                _emit({"sequence_number": 0, "type": "response.failed",
+                       "response": {"error": {"message": msg or "upstream error", "code": code, "type": "upstream_error"}}})
+
+        stop_ka.set()
         return {"done": True}
 
 
@@ -1790,8 +1789,6 @@ class Handler(BaseHTTPRequestHandler):
                             pass
                         time.sleep(wait)  # 期间 keepalive 持续保活
                         try:
-                            if upstream_name == "official":
-                                _official_limiter.acquire()
                             resp = urlopen(Request(url, data=payload, headers=up_headers, method=method),
                                            timeout=REQUEST_TIMEOUT)
                         except Exception as oe:
@@ -1949,7 +1946,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.42 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.43 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
