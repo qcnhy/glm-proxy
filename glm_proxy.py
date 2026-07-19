@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.38 — codex-relay + Python 路由层
+GLM API 代理 v2.9.39 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -594,16 +594,15 @@ _APPLY_PATCH_RULES = (
     "Do NOT use shell commands (echo, cat, sed, node, python, powershell) to write files. "
     "apply_patch is the ONLY correct way.\n\n"
     "PATCH FORMAT (the patch field is FREEFORM TEXT, not JSON):\n"
-    "1. *** Update File sections: EVERY content line MUST start with:\n"
-    "   - space ( ) = context line | minus (-) = remove | plus (+) = add\n"
-    "   NEVER write bare text lines without prefix!\n"
-    "2. *** Add File sections: content lines have NO prefix (just the raw content).\n"
-    "3. Use @@ to separate change hunks within a file.\n"
-    "4. *** Begin Patch / *** End Patch are commands, not content.\n"
-    "5. Each file can only be Added ONCE. To modify, use *** Update File.\n"
-    "6. Content with --- (YAML front matter, JS comments) is FINE. "
-    "Just put it as-is in Add File, or with +/- prefix in Update File. "
-    "The patch parser handles --- correctly, do NOT avoid it.\n"
+    "1. EVERY content line in BOTH *** Add File and *** Update File MUST start with:\n"
+    "   - plus (+) = line to add | minus (-) = line to remove | space ( ) = context line\n"
+    "   NEVER write bare text lines without a prefix character!\n"
+    "2. Example - create a new file:\n"
+    "   *** Begin Patch\n*** Add File: hello.txt\n+line one\n+line two\n*** End Patch\n"
+    "3. Use @@ to separate change hunks within Update File.\n"
+    "4. *** Begin Patch / *** End Patch are commands, not content (no prefix).\n"
+    "5. Each file can only be Added ONCE. To modify existing, use *** Update File.\n"
+    "6. Content with --- # @ etc is FINE with +/- prefix. Do NOT avoid any content.\n"
     "7. Do NOT wrap content in markdown code blocks (```).\n"
 )
 
@@ -1971,7 +1970,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.38 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.39 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
