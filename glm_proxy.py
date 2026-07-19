@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.39 — codex-relay + Python 路由层
+GLM API 代理 v2.9.40 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -696,11 +696,27 @@ def _convert_responses_to_messages(body):
             continue
         t = tool.get("type", "")
         if t == "function":
-            tools_out.append({
-                "type": "custom",
-                "name": tool.get("name", ""),
-                "input_schema": tool.get("parameters", tool.get("input_schema", {})),
-            })
+            fn_name = tool.get("name", "")
+            if fn_name == "apply_patch":
+                # apply_patch：保留 description（含规则注入），转 custom 格式
+                desc = tool.get("description", "")
+                tools_out.append({
+                    "type": "custom",
+                    "name": fn_name,
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "patch": {"type": "string", "description": desc},
+                        },
+                        "required": ["patch"],
+                    },
+                })
+            else:
+                tools_out.append({
+                    "type": "custom",
+                    "name": fn_name,
+                    "input_schema": tool.get("parameters", tool.get("input_schema", {})),
+                })
         elif t == "custom":
             # apply_patch 等 custom/grammar 工具 → 转 function 让 GLM 能调用
             desc = tool.get("description", "")
@@ -1005,6 +1021,7 @@ class Handler(BaseHTTPRequestHandler):
                         log.warning("    payload %dKB, stripping previous_response_id", pid_len // 1024)
                         del body["previous_response_id"]
                 if is_responses_converted:
+                    _inject_apply_patch_rules(body)  # 先注入规则，再转换
                     converted = _convert_responses_to_messages(body)
                     converted["model"] = up.get("messages_model", up["model"])
                     payload = json.dumps(converted).encode()
@@ -1970,7 +1987,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.39 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.40 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
