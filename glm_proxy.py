@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.36 — codex-relay + Python 路由层
+GLM API 代理 v2.9.37 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -588,6 +588,49 @@ def _append_tool_result(messages, output_item):
 
 
 # apply_patch 的 patch 格式规则（GLM 不原生支持 FREEFORM 工具，靠描述教它）
+_APPLY_PATCH_RULES = (
+    "\n\nIMPORTANT: apply_patch usage rules for GLM models:\n"
+    "1. In *** Update File sections, EVERY content line MUST start with one of:\n"
+    "   - space ( ) = context line (unchanged, shown for reference)\n"
+    "   - minus (-) = line to REMOVE from the file\n"
+    "   - plus (+) = line to ADD to the file\n"
+    "2. NEVER write bare text lines without a prefix character in Update File sections!\n"
+    "3. Start each change section with @@ (just @@ alone, nothing after it)\n"
+    "4. *** Begin Patch and *** End Patch are COMMANDS, NOT content. "
+    "Do NOT add +/-/space prefix to them!\n"
+    "5. Each file can only be Added ONCE. To modify an existing file, use *** Update File.\n"
+    "6. The patch field is FREEFORM text, NOT JSON. Do not wrap in {}.\n"
+)
+
+def _inject_apply_patch_rules(body):
+    """给 apply_patch 工具的描述注入格式规则（relay + converted 路径都用）"""
+    if not isinstance(body, dict):
+        return body
+    tools = body.get("tools") or body.get("input", [])
+    if not isinstance(tools, list):
+        return body
+    modified = False
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        name = tool.get("name", "")
+        ttype = tool.get("type", "")
+        # Responses API 格式: {"type":"function","name":"apply_patch",...}
+        # 或 custom 格式: {"type":"custom","name":"apply_patch",...}
+        if name == "apply_patch" and "description" in tool:
+            if _APPLY_PATCH_RULES.strip() not in (tool.get("description") or ""):
+                tool["description"] = (tool.get("description") or "") + _APPLY_PATCH_RULES
+                modified = True
+        # 嵌套格式: {"type":"function","function":{"name":"apply_patch",...}}
+        func = tool.get("function")
+        if isinstance(func, dict) and func.get("name") == "apply_patch":
+            if _APPLY_PATCH_RULES.strip() not in (func.get("description") or ""):
+                func["description"] = (func.get("description") or "") + _APPLY_PATCH_RULES
+                modified = True
+    return body
+
+
+
 
 
 def _convert_responses_to_messages(body):
@@ -656,6 +699,9 @@ def _convert_responses_to_messages(body):
             })
         elif t == "custom":
             # apply_patch 等 custom/grammar 工具 → 转 function 让 GLM 能调用
+            desc = tool.get("description", "")
+            if tool.get("name") == "apply_patch" and _APPLY_PATCH_RULES.strip() not in desc:
+                desc = desc + _APPLY_PATCH_RULES
             tools_out.append({
                 "type": "custom",
                 "name": tool.get("name", ""),
@@ -663,7 +709,7 @@ def _convert_responses_to_messages(body):
                     "type": "object",
                     "properties": {
                         "patch": {"type": "string",
-                                  "description": tool.get("description", "")},
+                                  "description": desc},
                     },
                     "required": ["patch"],
                 },
@@ -965,7 +1011,8 @@ class Handler(BaseHTTPRequestHandler):
                              converted.get("max_tokens", 0),
                              body.get("max_output_tokens"))
                 else:
-                    # codex-relay 路径：codex-relay 0.5.1+ 原生处理 custom tool 转换，无需预处理
+                    # codex-relay 路径：注入 apply_patch 规则到工具描述
+                    _inject_apply_patch_rules(body)
                     payload = json.dumps(body).encode()
                 if "Content-Type" not in up_headers and payload is not None:
                     up_headers["Content-Type"] = "application/json"
@@ -1919,7 +1966,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.36 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.37 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
