@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.44 — codex-relay + Python 路由层
+GLM API 代理 v2.9.45 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -702,10 +702,8 @@ def _convert_responses_to_messages(body):
                     "input_schema": tool.get("parameters", tool.get("input_schema", {})),
                 })
         elif t == "custom":
-            # apply_patch 等 custom/grammar 工具 → 转 function 让 GLM 能调用
+            # apply_patch 等 custom/grammar 工具 → 转 function 让 GLM 能调用（规则已在上方统一注入）
             desc = tool.get("description", "")
-            if tool.get("name") == "apply_patch" and _APPLY_PATCH_RULES.strip() not in desc:
-                desc = desc + _APPLY_PATCH_RULES
             tools_out.append({
                 "type": "custom",
                 "name": tool.get("name", ""),
@@ -1004,8 +1002,8 @@ class Handler(BaseHTTPRequestHandler):
                     if pid_len > 200000:
                         log.warning("    payload %dKB, stripping previous_response_id", pid_len // 1024)
                         del body["previous_response_id"]
+                _inject_apply_patch_rules(body)  # 统一注入（relay + converted 都覆盖）
                 if is_responses_converted:
-                    _inject_apply_patch_rules(body)  # 先注入规则，再转换
                     converted = _convert_responses_to_messages(body)
                     converted["model"] = up.get("messages_model", up["model"])
                     payload = json.dumps(converted).encode()
@@ -1016,8 +1014,6 @@ class Handler(BaseHTTPRequestHandler):
                              converted.get("max_tokens", 0),
                              body.get("max_output_tokens"))
                 else:
-                    # codex-relay 路径：注入 apply_patch 规则到工具描述
-                    _inject_apply_patch_rules(body)
                     payload = json.dumps(body).encode()
                 if "Content-Type" not in up_headers and payload is not None:
                     up_headers["Content-Type"] = "application/json"
@@ -1924,7 +1920,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.44 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.45 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
