@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.43 — codex-relay + Python 路由层
+GLM API 代理 v2.9.44 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -1556,118 +1556,96 @@ class Handler(BaseHTTPRequestHandler):
                 return ("error", code, msg)
             return None
 
-        buf = b""
+        # 内层函数：读上游 SSE，翻译成 Responses 事件，返回 (done, early_err)
+        def _run_once(resp):
+            nonlocal done, early_err
+            try:
+                buf = b""
+                while not done and early_err is None:
+                    chunk = resp.read(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\n\n" in buf or b"\r\n\r\n" in buf:
+                        if b"\r\n\r\n" in buf:
+                            block, buf = buf.split(b"\r\n\r\n", 1)
+                        else:
+                            block, buf = buf.split(b"\n\n", 1)
+                        block = block.replace(b"\r\n", b"\n")
+                        et, dj = None, None
+                        for line in block.decode("utf-8", errors="replace").split("\n"):
+                            if line.startswith("event: "):
+                                et = line[7:].strip()
+                            elif line.startswith("data: "):
+                                try:
+                                    dj = json.loads(line[6:])
+                                except Exception:
+                                    pass
+                        if not et or not dj:
+                            continue
+                        r = _on_event(et, dj)
+                        if r == "done":
+                            done = True
+                            break
+                        if isinstance(r, tuple) and r[0] == "error":
+                            if not has_output[0]:
+                                early_err = (r[1], r[2])
+                            else:
+                                _emit({"sequence_number": nseq(), "type": "response.failed",
+                                       "response": {"error": {"message": (r[2] or "upstream error"), "code": r[1], "type": "upstream_error"}}})
+                                done = True
+                            break
+                # 上游 EOF 但未发 message_stop：合成完成
+                if not done and early_err is None:
+                    log.warning("[#%d] [converted] %s upstream EOF without message_stop, synthesizing completed",
+                                self._req_id, upstream_name)
+                    _emit_created()
+                    _emit({"sequence_number": nseq(), "type": "response.completed", "response": _resp_obj("completed")})
+                    done = True
+                if done:
+                    log.info("[#%d]     <<< %s [converted] STREAM OK (sync, %dms, out=%d)",
+                             self._req_id, upstream_name, self._ms(), len(output_items))
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                log.warning("[#%d]     <<< %s [converted] STREAM interrupted", self._req_id, upstream_name)
+
+        # 首次运行
+        resp = first_resp
         done = False
         early_err = None
-        try:
-            while not done and early_err is None:
-                chunk = resp.read(4096)
-                if not chunk:
-                    break
-                buf += chunk
-                while b"\n\n" in buf or b"\r\n\r\n" in buf:
-                    if b"\r\n\r\n" in buf:
-                        block, buf = buf.split(b"\r\n\r\n", 1)
-                    else:
-                        block, buf = buf.split(b"\n\n", 1)
-                    block = block.replace(b"\r\n", b"\n")
-                    et, dj = None, None
-                    for line in block.decode("utf-8", errors="replace").split("\n"):
-                        if line.startswith("event: "):
-                            et = line[7:].strip()
-                        elif line.startswith("data: "):
-                            try:
-                                dj = json.loads(line[6:])
-                            except Exception:
-                                pass
-                    if not et or not dj:
-                        continue
-                    r = _on_event(et, dj)
-                    if r == "done":
-                        done = True
-                        break
-                    if isinstance(r, tuple) and r[0] == "error":
-                        if not has_output[0]:
-                            early_err = (r[1], r[2])
-                        else:
-                            _emit({"sequence_number": nseq(), "type": "response.failed",
-                                   "response": {"error": {"message": (r[2] or "upstream error"), "code": r[1], "type": "upstream_error"}}})
-                            done = True
-                        break
-            # 上游 EOF 但未发 message_stop：合成完成（避免客户端干等，这是治"响应结束仍等待"的关键）
-            if not done and early_err is None:
-                log.warning("[#%d] [converted] %s upstream EOF without message_stop, synthesizing completed",
-                            self._req_id, upstream_name)
-                _emit_created()
-                _emit({"sequence_number": nseq(), "type": "response.completed", "response": _resp_obj("completed")})
-                done = True
-            log.info("[#%d]     <<< %s [converted] STREAM OK (sync, %dms, out=%d)",
-                     self._req_id, upstream_name, self._ms(), len(output_items))
-        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
-            log.warning("[#%d]     <<< %s [converted] STREAM interrupted", self._req_id, upstream_name)
+        _run_once(resp)
 
-        # 早期错误重试（真实输出前的上游错误）
-        if early_err and not has_output[0]:
+        # 早期错误重试
+        while early_err and not has_output[0] and _is_retriable_conv(early_err[0]):
             code, msg = early_err
             for attempt in range(MAX):
-                if not _is_retriable_conv(code):
-                    break
                 wait = min(2 ** attempt, 4)
                 log.warning("[#%d] [converted] %s early error code=%s, retry %d/%d in %ds",
                             self._req_id, upstream_name, code, attempt + 1, MAX, wait)
                 try:
-                    first_resp.close()
+                    resp.close()
                 except Exception:
                     pass
                 time.sleep(wait)
                 try:
-                    first_resp = urlopen(Request(url, data=payload, headers=up_headers, method=method),
-                                         timeout=REQUEST_TIMEOUT)
+                    resp = urlopen(Request(url, data=payload, headers=up_headers, method=method),
+                                   timeout=REQUEST_TIMEOUT)
                 except Exception as oe:
                     log.error("[#%d] [converted] reopen failed: %s", self._req_id, oe)
+                    _emit({"sequence_number": 0, "type": "response.failed",
+                           "response": {"error": {"message": str(oe), "type": "upstream_error"}}})
+                    early_err = None
                     break
-                # 重新初始化状态，重试
                 seq[0] = 0; rid[0] = None; model[0] = None; usage[0] = {}
                 blocks.clear(); output_items.clear(); created_sent[0] = False; has_output[0] = False
                 done = False; early_err = None
-                try:
-                    buf = b""
-                    upstream_eof = False
-                    while not done and not early_err:
-                        chunk = first_resp.read(4096)
-                        if not chunk: break
-                        buf += chunk
-                        while b"\n\n" in buf or b"\r\n\r\n" in buf:
-                            if b"\r\n\r\n" in buf: block, buf = buf.split(b"\r\n\r\n", 1)
-                            else: block, buf = buf.split(b"\n\n", 1)
-                            block = block.replace(b"\r\n", b"\n")
-                            dj, et = _parse(block)
-                            if not dj or not et: continue
-                            event_type_counts[et] = event_type_counts.get(et, 0) + 1
-                            if et == "error" and not has_output[0]:
-                                ed = dj.get("error", dj)
-                                early_err = (ed.get("code") if isinstance(ed, dict) else None,
-                                             (ed.get("message", "") if isinstance(ed, dict) else str(ed)))
-                                break
-                            if et == "message_delta":
-                                u = dj.get("usage", {}) or {}
-                                if u: usage[0].update(u)
-                            r = _on_event(et, dj)
-                            if r == "done": done = True; break
-                            if isinstance(r, tuple) and r[0] == "error":
-                                if not has_output[0]: early_err = (r[1], r[2])
-                                else: done = True
-                                break
-                    if not done and early_err is None:
-                        _emit_created()
-                        _emit({"sequence_number": nseq(), "type": "response.completed", "response": _resp_obj("completed")})
-                        done = True
-                    if done: break
-                except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
-                    pass
-            if not done and early_err:
-                _emit({"sequence_number": 0, "type": "response.failed",
-                       "response": {"error": {"message": msg or "upstream error", "code": code, "type": "upstream_error"}}})
+                _run_once(resp)
+                if done or not early_err:
+                    break
+            break
+
+        if not done and early_err:
+            _emit({"sequence_number": 0, "type": "response.failed",
+                   "response": {"error": {"message": early_err[1] or "upstream error", "code": early_err[0], "type": "upstream_error"}}})
 
         stop_ka.set()
         return {"done": True}
@@ -1946,7 +1924,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.43 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.44 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
