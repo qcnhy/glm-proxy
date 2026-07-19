@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.41 — codex-relay + Python 路由层
+GLM API 代理 v2.9.42 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -1690,8 +1690,6 @@ class Handler(BaseHTTPRequestHandler):
         has_output = False
         stream_error = None
         held_completed = None
-        _apply_patch_oi = set()  # output_index 集合：apply_patch function_call 需转 custom_tool_call
-        _apply_patch_args = {}  # output_index -> 累积的 JSON arguments 字符串
         raw_blocks = []
 
         def _write(data):
@@ -1764,45 +1762,7 @@ class Handler(BaseHTTPRequestHandler):
                         if t == "response.completed":
                             held_completed = p
                             continue
-                        # apply_patch fallback: 缓冲 JSON arguments，结束时解包成 custom_tool_call
-                        if t == "response.output_item.added" and item.get("name") == "apply_patch" and item.get("type") == "function_call":
-                            item["type"] = "custom_tool_call"
-                            _apply_patch_oi.add(oi)
-                            _apply_patch_args[oi] = ""  # 开始缓冲
-                            out = (f"event: {t}\ndata: {json.dumps(p, ensure_ascii=False)}\n\n").encode()
-                        elif oi in _apply_patch_oi:
-                            if t == "response.function_call_arguments.delta":
-                                _apply_patch_args[oi] += p.get("delta", "")
-                                continue  # 缓冲，不发
-                            if t == "response.function_call_arguments.done":
-                                _apply_patch_args[oi] += p.get("arguments", "")
-                                continue  # 缓冲，不发
-                            if t == "response.output_item.done":
-                                # 解包 JSON {"patch":"..."} → 原始 patch 文本
-                                raw_args = _apply_patch_args.pop(oi, "")
-                                try:
-                                    parsed = json.loads(raw_args)
-                                    patch_text = parsed.get("patch", raw_args) if isinstance(parsed, dict) else raw_args
-                                except Exception:
-                                    patch_text = raw_args
-                                if not patch_text.startswith("*** Begin Patch"):
-                                    patch_text = "*** Begin Patch\n" + patch_text
-                                if not patch_text.rstrip().endswith("*** End Patch"):
-                                    patch_text = patch_text.rstrip() + "\n*** End Patch"
-                                seq = p.get("sequence_number", events + 1)
-                                for ck in [patch_text[i:i+20] for i in range(0, len(patch_text), 20)]:
-                                    seq += 1
-                                    _emit({"type": "response.custom_tool_call_input.delta", "sequence_number": seq,
-                                           "delta": ck, "item_id": item.get("id",""), "output_index": oi})
-                                seq += 1
-                                _emit({"type": "response.custom_tool_call_input.done", "sequence_number": seq,
-                                       "input": patch_text, "item_id": item.get("id",""), "output_index": oi})
-                                item["type"] = "custom_tool_call"
-                                item["input"] = patch_text
-                                item.pop("arguments", None)
-                                out = (f"event: response.output_item.done\ndata: {json.dumps(p, ensure_ascii=False)}\n\n").encode()
-                                has_output = True
-                        if b"output_text.delta" in out or b"custom_tool_call" in out:
+                        if b"output_text.delta" in out or b"function_call_arguments.delta" in out or b"custom_tool_call" in out:
                             has_output = True
                         _write(out)
                     if early_err:
@@ -1857,20 +1817,8 @@ class Handler(BaseHTTPRequestHandler):
                 # 正常完成或已真实输出（含中途错误已转发）→ 退出重试循环
                 break
 
-            # response.completed（apply_patch 项改写 function_call→custom_tool_call）
+            # response.completed
             if held_completed is not None:
-                if _apply_patch_oi:
-                    for it in held_completed.get("response", {}).get("output", []) or []:
-                        if it.get("name") == "apply_patch" and it.get("type") == "function_call":
-                            it["type"] = "custom_tool_call"
-                            if "arguments" in it:
-                                import json as _json
-                                try:
-                                    args = _json.loads(it["arguments"])
-                                    it["input"] = args.get("patch", it["arguments"])
-                                except Exception:
-                                    it["input"] = it["arguments"]
-                                it.pop("arguments", None)
                 _emit(held_completed)
             elif not stream_error:
                 # 上游未发 response.completed（不完整流）→ 合成收尾，避免客户端"响应结束但一直转"
@@ -2001,7 +1949,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.41 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.42 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
