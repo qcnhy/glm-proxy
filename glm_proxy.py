@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.40 — codex-relay + Python 路由层
+GLM API 代理 v2.9.41 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -677,8 +677,15 @@ def _convert_responses_to_messages(body):
                 _append_tool_result(messages, item)
             elif item_type == "custom_tool_call":
                 # custom_tool_call → function_call（apply_patch 等）
+                # 关键：input 是 FREEFORM 文本（patch），不是 JSON
+                # 必须包成 {"patch": "..."} 否则 _safe_parse_json 返回 {} 教坏 GLM
+                raw_input = item.get("input", "")
+                if item.get("name") == "apply_patch" and isinstance(raw_input, str):
+                    arguments = json.dumps({"patch": raw_input}, ensure_ascii=False)
+                else:
+                    arguments = raw_input
                 _append_tool_use(messages, {**item, "type": "function_call",
-                                            "arguments": item.get("input", "")})
+                                            "arguments": arguments})
             elif item_type == "custom_tool_call_output":
                 # custom_tool_call_output → function_call_output
                 _append_tool_result(messages, item)
@@ -1464,6 +1471,10 @@ class Handler(BaseHTTPRequestHandler):
                 elif dt == "input_json_delta":
                     t = delta.get("partial_json", "")
                     b["args"] += t
+                    # 调试：apply_patch 的每个 delta
+                    if b.get("name") == "apply_patch":
+                        log.warning("[#%d] [converted] PATCH_DELTA: len=%d frag=%s (accumulated=%d)",
+                                    getattr(self, '_req_id', 0), len(t), repr(t[:100]), len(b["args"]))
                     # apply_patch 的 args 缓冲（不发 delta，stop 时一次性合成 custom_tool_call）
                     if b.get("name") != "apply_patch":
                         _emit({"sequence_number": nseq(), "type": "response.function_call_arguments.delta", "item_id": b["iid"],
@@ -1491,6 +1502,9 @@ class Handler(BaseHTTPRequestHandler):
                     _emit({"sequence_number": nseq(), "type": "response.output_item.done", "output_index": b["oi"], "item": item})
                     output_items.append(item)
                 elif b["type"] == "tool_use":
+                    # 调试日志：看 GLM 实际生成的 tool_use
+                    log.warning("[#%d] [converted] TOOL_USE: name=%s args_len=%d args_raw=%s",
+                                getattr(self, '_req_id', 0), b.get("name",""), len(b.get("args","")), repr(b.get("args","")[:300]))
                     if b.get("name") == "apply_patch":
                         raw_args = b["args"]
                         try:
@@ -1987,7 +2001,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.40 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.41 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
