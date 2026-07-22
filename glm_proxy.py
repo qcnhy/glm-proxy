@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.55 — codex-relay + Python 路由层
+GLM API 代理 v2.9.56 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -1400,7 +1400,17 @@ class Handler(BaseHTTPRequestHandler):
                         log.info("[#%d]     <<< %s STREAM OK (%s, %dms)%s",
                                  self._req_id, upstream_name, size_str, self._ms(), tag)
                     return
-                # overflow（无内容）：删最远一条 user 轮次重发
+                if not overflow:
+                    # 非内容且非超限（上游早断/不完整/空但无超限信号）→ 原样转发已握住的块 + 合成收尾，**不裁剪**。
+                    # 只处理超限；其他错误(event:error 已在探测期 flush)一律不裁剪。
+                    for hb in held:
+                        _write(hb)
+                    if held and not saw_message_stop:
+                        _write(b'event: message_delta\ndata: {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 0}}\n\nevent: message_stop\ndata: {"type": "message_stop"}\n\n')
+                    log.info("[#%d]     <<< %s STREAM non-content (非超限, %dms) — 原样转发不裁剪",
+                             self._req_id, upstream_name, self._ms())
+                    return
+                # overflow（显式 model_context_window_exceeded 或 空完整收尾）：删最远一条 user 轮次重发
                 if not _pop_oldest_turn(body.get("messages", [])):
                     log.warning("[#%d] [ctx-revive] %s 删到最少仍超限，合成超限收尾",
                                 self._req_id, upstream_name)
@@ -2006,7 +2016,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.55 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.56 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
