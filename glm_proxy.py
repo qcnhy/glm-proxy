@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.54 — codex-relay + Python 路由层
+GLM API 代理 v2.9.55 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -784,6 +784,33 @@ def _patch_msg_usage(block_bytes, est_input):
         return block_bytes
 
 
+def _is_normal_user_msg(msg):
+    """单条消息是否是合法的 user 起点：user 角色、且非纯 tool_result 孤儿。
+    Anthropic 要求 messages 以 user 开头，tool_result 必须跟在 tool_use 后——
+    裁剪后开头若是 assistant 或孤儿 tool_result，上游会 400。"""
+    if not isinstance(msg, dict) or msg.get("role") != "user":
+        return False
+    c = msg.get("content")
+    if isinstance(c, str):
+        return True
+    if isinstance(c, list):
+        return any(not (isinstance(b, dict) and b.get("type") == "tool_result") for b in c)
+    return True
+
+
+def _pop_oldest_turn(msgs):
+    """从最远处删**一整条** user 轮次：删掉开头 user 及其后到下一个合法 user 前的所有消息
+    （保证删后开头仍是合法 user，不破坏 tool_use/tool_result 配对）。至少保留最近 6 条。
+    返回是否删了（False=没得删）。"""
+    if not isinstance(msgs, list) or len(msgs) <= 6:
+        return False
+    n0 = len(msgs)
+    msgs.pop(0)  # 删最远的一条 user
+    while len(msgs) > 6 and not _is_normal_user_msg(msgs[0]):  # 删到下一个合法 user 开头
+        msgs.pop(0)
+    return len(msgs) < n0
+
+
 # ── HTTP 处理 ─────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -1047,14 +1074,10 @@ class Handler(BaseHTTPRequestHandler):
                                         self._req_id, up["name"], stream_error)
                         return  # 已发响应头，总是 done
                     elif is_messages:
-                        # 增量流式：已发送响应头并边收边发，直接返回（不再回退）
-                        _ho, _u, ctx_exceeded, _se = self._messages_stream(resp, up["name"], _est_tokens(body))
-                        # 缺口3：流式已发200，无法再回发400状态。模型若 stop_reason=model_context_window_exceeded，
-                        # 该 stop_reason 已随 message_delta 原样转发给客户端（客户端据此可知超限并压缩重试）；
-                        # 此处捕获并记录，不再静默丢弃检测信号。
-                        if ctx_exceeded:
-                            log.warning("[#%d] [messages] %s stream: model_context_window_exceeded "
-                                        "(stop_reason 已转发客户端)", self._req_id, up["name"])
+                        # 流式 + 超限自动复活（探测驱动）：握住到首条内容才 flush；
+                        # 上游实际返回超限(无内容)则删最远一条 user 轮次重发，逐条减直到产出内容。
+                        # est_input 用客户端原始请求大小，让上报 input_tokens 反映真实上下文触发压缩。
+                        self._messages_stream_revive(resp, up, up_headers, body, _est_tokens(body))
                         return
                     else:
                         self._pipe_stream(resp, up["name"])
@@ -1177,201 +1200,227 @@ class Handler(BaseHTTPRequestHandler):
         except (ConnectionResetError, BrokenPipeError):
             log.warning("[#%d]     <<< %s STREAM interrupted", self._req_id, upstream_name)
 
-    # ── Messages API 流式处理（缓冲 + 空输出检测 + usage）──
-    def _messages_stream(self, resp, upstream_name, est_input=0):
-        """增量流式转发 Messages API SSE（边收边发，避免客户端超时）。
-        遇 error 块就地合成正常结束。返回 (has_output, usage_dict, context_exceeded, stream_error)"""
-        has_output = False
-        context_exceeded = False
-        stream_error = False
-        saw_message_stop = False
-        last_usage = {}
-        open_indices = []
-        skip_indices = set()  # 客户端不支持的 server_tool_use 等内容块 index，转发时跳过
-        total_bytes = 0
-        block_count = 0
-        size = 0
-        # keepalive：GLM-5.2 思考期(十几~几十秒)上游不吐数据，发 200 头后若静默，
-        # 客户端 idle 超时会断开 → STREAM interrupted。后台线程定期发 SSE 注释(: keepalive)保活。
-        # wlock 串行化所有写，避免 keepalive 与转发循环交错损坏 SSE 流。
+    def _messages_stream_revive(self, first_resp, up, up_headers, body, est_input=0):
+        """Messages 流式 + 超限自动复活（完全靠上游实际响应驱动，不用 est 预判）。
+        提交 200 + keepalive 后，**握住**上游块不发，直到看见首条内容(content_block_delta)：
+          - 见内容 → flush 已握住的块 + 继续正常增量流式；
+          - 上游出内容前返回 model_context_window_exceeded / 空收尾 → 从最远删一整条 user 轮次 → 重发，逐条减直到产出内容；
+          - 非超限错误(event:error) → flush 转发给客户端，不裁剪。
+        客户端全程有 keepalive 保活，重试对其透明。est_input 用客户端原始请求大小（非裁剪后），
+        以便上报的 input_tokens 反映客户端真实上下文 → 触发其自动压缩。"""
+        upstream_name = up["name"]
+        url = up["anthropic_url"].rstrip("/")
+        _SERVER_TOOL_TYPES = {
+            "server_tool_use", "web_search_tool_result",
+            "code_execution_tool_use", "code_execution_tool_result",
+            "computer_tool_use", "computer_tool_result",
+            "bash_tool_use", "bash_tool_result",
+            "text_editor_tool_use", "text_editor_tool_result",
+        }
+        self.send_response(200)
+        for h in ["Content-Type", "Cache-Control"]:
+            v = first_resp.headers.get(h)
+            if v:
+                self.send_header(h, v)
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
         wlock = threading.Lock()
         stop_ka = threading.Event()
         def _write(data):
             with wlock:
                 self.wfile.write(data); self.wfile.flush()
-        kat = None
-        try:
-            # 立即发送响应头，开始增量流式（避免客户端长时间等数据超时断开）
-            self.send_response(200)
-            for h in ["Content-Type", "Cache-Control"]:
-                v = resp.headers.get(h)
-                if v:
-                    self.send_header(h, v)
-            self.send_header("Connection", "close")
-            self.end_headers()
-            self.close_connection = True
-            def _keepalive():
-                while not stop_ka.wait(3):
-                    try:
-                        _write(b": keepalive\n\n")
-                    except Exception:
-                        break
-            kat = threading.Thread(target=_keepalive, daemon=True)
-            kat.start()
-            buf = b""
-            while True:
-                chunk = resp.read(4096)
-                if not chunk:
+        def _keepalive():
+            while not stop_ka.wait(3):
+                try:
+                    _write(b": keepalive\n\n")
+                except Exception:
                     break
-                total_bytes += len(chunk)
-                buf += chunk
-                # SSE 分隔符兼容 \n\n 和 \r\n\r\n
-                while b"\n\n" in buf or b"\r\n\r\n" in buf:
-                    if b"\r\n\r\n" in buf:
-                        block, buf = buf.split(b"\r\n\r\n", 1)
-                    else:
-                        block, buf = buf.split(b"\n\n", 1)
-                    block = block.replace(b"\r\n", b"\n")
-                    block_count += 1
+        threading.Thread(target=_keepalive, daemon=True).start()
 
-                    # 检测 error 事件（如 1234 overloaded）
-                    if b"event: error" in block:
-                        try:
-                            text = block.decode("utf-8", errors="replace")
-                            err_code, err_msg, data_raw = None, None, None
-                            for line in text.split("\n"):
-                                if line.startswith("data: "):
-                                    data_raw = line[6:]
-                                    p = json.loads(data_raw)
-                                    err = p.get("error", p)  # 兼容 {error:{}} 和顶层
-                                    err_code = err.get("code") if isinstance(err, dict) else None
-                                    err_msg = err.get("message", "") if isinstance(err, dict) else str(err)
-                            log.warning("[#%d] [messages] %s stream error: code=%s msg=%s | has_output=%s bytes=%d",
-                                        self._req_id, upstream_name, err_code, (err_msg or "")[:150],
-                                        has_output, total_bytes)
-                            log.warning("[#%d] [messages] raw error block: %s",
-                                        self._req_id, repr(text[:500]))
-                        except Exception as pe:
-                            log.warning("[#%d] [messages] %s stream error (parse failed: %s), raw: %s",
-                                        self._req_id, upstream_name, pe,
-                                        repr(block.decode("utf-8", errors="replace")[:500]))
-                        stream_error = True
-                        break  # 错误后由收尾逻辑合成正常结束
+        resp = first_resp
+        attempt = 0
+        last_usage = {}
+        try:
+            while True:  # === 重试外层：每次处理一个上游 resp ===
+                buf = b""
+                held = []          # 探测期握住、未转发的块
+                flushed = False    # 是否已见内容并 flush（进入正常流式）
+                overflow = False   # 上游超限（出内容前）
+                stream_error = False
+                saw_message_stop = False
+                open_indices = []
+                skip_indices = set()
+                size = 0
+                total_bytes = 0
+                try:
+                    while True:  # 读单个 resp
+                        chunk = resp.read(4096)
+                        if not chunk:
+                            break
+                        total_bytes += len(chunk)
+                        buf += chunk
+                        while b"\n\n" in buf or b"\r\n\r\n" in buf:
+                            if b"\r\n\r\n" in buf:
+                                block, buf = buf.split(b"\r\n\r\n", 1)
+                            else:
+                                block, buf = buf.split(b"\n\n", 1)
+                            block = block.replace(b"\r\n", b"\n")
 
-                    # 校验 data JSON 合法性，避免转发畸形块导致客户端解码失败
-                    if (b"\ndata: " in block or block.startswith(b"data: ")) and b"event: ping" not in block:
-                        malformed = False
-                        for line in block.decode("utf-8", errors="replace").split("\n"):
-                            if line.startswith("data: "):
+                            is_error_block = b"event: error" in block
+                            if is_error_block:
                                 try:
-                                    json.loads(line[6:])
+                                    for line in block.decode("utf-8", errors="replace").split("\n"):
+                                        if line.startswith("data: "):
+                                            p = json.loads(line[6:])
+                                            err = p.get("error", p)
+                                            log.warning("[#%d] [messages] %s stream error: code=%s msg=%s | bytes=%d",
+                                                        self._req_id, upstream_name,
+                                                        err.get("code") if isinstance(err, dict) else None,
+                                                        (err.get("message", "") if isinstance(err, dict) else str(err))[:150],
+                                                        total_bytes)
+                                            break
                                 except Exception:
-                                    malformed = True
+                                    pass
+
+                            # 畸形 JSON 块丢弃（error 块跳过此校验）
+                            if not is_error_block and (b"\ndata: " in block or block.startswith(b"data: ")) and b"event: ping" not in block:
+                                malformed = False
+                                for line in block.decode("utf-8", errors="replace").split("\n"):
+                                    if line.startswith("data: "):
+                                        try:
+                                            json.loads(line[6:])
+                                        except Exception:
+                                            malformed = True
+                                            break
+                                if malformed:
+                                    log.warning("[#%d] [messages] %s dropping malformed block: %s",
+                                                self._req_id, upstream_name, repr(block[:120]))
+                                    continue
+
+                            # 过滤客户端不支持的 server_tool 内容块
+                            try:
+                                _elines = block.decode("utf-8", errors="replace").split("\n")
+                                _etype = next((l[7:].strip() for l in _elines if l.startswith("event: ")), None)
+                                _dj = None
+                                for _l in _elines:
+                                    if _l.startswith("data: "):
+                                        _dj = json.loads(_l[6:]); break
+                                if _etype == "content_block_start" and isinstance(_dj, dict):
+                                    if (_dj.get("content_block") or {}).get("type", "") in _SERVER_TOOL_TYPES:
+                                        skip_indices.add(_dj.get("index", 0))
+                                        continue
+                                elif _etype in ("content_block_delta", "content_block_stop") and isinstance(_dj, dict):
+                                    if _dj.get("index", 0) in skip_indices:
+                                        if _etype == "content_block_stop":
+                                            skip_indices.discard(_dj.get("index", 0))
+                                        continue
+                            except Exception:
+                                pass
+
+                            if est_input:
+                                block = _patch_msg_usage(block, est_input)
+                            out = block + b"\n\n"
+
+                            # === 探测：未 flush 前握住，见首条内容才 flush ===
+                            if not flushed:
+                                if b'"content_block_delta"' in block:
+                                    for hb in held:
+                                        _write(hb)
+                                    held = []
+                                    _write(out); size += len(out)
+                                    flushed = True
+                                elif b'"model_context_window_exceeded"' in block:
+                                    overflow = True
+                                    break  # held 丢弃，不转发 → 重试
+                                elif b'"message_stop"' in block:
+                                    overflow = True  # 出内容前就 stop = 超限空收尾
                                     break
-                        if malformed:
-                            log.warning("[#%d] [messages] %s dropping malformed block: %s",
-                                        self._req_id, upstream_name, repr(block[:200]))
-                            continue
+                                elif is_error_block:
+                                    for hb in held:
+                                        _write(hb)
+                                    held = []
+                                    _write(out); size += len(out)
+                                    flushed = True
+                                    stream_error = True
+                                else:
+                                    held.append(out)
+                            else:
+                                _write(out); size += len(out)
 
-                    # 过滤客户端不支持的 server_tool_use 等服务端工具内容块
-                    # （GLM 偶发产出，Claude Code 不认 → "Unsupported content type"）
-                    _SERVER_TOOL_TYPES = {
-                        "server_tool_use", "web_search_tool_result",
-                        "code_execution_tool_use", "code_execution_tool_result",
-                        "computer_tool_use", "computer_tool_result",
-                        "bash_tool_use", "bash_tool_result",
-                        "text_editor_tool_use", "text_editor_tool_result",
-                    }
-                    try:
-                        _elines = block.decode("utf-8", errors="replace").split("\n")
-                        _etype = next((l[7:].strip() for l in _elines if l.startswith("event: ")), None)
-                        _dj = None
-                        for _l in _elines:
-                            if _l.startswith("data: "):
-                                _dj = json.loads(_l[6:]); break
-                        if _etype == "content_block_start" and isinstance(_dj, dict):
-                            _cbt = (_dj.get("content_block") or {}).get("type", "")
-                            if _cbt in _SERVER_TOOL_TYPES:
-                                skip_indices.add(_dj.get("index", 0))
-                                log.warning("[#%d] [messages] %s dropping unsupported content_block type=%s idx=%s",
-                                            self._req_id, upstream_name, _cbt, _dj.get("index"))
-                                continue
-                        elif _etype in ("content_block_delta", "content_block_stop") and isinstance(_dj, dict):
-                            if _dj.get("index", 0) in skip_indices:
-                                if _etype == "content_block_stop":
-                                    skip_indices.discard(_dj.get("index", 0))
-                                continue
-                    except Exception:
-                        pass
+                            if b'"content_block_start"' in block:
+                                try:
+                                    for line in block.decode("utf-8", errors="replace").split("\n"):
+                                        if line.startswith("data: "):
+                                            open_indices.append(json.loads(line[6:]).get("index", 0))
+                                except Exception:
+                                    pass
+                            elif b'"content_block_stop"' in block:
+                                try:
+                                    for line in block.decode("utf-8", errors="replace").split("\n"):
+                                        if line.startswith("data: "):
+                                            idx = json.loads(line[6:]).get("index", -1)
+                                            if idx in open_indices:
+                                                open_indices.remove(idx)
+                                except Exception:
+                                    pass
+                            elif b"message_stop" in block:
+                                saw_message_stop = True
+                            elif b"message_delta" in block:
+                                try:
+                                    for line in block.decode("utf-8", errors="replace").split("\n"):
+                                        if line.startswith("data: "):
+                                            p = json.loads(line[6:])
+                                            if p.get("usage"):
+                                                last_usage = p["usage"]
+                                except Exception:
+                                    pass
+                        if overflow:
+                            break  # 退出 chunk 循环 → 进入重试判定
+                except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                    log.warning("[#%d]     <<< %s STREAM interrupted", self._req_id, upstream_name)
+                    return
 
-                    # 修正非标准上游 usage.input_tokens（见 _patch_msg_usage），让客户端拿到真实输入 token 数
-                    if est_input:
-                        block = _patch_msg_usage(block, est_input)
-                    # 增量转发该块
-                    out = block + b"\n\n"
-                    _write(out)
-                    size += len(out)
-                    if b"content_block_delta" in block:
-                        has_output = True
-                    if b'"content_block_start"' in block:
-                        try:
-                            for line in block.decode("utf-8", errors="replace").split("\n"):
-                                if line.startswith("data: "):
-                                    open_indices.append(json.loads(line[6:]).get("index", 0))
-                        except: pass
-                    elif b'"content_block_stop"' in block:
-                        try:
-                            for line in block.decode("utf-8", errors="replace").split("\n"):
-                                if line.startswith("data: "):
-                                    idx = json.loads(line[6:]).get("index", -1)
-                                    if idx in open_indices: open_indices.remove(idx)
-                        except: pass
-                    elif b"message_stop" in block:
-                        saw_message_stop = True
-                    elif b"message_delta" in block:
-                        try:
-                            for line in block.decode("utf-8", errors="replace").split("\n"):
-                                if line.startswith("data: "):
-                                    p = json.loads(line[6:])
-                                    if p.get("usage"): last_usage = p["usage"]
-                                    if p.get("delta", {}).get("stop_reason") == "model_context_window_exceeded":
-                                        context_exceeded = True
-                        except: pass
-                if stream_error:
-                    break  # 错误后退出外层 chunk 循环
-            # 上游流不完整（EOF 但未见 message_stop，如中转中途断流）→ 合成正常收尾，
-            # 否则客户端会 "stream disconnected / error decoding response body"
-            if not saw_message_stop:
-                log.warning("[#%d] [messages] %s upstream incomplete (no message_stop), synthesizing close (open=%d, err=%s, %dKB)",
-                            self._req_id, upstream_name, len(open_indices), stream_error, total_bytes // 1024)
-                for idx in open_indices:
-                    _write(("event: content_block_stop\ndata: {\"type\": \"content_block_stop\", \"index\": " + str(idx) + "}\n\n").encode())
-                _write(b'event: message_delta\ndata: {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 0}}\n\nevent: message_stop\ndata: {"type": "message_stop"}\n\n')
-            size_str = (str(size // 1024) + "KB") if size >= 1024 else (str(size) + "B")
-            if last_usage:
-                log.info("[#%d]     <<< %s STREAM OK (%s, %dms) usage: input=%d output=%d total=%d",
-                         self._req_id, upstream_name, size_str, self._ms(), last_usage.get("input_tokens", 0),
-                         last_usage.get("output_tokens", 0),
-                         last_usage.get("input_tokens", 0) + last_usage.get("output_tokens", 0))
-            else:
-                log.info("[#%d]     <<< %s STREAM OK (%s, %dms)", self._req_id, upstream_name, size_str, self._ms())
-        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
-            log.warning("[#%d]     <<< %s STREAM interrupted", self._req_id, upstream_name)
+                # === 判定本次 resp ===
+                if flushed:
+                    if not saw_message_stop:  # 不完整 → 合成收尾
+                        log.warning("[#%d] [messages] %s incomplete (no message_stop), synthesizing close",
+                                    self._req_id, upstream_name)
+                        for idx in open_indices:
+                            _write(("event: content_block_stop\ndata: {\"type\": \"content_block_stop\", \"index\": " + str(idx) + "}\n\n").encode())
+                        _write(b'event: message_delta\ndata: {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 0}}\n\nevent: message_stop\ndata: {"type": "message_stop"}\n\n')
+                    size_str = (str(size // 1024) + "KB") if size >= 1024 else (str(size) + "B")
+                    tag = f" [revive#{attempt}]" if attempt else ""
+                    if last_usage:
+                        log.info("[#%d]     <<< %s STREAM OK (%s, %dms) usage: input=%d output=%d total=%d%s",
+                                 self._req_id, upstream_name, size_str, self._ms(),
+                                 last_usage.get("input_tokens", 0), last_usage.get("output_tokens", 0),
+                                 last_usage.get("input_tokens", 0) + last_usage.get("output_tokens", 0), tag)
+                    else:
+                        log.info("[#%d]     <<< %s STREAM OK (%s, %dms)%s",
+                                 self._req_id, upstream_name, size_str, self._ms(), tag)
+                    return
+                # overflow（无内容）：删最远一条 user 轮次重发
+                if not _pop_oldest_turn(body.get("messages", [])):
+                    log.warning("[#%d] [ctx-revive] %s 删到最少仍超限，合成超限收尾",
+                                self._req_id, upstream_name)
+                    _write(b'event: message_delta\ndata: {"type": "message_delta", "delta": {"stop_reason": "model_context_window_exceeded"}, "usage": {"output_tokens": 0}}\n\nevent: message_stop\ndata: {"type": "message_stop"}\n\n')
+                    return
+                attempt += 1
+                log.warning("[#%d] [ctx-revive] %s 上游超限(无内容)，删最远 1 条 user 轮次后重发(attempt %d, est~%dK)",
+                            self._req_id, upstream_name, attempt, int(_est_tokens(body) // 1000))
+                payload = json.dumps(body).encode()
+                req = Request(url, data=payload, headers=up_headers, method="POST")
+                resp = urlopen(req, timeout=REQUEST_TIMEOUT)
         except Exception as e:
-            # 任何其他异常：合成干净收尾，避免客户端解码失败
-            log.error("[#%d] [messages] %s stream exception: %s — synthesizing clean close",
+            log.error("[#%d] [messages] %s revive exception: %s — synthesizing close",
                       self._req_id, upstream_name, e)
             try:
-                for idx in open_indices:
-                    _write(("event: content_block_stop\ndata: {\"type\": \"content_block_stop\", \"index\": " + str(idx) + "}\n\n").encode())
-                if not saw_message_stop:
-                    _write(b'event: message_delta\ndata: {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 0}}\n\nevent: message_stop\ndata: {"type": "message_stop"}\n\n')
+                _write(b'event: message_delta\ndata: {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 0}}\n\nevent: message_stop\ndata: {"type": "message_stop"}\n\n')
             except Exception:
                 pass
         finally:
-            stop_ka.set()  # 停 keepalive 线程
-
-        return has_output, last_usage, context_exceeded, stream_error
+            stop_ka.set()
 
     # ── Responses→Messages 转换流式处理（旧：整段缓冲，留作兜底）──
     def _converted_stream_with_retry(self, first_resp, up, url, up_headers, payload, method):
@@ -1957,7 +2006,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.54 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.55 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
