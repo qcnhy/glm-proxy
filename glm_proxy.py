@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.57 — codex-relay + Python 路由层
+GLM API 代理 v2.9.58 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -798,12 +798,15 @@ _OVERFLOW_MARKERS = (
     "maximum context length", "maximum context window",
     "context length exceeded",
     "prompt is too long", "input too long",
+    "prompt exceeds max length",        # external-openai/official openai 端点
+    "exceeds max length",
     "exceeds the context window", "exceeds context",
     "too many input tokens",
     "exceeded limit on max bytes",      # internal 请求体过大
     "toolarge",                         # BadRequest.TooLarge
-    # 中文文案 (venus-deepseek)
+    # 中文文案 (venus-deepseek / ecloud)
     "上下文内容过大", "上下文过大", "超出模型处理限制",
+    "文本过长",                         # ecloud openai 端点
 )
 
 
@@ -841,6 +844,40 @@ def _pop_oldest_turn(msgs):
     while len(msgs) > 6 and not _is_normal_user_msg(msgs[0]):  # 删到下一个合法 user 开头
         msgs.pop(0)
     return len(msgs) < n0
+
+
+def _responses_input_starts_user(inp):
+    """Responses input 数组开头是否是合法的 user 消息项（裁剪后保证开头合法，
+    不留 assistant/function_call_output 孤儿）。"""
+    if not isinstance(inp, list) or not inp:
+        return False
+    item = inp[0]
+    return (isinstance(item, dict) and item.get("role") == "user"
+            and item.get("type", "message") == "message")
+
+
+def _pop_oldest_responses_input(payload_bytes):
+    """裁剪 Responses 请求体 input 最远一条（relay 路径超限复活用，对应 messages 的 _pop_oldest_turn）。
+    input 是数组时删最远一条、保证开头仍是合法 user；input 是字符串则无法按轮次裁。
+    返回裁剪后的 payload bytes，或 None（无法裁/太少）。"""
+    try:
+        body = json.loads(payload_bytes)
+    except Exception:
+        return None
+    inp = body.get("input")
+    if not isinstance(inp, list) or len(inp) <= 6:
+        return None
+    n0 = len(inp)
+    inp.pop(0)
+    while len(inp) > 6 and not _responses_input_starts_user(inp):
+        inp.pop(0)
+    if len(inp) >= n0:
+        return None
+    body["input"] = inp
+    try:
+        return json.dumps(body, ensure_ascii=False).encode()
+    except Exception:
+        return None
 
 
 # ── HTTP 处理 ─────────────────────────────────────────
@@ -1836,9 +1873,13 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
 
         resp = first_resp
+        overflow_attempt = 0
+        retriable_attempt = 0
         try:
-            for attempt in range(MAX + 1):
-                early_err = None  # (code, err, out_bytes) 真实输出前的 response.failed，候选重试
+            while True:  # 重试外循环：可重试错误(同payload) + 超限(裁input) 都在此重发
+                early_err = None  # (code, err, out_bytes) 真实输出前的 response.failed
+                held_completed = None
+                has_output = False
                 buf = b""
                 done = False
                 while not done:
@@ -1878,7 +1919,7 @@ class Handler(BaseHTTPRequestHandler):
                             err = (p or {}).get("response", {}).get("error")
                             code = err.get("code") if isinstance(err, dict) else None
                             if not has_output:
-                                early_err = (code, err, out)  # 真实输出前 → 候选重试（暂不转发）
+                                early_err = (code, err, out)  # 真实输出前 → 候选重试/裁剪（暂不转发）
                                 done = True
                                 break
                             stream_error = err
@@ -1888,7 +1929,7 @@ class Handler(BaseHTTPRequestHandler):
                         if t == "response.completed":
                             held_completed = p
                             continue
-                        if b"output_text.delta" in out or b"function_call_arguments.delta" in out or b"custom_tool_call" in out:
+                        if b"output_text.delta" in out or b"function_call_arguments.delta" in out or b"custom_tool_call" in out or b"reasoning" in out:
                             has_output = True
                         _write(out)
                     if early_err:
@@ -1903,13 +1944,45 @@ class Handler(BaseHTTPRequestHandler):
                     events += 1
                     _write(out)
 
-                # 早期 response.failed：决定重试 or 转发
+                # 中途错误（已真实输出后的 response.failed，已转发）→ 完成
+                if stream_error:
+                    break
+
+                # === 超限复活（对应 messages 路径）===：response.failed 带超限文案 或 空 completed(无 output)
+                overflow = False
                 if early_err and not has_output:
+                    overflow = _is_overflow_signal(json.dumps(early_err[1], ensure_ascii=False))
+                elif held_completed is not None and not has_output:
+                    overflow = True  # 空 completed（无 output）= 超限
+                if overflow:
+                    trimmed = _pop_oldest_responses_input(payload)
+                    if trimmed:
+                        overflow_attempt += 1
+                        log.warning("[#%d] [ctx-revive] %s relay 超限(无输出)，删最远 1 条 input 后重发(attempt %d)",
+                                    self._req_id, upstream_name, overflow_attempt)
+                        payload = trimmed
+                        try:
+                            resp.close()
+                        except Exception:
+                            pass
+                        try:
+                            resp = urlopen(Request(url, data=payload, headers=up_headers, method=method),
+                                           timeout=REQUEST_TIMEOUT)
+                        except Exception as oe:
+                            log.error("[#%d]     !!! %s reopen failed: %s", self._req_id, upstream_name, oe)
+                            _emit({"type": "response.failed", "sequence_number": events + 1,
+                                   "response": {"error": {"message": str(oe), "type": "upstream_error"}}})
+                            stream_error = str(oe)
+                        continue  # 用裁剪后的 payload 重发
+
+                # === 早期 response.failed（非超限）：可重试→重试(同payload)；不可重试→转发 ===
+                if early_err and not has_output and not stream_error:
                     code, err, out_bytes = early_err
-                    if attempt < MAX and _is_retriable_conv(code):
-                        wait = min(2 ** attempt, 4)
+                    if retriable_attempt < MAX and _is_retriable_conv(code):
+                        retriable_attempt += 1
+                        wait = min(2 ** (retriable_attempt - 1), 4)
                         log.warning("[#%d]     !!! %s early error code=%s, retry %d/%d in %ds",
-                                    self._req_id, upstream_name, code, attempt + 1, MAX, wait)
+                                    self._req_id, upstream_name, code, retriable_attempt, MAX, wait)
                         try:
                             resp.close()
                         except Exception:
@@ -1923,7 +1996,6 @@ class Handler(BaseHTTPRequestHandler):
                             _emit({"type": "response.failed", "sequence_number": events + 1,
                                    "response": {"error": {"message": str(oe), "type": "upstream_error"}}})
                             stream_error = str(oe)
-                            break
                         continue  # 用新 resp 重试
                     # 不可重试或重试用尽 → 检查 429 并封锁，然后转发 response.failed
                     if isinstance(err, dict):
@@ -1937,20 +2009,18 @@ class Handler(BaseHTTPRequestHandler):
                     log.warning("[#%d]     !!! %s forwarding response.failed: %s", self._req_id, upstream_name, err)
                     _write(out_bytes)
                     stream_error = err
-                    break
-                # 正常完成或已真实输出（含中途错误已转发）→ 退出重试循环
-                break
 
-            # response.completed
-            if held_completed is not None:
-                _emit(held_completed)
-            elif not stream_error:
-                # 上游未发 response.completed（不完整流）→ 合成收尾，避免客户端"响应结束但一直转"
-                log.warning("[#%d]     !!! %s no response.completed, synthesizing (has_output=%s, events=%d)",
-                            self._req_id, upstream_name, has_output, events)
-                _emit({"type": "response.completed", "sequence_number": events + 1,
-                       "response": {"id": "resp_syn", "object": "response",
-                                    "status": "completed", "output": [], "usage": last_usage or {}}})
+                # 正常完成或已真实输出（含中途错误已转发）→ emit response.completed 收尾
+                if held_completed is not None:
+                    _emit(held_completed)
+                elif not stream_error:
+                    # 上游未发 response.completed（不完整流）→ 合成收尾，避免客户端"响应结束但一直转"
+                    log.warning("[#%d]     !!! %s no response.completed, synthesizing (has_output=%s, events=%d)",
+                                self._req_id, upstream_name, has_output, events)
+                    _emit({"type": "response.completed", "sequence_number": events + 1,
+                           "response": {"id": "resp_syn", "object": "response",
+                                        "status": "completed", "output": [], "usage": last_usage or {}}})
+                break  # 完成，退出重试循环
 
             # 保存 exchange 用于排查
             resp_text = b"".join(raw_blocks).decode("utf-8", errors="replace")
@@ -2080,7 +2150,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.57 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.58 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
