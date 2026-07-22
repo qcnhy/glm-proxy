@@ -1982,7 +1982,7 @@ class Handler(BaseHTTPRequestHandler):
                             _emit({"type": "response.failed", "sequence_number": events + 1,
                                    "response": {"error": {"message": str(oe), "type": "upstream_error"}}})
                             stream_error = str(oe)
-                        continue  # 用裁剪后的 payload 重发
+                            break  # reopen 失败，resp 已无效，不能 continue（否则 resp.read 崩溃）
 
                 # === 早期 response.failed（非超限）：与 messages 一致，直接转发（不退避重试）===
                 if early_err and not has_output and not stream_error:
