@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.56 — codex-relay + Python 路由层
+GLM API 代理 v2.9.57 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -784,6 +784,38 @@ def _patch_msg_usage(block_bytes, est_input):
         return block_bytes
 
 
+# 超限信号关键词（按各上游【实测】超限响应归纳，覆盖 4 种不同表现）
+# 实测：official/external-claude = 200流式 + model_context_window_exceeded
+#       ecloud       = HTTP400 + "ContextWindowExceededError"/"maximum context length is N tokens"
+#       venus-deepseek = HTTP400 + "CONTEXT_TOO_LARGE"/"上下文内容过大"
+#       internal     = HTTP400 + "Exceeded limit on max bytes to request body"/"BadRequest.TooLarge"(请求体上限)
+_OVERFLOW_MARKERS = (
+    # stop_reason / 错误码名
+    "context_window_exceeded", "contextwindowexceeded",
+    "context_length_exceeded", "contextlengthexceeded",
+    "context_too_large",                # venus-deepseek code
+    # 英文文案
+    "maximum context length", "maximum context window",
+    "context length exceeded",
+    "prompt is too long", "input too long",
+    "exceeds the context window", "exceeds context",
+    "too many input tokens",
+    "exceeded limit on max bytes",      # internal 请求体过大
+    "toolarge",                         # BadRequest.TooLarge
+    # 中文文案 (venus-deepseek)
+    "上下文内容过大", "上下文过大", "超出模型处理限制",
+)
+
+
+def _is_overflow_signal(text):
+    """文本是否含上下文超限信号（兼容各上游：BigModel 的 model_context_window_exceeded、
+    OpenAI 风格的 context_length_exceeded、以及各家中转 'prompt is too long' 等文案）。"""
+    if not text:
+        return False
+    t = text.lower()
+    return any(m in t for m in _OVERFLOW_MARKERS)
+
+
 def _is_normal_user_msg(msg):
     """单条消息是否是合法的 user 起点：user 角色、且非纯 tool_result 孤儿。
     Anthropic 要求 messages 以 user 开头，tool_result 必须跟在 tool_use 后——
@@ -1150,6 +1182,10 @@ class Handler(BaseHTTPRequestHandler):
                 err_body = e.read()
                 last_err = (e.code, err_body)
                 log.error("[#%d]     !!! %s HTTP %d: %s", self._req_id, up["name"], e.code, err_body[:300].decode(errors="replace"))
+                # messages 路径 + HTTP 超限(ecloud/venus/internal 等 400 带超限文案) → 删消息重发复活
+                if is_messages and _is_overflow_signal(err_body.decode("utf-8", errors="replace")):
+                    if self._revive_http_overflow(up, up_headers, body, e.code):
+                        return
                 # 429 rate_limit → 解析重置时间，封锁 official+external（HTTP 错误，所有路径都经过此处）
                 if e.code == 429:
                     log.info("[#%d]     [429] HTTPError 429 from %s, calling _block_channel_on_429", self._req_id, up["name"])
@@ -1330,12 +1366,11 @@ class Handler(BaseHTTPRequestHandler):
                                     held = []
                                     _write(out); size += len(out)
                                     flushed = True
-                                elif b'"model_context_window_exceeded"' in block:
+                                elif _is_overflow_signal(block.decode("utf-8", errors="replace")) or b'"message_stop"' in block:
+                                    # 各上游超限信号(model_context_window_exceeded / context_length_exceeded /
+                                    # "prompt is too long" 等)或空完整收尾(出内容前 message_stop) → 删一条重发
                                     overflow = True
                                     break  # held 丢弃，不转发 → 重试
-                                elif b'"message_stop"' in block:
-                                    overflow = True  # 出内容前就 stop = 超限空收尾
-                                    break
                                 elif is_error_block:
                                     for hb in held:
                                         _write(hb)
@@ -1431,6 +1466,35 @@ class Handler(BaseHTTPRequestHandler):
                 pass
         finally:
             stop_ka.set()
+
+    def _revive_http_overflow(self, up, up_headers, body, first_code):
+        """messages 路径 HTTP 超限复活：上游返回 HTTP 错误(ecloud/venus/internal 等 400 带超限文案)时，
+        逐条删最远 user 轮次并重发，直到上游返回 200 → 交给 _messages_stream_revive 正常流式。
+        est_input 用【原始】请求大小(删消息前)，让上报 input_tokens 反映客户端真实上下文→触发压缩。
+        返回 True=已复活并流式完成；False=删光仍超限或遇非超限错误(交 _route 回退下一上游)。"""
+        url = up["anthropic_url"].rstrip("/")
+        orig_est = _est_tokens(body)  # 删消息前的大小
+        for attempt in range(1, 31):
+            if not _pop_oldest_turn(body.get("messages", [])):
+                log.warning("[#%d] [ctx-revive] %s HTTP%d 删到最少仍超限", self._req_id, up["name"], first_code)
+                return False
+            log.warning("[#%d] [ctx-revive] %s HTTP%d 超限，删最远 1 条 user 轮次后重发(attempt %d, est~%dK)",
+                        self._req_id, up["name"], first_code, attempt, int(_est_tokens(body) // 1000))
+            payload = json.dumps(body).encode()
+            req = Request(url, data=payload, headers=up_headers, method="POST")
+            try:
+                resp = urlopen(req, timeout=REQUEST_TIMEOUT)
+            except HTTPError as e2:
+                if _is_overflow_signal(e2.read().decode("utf-8", errors="replace")):
+                    continue  # 还超限，继续删
+                log.warning("[#%d] [ctx-revive] %s 重发遇非超限 HTTP%d，交回退", self._req_id, up["name"], e2.code)
+                return False
+            except Exception:
+                return False
+            # 拿到 200 → 交给流式（est_input 传原始大小）
+            self._messages_stream_revive(resp, up, up_headers, body, orig_est)
+            return True
+        return False
 
     # ── Responses→Messages 转换流式处理（旧：整段缓冲，留作兜底）──
     def _converted_stream_with_retry(self, first_resp, up, url, up_headers, payload, method):
@@ -2016,7 +2080,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.56 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.57 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
