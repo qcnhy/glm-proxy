@@ -1130,7 +1130,7 @@ class Handler(BaseHTTPRequestHandler):
                     elif is_responses:
                         # relay 路径：立即发头+keepalive（idle安全），早期 1305/过载退避重试
                         events, has_output, stream_error = self._relay_stream_with_retry(
-                            resp, up, url, up_headers, payload, method)
+                            resp, up, url, up_headers, payload, method, _est_tokens(body))
                         if stream_error:
                             log.warning("[#%d]     !!! %s upstream error, forwarding to client: %s",
                                         self._req_id, up["name"], stream_error)
@@ -1805,7 +1805,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
     # ── 流式转发 ─────────────────────────────────────
-    def _relay_stream_with_retry(self, first_resp, up, url, up_headers, payload, method):
+    def _relay_stream_with_retry(self, first_resp, up, url, up_headers, payload, method, est_input=0):
         """增量流式转发 codex-relay 的 Responses SSE：立即发响应头 + 后台 keepalive 线程
         防 idle 超时，边收边发；apply_patch 项缓冲后合成 custom_tool_call。
         probe-hold：非内容块(response.created 等)握住不发，见首条内容才 flush；
@@ -1951,6 +1951,18 @@ class Handler(BaseHTTPRequestHandler):
                             stream_error = str(oe)
                             break  # reopen 失败，resp 已无效，不能 continue（否则 resp.read 崩溃）
                         continue  # reopen 成功 → 用裁剪后的 payload 重发（6528f7b 误删，致复活失效，现恢复）
+                    else:
+                        # 删到最少仍超限 → 合成清晰超限 response.failed（对齐 messages 的 context_exceeded 信号）
+                        log.warning("[#%d] [ctx-revive] %s relay 删到最少仍超限，合成超限 response.failed",
+                                    self._req_id, upstream_name)
+                        for hb in held:
+                            _write(hb)
+                        held = []
+                        _emit({"type": "response.failed", "sequence_number": events + 1,
+                               "response": {"error": {"message": "context length exceeded, please reduce conversation history",
+                                                      "code": "context_length_exceeded", "type": "upstream_error"}}})
+                        stream_error = "overflow_giveup"
+                        break
 
                 # === 早期 response.failed（非超限）：与 messages 一致，直接转发（不退避重试）===
                 if early_err and not has_output and not stream_error:
@@ -1977,6 +1989,15 @@ class Handler(BaseHTTPRequestHandler):
                     _write(hb)
                 held = []
                 if held_completed is not None:
+                    # 与 messages 一致：上报 input_tokens 用客户端原始请求大小（est_input），
+                    # 非裁剪后的大小 → 让 Codex 看到真实上下文 → 触发其压缩（否则复活后 Codex 不压缩、循环超限）
+                    if est_input:
+                        try:
+                            u = held_completed.setdefault("response", {}).setdefault("usage", {})
+                            u["input_tokens"] = int(est_input)
+                            u["total_tokens"] = int(est_input) + int(u.get("output_tokens", 0) or 0)
+                        except Exception:
+                            pass
                     _emit(held_completed)
                 elif not stream_error:
                     # 上游未发 response.completed（不完整流）→ 合成收尾，避免客户端"响应结束但一直转"
