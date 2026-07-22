@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.62 — codex-relay + Python 路由层
+GLM API 代理 v2.9.64 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -804,67 +804,6 @@ def _is_overflow_signal(text):
     return any(m in t for m in _OVERFLOW_MARKERS)
 
 
-def _is_normal_user_msg(msg):
-    """单条消息是否是合法的 user 起点：user 角色、且非纯 tool_result 孤儿。
-    Anthropic 要求 messages 以 user 开头，tool_result 必须跟在 tool_use 后——
-    裁剪后开头若是 assistant 或孤儿 tool_result，上游会 400。"""
-    if not isinstance(msg, dict) or msg.get("role") != "user":
-        return False
-    c = msg.get("content")
-    if isinstance(c, str):
-        return True
-    if isinstance(c, list):
-        return any(not (isinstance(b, dict) and b.get("type") == "tool_result") for b in c)
-    return True
-
-
-def _pop_oldest_turn(msgs):
-    """从最远处删**一整条** user 轮次：删掉开头 user 及其后到下一个合法 user 前的所有消息
-    （保证删后开头仍是合法 user，不破坏 tool_use/tool_result 配对）。至少保留最近 6 条。
-    返回是否删了（False=没得删）。"""
-    if not isinstance(msgs, list) or len(msgs) <= 6:
-        return False
-    n0 = len(msgs)
-    msgs.pop(0)  # 删最远的一条 user
-    while len(msgs) > 6 and not _is_normal_user_msg(msgs[0]):  # 删到下一个合法 user 开头
-        msgs.pop(0)
-    return len(msgs) < n0
-
-
-def _responses_input_starts_user(inp):
-    """Responses input 数组开头是否是合法的 user 消息项（裁剪后保证开头合法，
-    不留 assistant/function_call_output 孤儿）。"""
-    if not isinstance(inp, list) or not inp:
-        return False
-    item = inp[0]
-    return (isinstance(item, dict) and item.get("role") == "user"
-            and item.get("type", "message") == "message")
-
-
-def _pop_oldest_responses_input(payload_bytes):
-    """裁剪 Responses 请求体 input 最远一条（relay 路径超限复活用，对应 messages 的 _pop_oldest_turn）。
-    input 是数组时删最远一条、保证开头仍是合法 user；input 是字符串则无法按轮次裁。
-    返回裁剪后的 payload bytes，或 None（无法裁/太少）。"""
-    try:
-        body = json.loads(payload_bytes)
-    except Exception:
-        return None
-    inp = body.get("input")
-    if not isinstance(inp, list) or len(inp) <= 6:
-        return None
-    n0 = len(inp)
-    inp.pop(0)
-    while len(inp) > 6 and not _responses_input_starts_user(inp):
-        inp.pop(0)
-    if len(inp) >= n0:
-        return None
-    body["input"] = inp
-    try:
-        return json.dumps(body, ensure_ascii=False).encode()
-    except Exception:
-        return None
-
-
 # ── HTTP 处理 ─────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -1128,10 +1067,10 @@ class Handler(BaseHTTPRequestHandler):
                                         self._req_id, up["name"], stream_error)
                         return  # 已发响应头，总是 done
                     elif is_messages:
-                        # 流式 + 超限自动复活（探测驱动）：握住到首条内容才 flush；
-                        # 上游实际返回超限(无内容)则删最远一条 user 轮次重发，逐条减直到产出内容。
-                        # est_input 用客户端原始请求大小，让上报 input_tokens 反映真实上下文触发压缩。
-                        self._messages_stream_revive(resp, up, up_headers, body, _est_tokens(body))
+                        # 流式（probe-before-commit）：延迟提交 200，握住到首条内容才 flush；
+                        # 上游实际返回超限(含 200 流式超限信号) → 返干净 400 触发客户端 auto-compact（不做 est 预判）。
+                        # est_input 仅用于上报 input_tokens 让客户端看到真实上下文。
+                        self._messages_stream(resp, up, up_headers, body, _est_tokens(body))
                         return
                     else:
                         self._pipe_stream(resp, up["name"])
@@ -1204,10 +1143,10 @@ class Handler(BaseHTTPRequestHandler):
                 err_body = e.read()
                 last_err = (e.code, err_body)
                 log.error("[#%d]     !!! %s HTTP %d: %s", self._req_id, up["name"], e.code, err_body[:300].decode(errors="replace"))
-                # messages 路径 + HTTP 超限(ecloud/venus/internal 等 400 带超限文案) → 删消息重发复活
-                if is_messages and _is_overflow_signal(err_body.decode("utf-8", errors="replace")):
-                    if self._revive_http_overflow(up, up_headers, body, e.code):
-                        return
+                # 任意路径 + HTTP 超限(ecloud/venus/internal 等 400 带超限文案) → 返干净 400 触发客户端压缩（不回退）
+                if (is_messages or is_responses) and _is_overflow_signal(err_body.decode("utf-8", errors="replace")):
+                    self._send_overflow_400(up, _est_tokens(body), as_responses=is_responses)
+                    return
                 # 429 rate_limit → 解析重置时间，封锁 official+external（HTTP 错误，所有路径都经过此处）
                 if e.code == 429:
                     log.info("[#%d]     [429] HTTPError 429 from %s, calling _block_channel_on_429", self._req_id, up["name"])
@@ -1258,14 +1197,14 @@ class Handler(BaseHTTPRequestHandler):
         except (ConnectionResetError, BrokenPipeError):
             log.warning("[#%d]     <<< %s STREAM interrupted", self._req_id, upstream_name)
 
-    def _messages_stream_revive(self, first_resp, up, up_headers, body, est_input=0):
-        """Messages 流式 + 超限自动复活（完全靠上游实际响应驱动，不用 est 预判）。
-        提交 200 + keepalive 后，**握住**上游块不发，直到看见首条内容(content_block_delta)：
-          - 见内容 → flush 已握住的块 + 继续正常增量流式；
-          - 上游出内容前返回 model_context_window_exceeded / 空收尾 → 从最远删一整条 user 轮次 → 重发，逐条减直到产出内容；
-          - 非超限错误(event:error) → flush 转发给客户端，不裁剪。
-        客户端全程有 keepalive 保活，重试对其透明。est_input 用客户端原始请求大小（非裁剪后），
-        以便上报的 input_tokens 反映客户端真实上下文 → 触发其自动压缩。"""
+    def _messages_stream(self, first_resp, up, up_headers, body, est_input=0):
+        """Messages 流式（probe-before-commit，靠上游实际响应驱动超限检测，不用 est 预判）。
+        **延迟提交 200**：先握住上游块不发响应头，直到看见首条内容(content_block_delta)：
+          - 见内容 → 提交 200 + flush 已握住的块 + 继续正常增量流式（keepalive 随之启动）；
+          - 上游出内容前返回超限信号(model_context_window_exceeded / "prompt is too long" 等)或空收尾
+            → 返干净 HTTP 400（探测期未提交 200，可直接 _send_raw(400)）→ 触发客户端 auto-compact；
+          - 非超限错误(event:error) → 提交 200 + flush 转发给客户端。
+        est_input 用客户端原始请求大小，上报 input_tokens 反映真实上下文。"""
         upstream_name = up["name"]
         url = up["anthropic_url"].rstrip("/")
         _SERVER_TOOL_TYPES = {
@@ -1275,16 +1214,9 @@ class Handler(BaseHTTPRequestHandler):
             "bash_tool_use", "bash_tool_result",
             "text_editor_tool_use", "text_editor_tool_result",
         }
-        self.send_response(200)
-        for h in ["Content-Type", "Cache-Control"]:
-            v = first_resp.headers.get(h)
-            if v:
-                self.send_header(h, v)
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.close_connection = True
         wlock = threading.Lock()
         stop_ka = threading.Event()
+        committed = [False]
         def _write(data):
             with wlock:
                 self.wfile.write(data); self.wfile.flush()
@@ -1294,17 +1226,29 @@ class Handler(BaseHTTPRequestHandler):
                     _write(b": keepalive\n\n")
                 except Exception:
                     break
-        threading.Thread(target=_keepalive, daemon=True).start()
+        def _commit():
+            # 延迟提交 200（probe-before-commit）：探测期(到首条内容前)不发响应头，
+            # 便于检测到上游"200 流式却超限"时改返干净 400（200 已发就回不去 400）。
+            if committed[0]:
+                return
+            self.send_response(200)
+            for h in ["Content-Type", "Cache-Control"]:
+                v = first_resp.headers.get(h)
+                if v:
+                    self.send_header(h, v)
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            committed[0] = True
+            threading.Thread(target=_keepalive, daemon=True).start()
 
         resp = first_resp
-        attempt = 0
         last_usage = {}
         try:
-            while True:  # === 重试外层：每次处理一个上游 resp ===
+            while True:  # 单次处理上游 resp（超限直接返 400，不再 trim 重试）
                 buf = b""
                 held = []          # 探测期握住、未转发的块
                 flushed = False    # 是否已见内容并 flush（进入正常流式）
-                overflow = False   # 上游超限（出内容前）
                 stream_error = False
                 saw_message_stop = False
                 open_indices = []
@@ -1383,20 +1327,28 @@ class Handler(BaseHTTPRequestHandler):
                             # === 探测：未 flush 前握住，见首条内容才 flush ===
                             if not flushed:
                                 if b'"content_block_delta"' in block:
+                                    _commit()  # 见首条内容 → 提交 200 + 启动 keepalive
                                     for hb in held:
                                         _write(hb)
                                     held = []
                                     _write(out); size += len(out)
                                     flushed = True
                                 elif _is_overflow_signal(block.decode("utf-8", errors="replace")) or b'"message_stop"' in block:
-                                    # 各上游超限信号(model_context_window_exceeded / context_length_exceeded /
-                                    # "prompt is too long" 等)或空完整收尾(出内容前 message_stop) → 删一条重发
-                                    overflow = True
-                                    break  # held 丢弃，不转发 → 重试
+                                    # 上游超限信号(model_context_window_exceeded / context_length_exceeded /
+                                    # "prompt is too long" 等)或空完整收尾(出内容前 message_stop) → 返干净 400
+                                    # 触发客户端 auto-compact（探测期未提交 200，可直接 _send_raw(400)）
+                                    stop_ka.set()
+                                    try:
+                                        resp.close()
+                                    except Exception:
+                                        pass
+                                    self._send_overflow_400(up, est_input)
+                                    return
                                 elif is_error_block:
                                     # 429 → 封锁渠道（与 relay 一致）
                                     if b"429" in block or b"rate_limit" in block:
                                         _block_channel_on_429(block, up["name"], self._req_id)
+                                    _commit()  # 出内容前的非超限错误 → 提交 200 + 转发错误
                                     for hb in held:
                                         _write(hb)
                                     held = []
@@ -1435,8 +1387,6 @@ class Handler(BaseHTTPRequestHandler):
                                                 last_usage = p["usage"]
                                 except Exception:
                                     pass
-                        if overflow:
-                            break  # 退出 chunk 循环 → 进入重试判定
                 except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
                     log.warning("[#%d]     <<< %s STREAM interrupted", self._req_id, upstream_name)
                     return
@@ -1450,38 +1400,24 @@ class Handler(BaseHTTPRequestHandler):
                             _write(("event: content_block_stop\ndata: {\"type\": \"content_block_stop\", \"index\": " + str(idx) + "}\n\n").encode())
                         _write(b'event: message_delta\ndata: {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 0}}\n\nevent: message_stop\ndata: {"type": "message_stop"}\n\n')
                     size_str = (str(size // 1024) + "KB") if size >= 1024 else (str(size) + "B")
-                    tag = f" [revive#{attempt}]" if attempt else ""
                     if last_usage:
-                        log.info("[#%d]     <<< %s STREAM OK (%s, %dms) usage: input=%d output=%d total=%d%s",
+                        log.info("[#%d]     <<< %s STREAM OK (%s, %dms) usage: input=%d output=%d total=%d",
                                  self._req_id, upstream_name, size_str, self._ms(),
                                  last_usage.get("input_tokens", 0), last_usage.get("output_tokens", 0),
-                                 last_usage.get("input_tokens", 0) + last_usage.get("output_tokens", 0), tag)
+                                 last_usage.get("input_tokens", 0) + last_usage.get("output_tokens", 0))
                     else:
-                        log.info("[#%d]     <<< %s STREAM OK (%s, %dms)%s",
-                                 self._req_id, upstream_name, size_str, self._ms(), tag)
+                        log.info("[#%d]     <<< %s STREAM OK (%s, %dms)",
+                                 self._req_id, upstream_name, size_str, self._ms())
                     return
-                if not overflow:
-                    # 非内容且非超限（上游早断/不完整/空但无超限信号）→ 原样转发已握住的块 + 合成收尾，**不裁剪**。
-                    # 只处理超限；其他错误(event:error 已在探测期 flush)一律不裁剪。
-                    for hb in held:
-                        _write(hb)
-                    if held and not saw_message_stop:
-                        _write(b'event: message_delta\ndata: {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 0}}\n\nevent: message_stop\ndata: {"type": "message_stop"}\n\n')
-                    log.info("[#%d]     <<< %s STREAM non-content (非超限, %dms) — 原样转发不裁剪",
-                             self._req_id, upstream_name, self._ms())
-                    return
-                # overflow（显式 model_context_window_exceeded 或 空完整收尾）：删最远一条 user 轮次重发
-                if not _pop_oldest_turn(body.get("messages", [])):
-                    log.warning("[#%d] [ctx-revive] %s 删到最少仍超限，合成超限收尾",
-                                self._req_id, upstream_name)
-                    _write(b'event: message_delta\ndata: {"type": "message_delta", "delta": {"stop_reason": "model_context_window_exceeded"}, "usage": {"output_tokens": 0}}\n\nevent: message_stop\ndata: {"type": "message_stop"}\n\n')
-                    return
-                attempt += 1
-                log.warning("[#%d] [ctx-revive] %s 上游超限(无内容)，删最远 1 条 user 轮次后重发(attempt %d, est~%dK)",
-                            self._req_id, upstream_name, attempt, int(_est_tokens(body) // 1000))
-                payload = json.dumps(body).encode()
-                req = Request(url, data=payload, headers=up_headers, method="POST")
-                resp = urlopen(req, timeout=REQUEST_TIMEOUT)
+                # 非内容（上游早断/不完整/空但无超限信号；超限已在探测期返 400）→ 提交 200 + 转发已握住的块 + 合成收尾
+                _commit()
+                for hb in held:
+                    _write(hb)
+                if held and not saw_message_stop:
+                    _write(b'event: message_delta\ndata: {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 0}}\n\nevent: message_stop\ndata: {"type": "message_stop"}\n\n')
+                log.info("[#%d]     <<< %s STREAM non-content (%dms) — 提交200+合成收尾",
+                         self._req_id, upstream_name, self._ms())
+                return
         except Exception as e:
             log.error("[#%d] [messages] %s revive exception: %s — synthesizing close",
                       self._req_id, upstream_name, e)
@@ -1492,65 +1428,55 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             stop_ka.set()
 
-    def _revive_http_overflow(self, up, up_headers, body, first_code):
-        """messages 路径 HTTP 超限复活：上游返回 HTTP 错误(ecloud/venus/internal 等 400 带超限文案)时，
-        逐条删最远 user 轮次并重发，直到上游返回 200 → 交给 _messages_stream_revive 正常流式。
-        est_input 用【原始】请求大小(删消息前)，让上报 input_tokens 反映客户端真实上下文→触发压缩。
-        返回 True=已复活并流式完成；False=删光仍超限或遇非超限错误(交 _route 回退下一上游)。"""
-        url = up["anthropic_url"].rstrip("/")
-        orig_est = _est_tokens(body)  # 删消息前的大小
-        for attempt in range(1, 31):
-            if not _pop_oldest_turn(body.get("messages", [])):
-                log.warning("[#%d] [ctx-revive] %s HTTP%d 删到最少仍超限", self._req_id, up["name"], first_code)
-                return False
-            log.warning("[#%d] [ctx-revive] %s HTTP%d 超限，删最远 1 条 user 轮次后重发(attempt %d, est~%dK)",
-                        self._req_id, up["name"], first_code, attempt, int(_est_tokens(body) // 1000))
-            payload = json.dumps(body).encode()
-            req = Request(url, data=payload, headers=up_headers, method="POST")
-            try:
-                resp = urlopen(req, timeout=REQUEST_TIMEOUT)
-            except HTTPError as e2:
-                if _is_overflow_signal(e2.read().decode("utf-8", errors="replace")):
-                    continue  # 还超限，继续删
-                log.warning("[#%d] [ctx-revive] %s 重发遇非超限 HTTP%d，交回退", self._req_id, up["name"], e2.code)
-                return False
-            except Exception:
-                return False
-            # 拿到 200 → 交给流式（est_input 传原始大小）
-            self._messages_stream_revive(resp, up, up_headers, body, orig_est)
-            return True
-        return False
-
     # ── Responses→Messages 转换流式处理（旧：整段缓冲，留作兜底）──
     def _converted_stream_with_retry(self, first_resp, up, url, up_headers, payload, method):
-        """converted 路径：立即发响应头 + keepalive，同步翻译 Anthropic→Responses，
-        早期错误退避重试。合并了原 sync + retry 两层。"""
+        """converted 路径（probe-before-commit）：同步翻译 Anthropic→Responses。
+        延迟提交 200：首条内容前缓冲，见内容才提交+flush；overflow(超限 stop_reason / 空收尾 / error 体)
+        → 返干净 400(as_responses)触发客户端压缩；其他早期错误转发 response.failed。"""
         import threading
         upstream_name = up["name"]
         wlock = threading.Lock()
         stop_ka = threading.Event()
+        committed = [False]
+        held = []  # probe-hold：首条内容前缓冲，便于超限(200流式)时改返干净 400
         def _write(data):
             with wlock:
                 self.wfile.write(data); self.wfile.flush()
-        def _emit(ed):
-            _write((f"event: {ed.get('type', '')}\ndata: {json.dumps(ed, ensure_ascii=False)}\n\n").encode())
         def _keepalive():
             while not stop_ka.wait(5):
                 try:
                     _write(b": keepalive\n\n")
                 except Exception:
                     break
-        # 立即发响应头 + 启动 keepalive
-        self.send_response(200)
-        for h in ["Content-Type", "Cache-Control"]:
-            v = first_resp.headers.get(h)
-            if v:
-                self.send_header(h, v)
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.close_connection = True
-        kat = threading.Thread(target=_keepalive, daemon=True)
-        kat.start()
+        def _commit():
+            # probe-before-commit：延迟提交 200，首条内容才提交（+启动 keepalive）
+            with wlock:
+                if committed[0]:
+                    return
+                self.send_response(200)
+                for h in ["Content-Type", "Cache-Control"]:
+                    v = first_resp.headers.get(h)
+                    if v:
+                        self.send_header(h, v)
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.close_connection = True
+                committed[0] = True
+            threading.Thread(target=_keepalive, daemon=True).start()
+        def _emit(ed):
+            t = ed.get("type", "")
+            _is_content = t.endswith(".delta") and ("output_text" in t or "reasoning_summary_text" in t
+                        or "function_call_arguments" in t or "custom_tool_call_input" in t)
+            if _is_content and not committed[0]:
+                _commit()  # 首条内容 → 提交 200 + flush 缓冲
+                for hb in held:
+                    _write(hb)
+                held.clear()
+            data = (f"event: {t}\ndata: {json.dumps(ed, ensure_ascii=False)}\n\n").encode()
+            if committed[0]:
+                _write(data)
+            else:
+                held.append(data)
 
         seq = [0]
         def nseq():
@@ -1718,7 +1644,12 @@ class Handler(BaseHTTPRequestHandler):
                 u = d.get("usage", {}) or {}
                 if u:
                     usage[0].update(u)
+                stop = (d.get("delta", {}) or {}).get("stop_reason", "")
+                if stop and _is_overflow_signal(stop):
+                    return ("overflow", None, stop)  # 超限 stop_reason（如 model_context_window_exceeded）
             elif et == "message_stop":
+                if not has_output[0]:
+                    return ("overflow", None, "empty completion")  # 出内容前收尾 = 超限
                 _emit_created()
                 _emit({"sequence_number": nseq(), "type": "response.completed", "response": _resp_obj("completed")})
                 return "done"
@@ -1726,15 +1657,18 @@ class Handler(BaseHTTPRequestHandler):
                 err = d.get("error", d)
                 code = err.get("code") if isinstance(err, dict) else None
                 msg = (err.get("message", "") if isinstance(err, dict) else str(err))
+                _etxt = msg if isinstance(msg, str) else json.dumps(msg, ensure_ascii=False)
+                if _is_overflow_signal(_etxt):
+                    return ("overflow", code, msg)
                 return ("error", code, msg)
             return None
 
         # 内层函数：读上游 SSE，翻译成 Responses 事件，返回 (done, early_err)
         def _run_once(resp):
-            nonlocal done, early_err
+            nonlocal done, early_err, overflow
             try:
                 buf = b""
-                while not done and early_err is None:
+                while not done and early_err is None and not overflow:
                     chunk = resp.read(4096)
                     if not chunk:
                         break
@@ -1760,6 +1694,9 @@ class Handler(BaseHTTPRequestHandler):
                         if r == "done":
                             done = True
                             break
+                        if isinstance(r, tuple) and r[0] == "overflow":
+                            overflow = True
+                            break
                         if isinstance(r, tuple) and r[0] == "error":
                             if not has_output[0]:
                                 early_err = (r[1], r[2])
@@ -1768,8 +1705,8 @@ class Handler(BaseHTTPRequestHandler):
                                        "response": {"error": {"message": (r[2] or "upstream error"), "code": r[1], "type": "upstream_error"}}})
                                 done = True
                             break
-                # 上游 EOF 但未发 message_stop：合成完成
-                if not done and early_err is None:
+                # 上游 EOF 但未发 message_stop：合成完成（overflow 时不合成，交外层返 400）
+                if not done and early_err is None and not overflow:
                     log.warning("[#%d] [converted] %s upstream EOF without message_stop, synthesizing completed",
                                 self._req_id, upstream_name)
                     _emit_created()
@@ -1785,11 +1722,32 @@ class Handler(BaseHTTPRequestHandler):
         resp = first_resp
         done = False
         early_err = None
+        overflow = False
         _run_once(resp)
+
+        # 超限（探测期未提交 200）→ 返干净 400 触发客户端压缩
+        if overflow:
+            stop_ka.set()
+            try:
+                resp.close()
+            except Exception:
+                pass
+            self._send_overflow_400(up, 0, as_responses=True)
+            return {"done": True}
 
         # 早期错误：与 messages/relay 一致，429 封锁后直接转发 response.failed（不退避重试）
         if not done and early_err:
             code, msg = early_err[0], early_err[1]
+            # 错误体含超限关键词 → 同样返 400（兜底：_on_event 未归为 overflow 的情况）
+            _etxt = msg if isinstance(msg, str) else json.dumps(msg, ensure_ascii=False)
+            if _is_overflow_signal(_etxt):
+                stop_ka.set()
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+                self._send_overflow_400(up, 0, as_responses=True)
+                return {"done": True}
             if str(code) == "429" or (isinstance(msg, dict) and msg.get("type") == "rate_limit_error") or "429" in str(msg)[:200]:
                 _block_channel_on_429(json.dumps({"error": {"code": code, "message": msg}}).encode(), upstream_name, self._req_id)
             _emit({"sequence_number": 0, "type": "response.failed",
@@ -1801,10 +1759,10 @@ class Handler(BaseHTTPRequestHandler):
 
     # ── 流式转发 ─────────────────────────────────────
     def _relay_stream_with_retry(self, first_resp, up, url, up_headers, payload, method, est_input=0):
-        """增量流式转发 codex-relay 的 Responses SSE：立即发响应头 + 后台 keepalive 线程
-        防 idle 超时，边收边发；apply_patch 项缓冲后合成 custom_tool_call。
-        probe-hold：非内容块(response.created 等)握住不发，见首条内容才 flush；
-        overflow(超限信号/空completed)→裁最远 input 重发；其他错误(含可重试)与 messages 一致直接转发(429另封锁渠道)。
+        """增量流式转发 codex-relay 的 Responses SSE（probe-before-commit，靠 codex-relay 自带 keepalive）。
+        apply_patch 项缓冲后合成 custom_tool_call。
+        延迟提交 200：非内容块(response.created 等)握住不发，首次 _write 才提交 200+flush；
+        overflow(超限信号/空completed)→返干净 400(as_responses)触发客户端压缩；其他错误与 messages 一致直接转发(429另封锁渠道)。
         返回 (events, has_output, stream_error)。已发响应头即视为完成（不回退下一上游）。"""
         import threading
         upstream_name = up["name"]
@@ -1815,27 +1773,32 @@ class Handler(BaseHTTPRequestHandler):
         held_completed = None
         raw_blocks = []
 
+        committed = [False]
+        def _commit():
+            # probe-before-commit：延迟提交 200，首次 _write 才提交，便于超限(200流式)时改返干净 400
+            if committed[0]:
+                return
+            self.send_response(200)
+            for h in ["Content-Type", "Cache-Control"]:
+                v = first_resp.headers.get(h)
+                if v:
+                    self.send_header(h, v)
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            committed[0] = True
+
         def _write(data):
+            _commit()  # 首次写入前才提交 200（探测期握住不发，超限可不提交直接 400）
             self.wfile.write(data)
             self.wfile.flush()
 
         def _emit(ed):
             _write((f"event: {ed.get('type', '')}\ndata: {json.dumps(ed, ensure_ascii=False)}\n\n").encode())
 
-        # 立即发响应头进入 SSE 模式（codex-relay 0.5.2+ 自带 keepalive + 立即 flush response.created）
-        self.send_response(200)
-        for h in ["Content-Type", "Cache-Control"]:
-            v = first_resp.headers.get(h)
-            if v:
-                self.send_header(h, v)
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.close_connection = True
-
         resp = first_resp
-        overflow_attempt = 0
         try:
-            while True:  # 重试外循环：超限(裁input) 在此重发；非超限错误直接转发(与 messages 一致)
+            while True:  # 单次处理（超限直接返 400，不再裁input重发；非超限错误直接转发）
                 early_err = None  # (code, err, out_bytes) 真实输出前的 response.failed
                 held_completed = None
                 has_output = False
@@ -1919,45 +1882,17 @@ class Handler(BaseHTTPRequestHandler):
                 if stream_error:
                     break
 
-                # === 超限复活（对应 messages 路径）===：response.failed 带超限文案 或 空 completed(无 output)
-                overflow = False
-                if early_err and not has_output:
-                    overflow = _is_overflow_signal(json.dumps(early_err[1], ensure_ascii=False))
-                elif held_completed is not None and not has_output:
-                    overflow = True  # 空 completed（无 output）= 超限
-                if overflow:
-                    trimmed = _pop_oldest_responses_input(payload)
-                    if trimmed:
-                        overflow_attempt += 1
-                        log.warning("[#%d] [ctx-revive] %s relay 超限(无输出)，删最远 1 条 input 后重发(attempt %d)",
-                                    self._req_id, upstream_name, overflow_attempt)
-                        payload = trimmed
-                        try:
-                            resp.close()
-                        except Exception:
-                            pass
-                        try:
-                            resp = urlopen(Request(url, data=payload, headers=up_headers, method=method),
-                                           timeout=REQUEST_TIMEOUT)
-                        except Exception as oe:
-                            log.error("[#%d]     !!! %s reopen failed: %s", self._req_id, upstream_name, oe)
-                            _emit({"type": "response.failed", "sequence_number": events + 1,
-                                   "response": {"error": {"message": str(oe), "type": "upstream_error"}}})
-                            stream_error = str(oe)
-                            break  # reopen 失败，resp 已无效，不能 continue（否则 resp.read 崩溃）
-                        continue  # reopen 成功 → 用裁剪后的 payload 重发（6528f7b 误删，致复活失效，现恢复）
-                    else:
-                        # 删到最少仍超限 → 合成清晰超限 response.failed（对齐 messages 的 context_exceeded 信号）
-                        log.warning("[#%d] [ctx-revive] %s relay 删到最少仍超限，合成超限 response.failed",
-                                    self._req_id, upstream_name)
-                        for hb in held:
-                            _write(hb)
-                        held = []
-                        _emit({"type": "response.failed", "sequence_number": events + 1,
-                               "response": {"error": {"message": "context length exceeded, please reduce conversation history",
-                                                      "code": "context_length_exceeded", "type": "upstream_error"}}})
-                        stream_error = "overflow_giveup"
-                        break
+                # === 超限检测（靠上游实际响应）===：response.failed 带超限文案 或 空 completed(无 output)
+                # → 返干净 400（Responses 形态）触发客户端压缩；探测期未提交 200，可直接 _send_raw(400)
+                if (early_err and not has_output
+                        and _is_overflow_signal(json.dumps(early_err[1], ensure_ascii=False))) \
+                   or (held_completed is not None and not has_output):
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+                    self._send_overflow_400(up, est_input, as_responses=True)
+                    return
 
                 # === 早期 response.failed（非超限）：与 messages 一致，直接转发（不退避重试）===
                 if early_err and not has_output and not stream_error:
@@ -2072,6 +2007,25 @@ class Handler(BaseHTTPRequestHandler):
             except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
                 log.warning("client disconnected before error response")
 
+    def _send_overflow_400(self, up, est_tokens=0, as_responses=False):
+        """超限：向客户端返干净 HTTP 400（触发其 auto-compact）。
+        不做 est 预判——调用方已通过上游实际响应(_is_overflow_signal 命中)确认是真超限。
+        as_responses=True → OpenAI Responses 错误形态（relay/converted，Codex）；
+        否则 Anthropic 形态（messages，Claude Code，H1 实锤：此形态触发 auto-compact）。"""
+        max_ctx = up.get("max_context_tokens", 200000)
+        msg = (f"prompt is too long: ~{int(est_tokens)} tokens > {max_ctx} maximum context window"
+               if est_tokens else "context length exceeded, please reduce conversation history")
+        if as_responses:
+            err = json.dumps({"error": {"message": msg, "type": "invalid_request_error",
+                                        "code": "context_length_exceeded"}}).encode()
+        else:
+            err = json.dumps({"type": "error", "error": {"type": "invalid_request_error",
+                                                         "message": msg}}).encode()
+        log.warning("[#%d]     !!! context overflow (~%dK > %dK), returning 400 to client",
+                    getattr(self, '_req_id', 0),
+                    int(est_tokens // 1000) if est_tokens else 0, max_ctx // 1000)
+        self._send_raw(400, err, "application/json")
+
     def _send_context_exceeded(self, body, up):
         """统一的「上下文超限即 400」入口：检测(est>max_ctx*0.9) + 发送合一。
 
@@ -2131,7 +2085,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.62 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.64 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
