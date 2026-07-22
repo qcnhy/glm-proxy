@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.59 — codex-relay + Python 路由层
+GLM API 代理 v2.9.60 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -1841,13 +1841,11 @@ class Handler(BaseHTTPRequestHandler):
     def _relay_stream_with_retry(self, first_resp, up, url, up_headers, payload, method):
         """增量流式转发 codex-relay 的 Responses SSE：立即发响应头 + 后台 keepalive 线程
         防 idle 超时，边收边发；apply_patch 项缓冲后合成 custom_tool_call。
-        早期（真实输出前）遇 response.failed 且为可重试错误（1305/过载/5xx/429）→ 退避重试，
-        复用同一客户端连接（期间 keepalive 持续保活，客户端只感知到稍慢开始）；
-        真实输出开始后不再重试，中途错误直接转发。
+        probe-hold：非内容块(response.created 等)握住不发，见首条内容才 flush；
+        overflow(超限信号/空completed)→裁最远 input 重发；其他错误(含可重试)与 messages 一致直接转发(429另封锁渠道)。
         返回 (events, has_output, stream_error)。已发响应头即视为完成（不回退下一上游）。"""
         import threading
         upstream_name = up["name"]
-        MAX = 2
         events = 0
         last_usage = {}
         has_output = False
@@ -1874,9 +1872,8 @@ class Handler(BaseHTTPRequestHandler):
 
         resp = first_resp
         overflow_attempt = 0
-        retriable_attempt = 0
         try:
-            while True:  # 重试外循环：可重试错误(同payload) + 超限(裁input) 都在此重发
+            while True:  # 重试外循环：超限(裁input) 在此重发；非超限错误直接转发(与 messages 一致)
                 early_err = None  # (code, err, out_bytes) 真实输出前的 response.failed
                 held_completed = None
                 has_output = False
@@ -1987,29 +1984,10 @@ class Handler(BaseHTTPRequestHandler):
                             stream_error = str(oe)
                         continue  # 用裁剪后的 payload 重发
 
-                # === 早期 response.failed（非超限）：可重试→重试(同payload)；不可重试→转发 ===
+                # === 早期 response.failed（非超限）：与 messages 一致，直接转发（不退避重试）===
                 if early_err and not has_output and not stream_error:
                     code, err, out_bytes = early_err
-                    if retriable_attempt < MAX and _is_retriable_conv(code):
-                        retriable_attempt += 1
-                        wait = min(2 ** (retriable_attempt - 1), 4)
-                        log.warning("[#%d]     !!! %s early error code=%s, retry %d/%d in %ds",
-                                    self._req_id, upstream_name, code, retriable_attempt, MAX, wait)
-                        try:
-                            resp.close()
-                        except Exception:
-                            pass
-                        time.sleep(wait)  # 期间 keepalive 持续保活
-                        try:
-                            resp = urlopen(Request(url, data=payload, headers=up_headers, method=method),
-                                           timeout=REQUEST_TIMEOUT)
-                        except Exception as oe:
-                            log.error("[#%d]     !!! %s reopen failed: %s", self._req_id, upstream_name, oe)
-                            _emit({"type": "response.failed", "sequence_number": events + 1,
-                                   "response": {"error": {"message": str(oe), "type": "upstream_error"}}})
-                            stream_error = str(oe)
-                        continue  # 用新 resp 重试
-                    # 不可重试或重试用尽 → 检查 429 并封锁，然后转发 response.failed
+                    # 429 → 封锁渠道（直到重置）；其余错误直接转发 response.failed
                     if isinstance(err, dict):
                         ec = str(err.get("code", ""))
                         if ec == "429" or err.get("type") == "rate_limit_error":
@@ -2169,7 +2147,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.59 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.60 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
