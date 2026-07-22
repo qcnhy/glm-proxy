@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.60 — codex-relay + Python 路由层
+GLM API 代理 v2.9.61 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -720,13 +720,6 @@ def _convert_messages_error_to_responses(err_body):
 
 
 # ── apply_patch 转换 ──────────────────────────────────
-def _is_retriable_conv(code):
-    """converted 路径早期错误是否值得退避重试（1305 过载 / 5xx / 429）。"""
-    if code is None:
-        return False
-    s = str(code)
-    return s in {"1305", "overloaded", "429", "500", "502", "503", "529"} or "overload" in s.lower()
-
 
 def _est_tokens(body):
     """估算请求 token 数：剔除 base64 图片数据（图片按分辨率约 1-3K token，不按 base64 字节长度算）。
@@ -1409,6 +1402,9 @@ class Handler(BaseHTTPRequestHandler):
                                     overflow = True
                                     break  # held 丢弃，不转发 → 重试
                                 elif is_error_block:
+                                    # 429 → 封锁渠道（与 relay 一致）
+                                    if b"429" in block or b"rate_limit" in block:
+                                        _block_channel_on_429(block, up["name"], self._req_id)
                                     for hb in held:
                                         _write(hb)
                                     held = []
@@ -1539,7 +1535,6 @@ class Handler(BaseHTTPRequestHandler):
         早期错误退避重试。合并了原 sync + retry 两层。"""
         import threading
         upstream_name = up["name"]
-        MAX = 2
         wlock = threading.Lock()
         stop_ka = threading.Event()
         def _write(data):
@@ -1800,35 +1795,7 @@ class Handler(BaseHTTPRequestHandler):
         early_err = None
         _run_once(resp)
 
-        # 早期错误重试
-        while early_err and not has_output[0] and _is_retriable_conv(early_err[0]):
-            code, msg = early_err
-            for attempt in range(MAX):
-                wait = min(2 ** attempt, 4)
-                log.warning("[#%d] [converted] %s early error code=%s, retry %d/%d in %ds",
-                            self._req_id, upstream_name, code, attempt + 1, MAX, wait)
-                try:
-                    resp.close()
-                except Exception:
-                    pass
-                time.sleep(wait)
-                try:
-                    resp = urlopen(Request(url, data=payload, headers=up_headers, method=method),
-                                   timeout=REQUEST_TIMEOUT)
-                except Exception as oe:
-                    log.error("[#%d] [converted] reopen failed: %s", self._req_id, oe)
-                    _emit({"sequence_number": 0, "type": "response.failed",
-                           "response": {"error": {"message": str(oe), "type": "upstream_error"}}})
-                    early_err = None
-                    break
-                seq[0] = 0; rid[0] = None; model[0] = None; usage[0] = {}
-                blocks.clear(); output_items.clear(); created_sent[0] = False; has_output[0] = False
-                done = False; early_err = None
-                _run_once(resp)
-                if done or not early_err:
-                    break
-            break
-
+        # 早期错误：与 messages/relay 一致，直接转发 response.failed（不退避重试）
         if not done and early_err:
             _emit({"sequence_number": 0, "type": "response.failed",
                    "response": {"error": {"message": early_err[1] or "upstream error", "code": early_err[0], "type": "upstream_error"}}})
@@ -1983,6 +1950,7 @@ class Handler(BaseHTTPRequestHandler):
                                    "response": {"error": {"message": str(oe), "type": "upstream_error"}}})
                             stream_error = str(oe)
                             break  # reopen 失败，resp 已无效，不能 continue（否则 resp.read 崩溃）
+                        continue  # reopen 成功 → 用裁剪后的 payload 重发（6528f7b 误删，致复活失效，现恢复）
 
                 # === 早期 response.failed（非超限）：与 messages 一致，直接转发（不退避重试）===
                 if early_err and not has_output and not stream_error:
@@ -2147,7 +2115,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.60 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.61 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
