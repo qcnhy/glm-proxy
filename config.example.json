@@ -27,19 +27,6 @@
       "worktime_only": true
     },
     {
-      "_comment": "Venus DeepSeek (fallback mid priority)",
-      "name": "internal",
-      "openai_url": "https://aigateway.venusgroup.com.cn/ai/deepseek/openai/v1",
-      "anthropic_url": "https://aigateway.venusgroup.com.cn/ai/deepseek/anthropic/v1/messages",
-      "anthropic_auth": "bearer",
-      "key": "YOUR_INTERNAL_KEY",
-      "relay_port": 4444,
-      "interceptor_port": 14444,
-      "model": "deepseek-v4-pro",
-      "messages_model": "deepseek-v4-pro",
-      "max_context_tokens": 128000
-    },
-    {
       "_comment": "智谱官方：原生两端点，一个 key 通吃。openai_url 用 coding 路径。",
       "name": "official",
       "openai_url": "https://open.bigmodel.cn/api/coding/paas/v4",
@@ -50,6 +37,31 @@
       "interceptor_port": 14446,
       "model": "glm-5.2",
       "messages_model": "glm-5.2",
+      "max_context_tokens": 1000000
+    },
+    {
+      "_comment": "Venus DeepSeek V4 Pro",
+      "name": "venus-deepseek",
+      "openai_url": "https://aigateway.venusgroup.com.cn/ai/deepseek/openai/v1",
+      "anthropic_url": "https://aigateway.venusgroup.com.cn/ai/deepseek/anthropic/v1/messages",
+      "anthropic_auth": "bearer",
+      "key": "YOUR_INTERNAL_KEY",
+      "relay_port": 4450,
+      "interceptor_port": 14450,
+      "model": "deepseek-v4-pro",
+      "messages_model": "deepseek-v4-pro",
+      "max_context_tokens": 128000
+    },
+    {
+      "_comment": "内网千问兜底",
+      "name": "internal",
+      "openai_url": "https://aigateway.venusgroup.com.cn/ai/aliyun/openai/v1",
+      "anthropic_url": "https://aigateway.venusgroup.com.cn/ai/aliyun/anthropic/v1/messages",
+      "anthropic_auth": "bearer",
+      "key": "YOUR_INTERNAL_KEY",
+      "relay_port": 4444,
+      "interceptor_port": 14444,
+      "model": "qwen3.5-plus",
       "max_context_tokens": 1000000
     }
   ]
