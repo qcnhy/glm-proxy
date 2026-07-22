@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.61 — codex-relay + Python 路由层
+GLM API 代理 v2.9.62 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -1795,8 +1795,11 @@ class Handler(BaseHTTPRequestHandler):
         early_err = None
         _run_once(resp)
 
-        # 早期错误：与 messages/relay 一致，直接转发 response.failed（不退避重试）
+        # 早期错误：与 messages/relay 一致，429 封锁后直接转发 response.failed（不退避重试）
         if not done and early_err:
+            code, msg = early_err[0], early_err[1]
+            if str(code) == "429" or (isinstance(msg, dict) and msg.get("type") == "rate_limit_error") or "429" in str(msg)[:200]:
+                _block_channel_on_429(json.dumps({"error": {"code": code, "message": msg}}).encode(), upstream_name, self._req_id)
             _emit({"sequence_number": 0, "type": "response.failed",
                    "response": {"error": {"message": early_err[1] or "upstream error", "code": early_err[0], "type": "upstream_error"}}})
 
@@ -2136,7 +2139,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.61 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.62 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
