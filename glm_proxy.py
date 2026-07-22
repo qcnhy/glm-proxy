@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.45 — codex-relay + Python 路由层
+GLM API 代理 v2.9.46 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -833,6 +833,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send_raw(200, STATIC_MODELS, "application/json")
             return
 
+        # GET 非 /v1/models 的未知路径（如 /v1/sub2api/billing）→ 404，不进上游循环
+        if method == "GET":
+            log.warning("[#%d] >>> GET %s (unsupported)", getattr(self, "_req_id", 0), self.path)
+            err = json.dumps({"error": {"message": f"Unsupported path: {path_only}",
+                                         "type": "invalid_request_error"}}).encode()
+            self._send_raw(404, err, "application/json")
+            return
+
         # 2) 读取请求体
         payload = None
         is_stream = False
@@ -875,6 +883,8 @@ class Handler(BaseHTTPRequestHandler):
             force_channel = "official"
 
         # 模型名路由（优先于 key）：模型名严格匹配 internal 渠道配置的 model → 走内网千问
+        # GET 请求 body=None（无 Content-Length），必须先初始化 req_model，否则 ROUTE 日志 UnboundLocalError
+        req_model = ""
         if isinstance(body, dict):
             req_model = body.get("model") or ""
             internal_model = next((up["model"] for up in UPSTREAMS if up.get("name") == "internal"), None)
@@ -893,10 +903,10 @@ class Handler(BaseHTTPRequestHandler):
         needs_completions = is_responses and use_completions
         needs_messages = is_messages or (is_responses and not use_completions)
         blocked_active = {k: datetime.fromtimestamp(v).strftime("%H:%M") for k, v in _channel_blocked_until.items() if v > time.time()}
-        log.info("[#%d] ROUTE: key=%s model=%s force=%s worktime=%s blocked=%s needs_comp=%s needs_msg=%s",
+        log.info("[#%d] ROUTE: key=%s model=%s force=%s worktime=%s blocked=%s needs_comp=%s needs_msg=%s path=%s",
                  self._req_id, client_key[:20] or "(empty)", req_model or "?",
                  force_channel, is_worktime, blocked_active or "{}",
-                 needs_completions, needs_messages)
+                 needs_completions, needs_messages, self.path)
         if has_images:
             log.info("    [image] 含图片 → 走 Messages 路径")
 
@@ -1920,7 +1930,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.45 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.46 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
