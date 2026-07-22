@@ -28,7 +28,7 @@
     },
     {
       "_comment": "Venus DeepSeek (fallback mid priority)",
-      "name": "venus-deepseek",
+      "name": "internal",
       "openai_url": "https://aigateway.venusgroup.com.cn/ai/deepseek/openai/v1",
       "anthropic_url": "https://aigateway.venusgroup.com.cn/ai/deepseek/anthropic/v1/messages",
       "anthropic_auth": "bearer",
