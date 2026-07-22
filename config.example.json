@@ -50,7 +50,7 @@
       "interceptor_port": 14450,
       "model": "deepseek-v4-pro",
       "messages_model": "deepseek-v4-pro",
-      "max_context_tokens": 128000
+      "max_context_tokens": 1000000
     },
     {
       "_comment": "内网千问兜底",
