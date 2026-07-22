@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.58 — codex-relay + Python 路由层
+GLM API 代理 v2.9.59 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -1881,6 +1881,7 @@ class Handler(BaseHTTPRequestHandler):
                 held_completed = None
                 has_output = False
                 buf = b""
+                held = []  # probe-hold：握住 response.created 等非内容块，见首条内容才 flush
                 done = False
                 while not done:
                     chunk = resp.read(4096)
@@ -1929,9 +1930,20 @@ class Handler(BaseHTTPRequestHandler):
                         if t == "response.completed":
                             held_completed = p
                             continue
-                        if b"output_text.delta" in out or b"function_call_arguments.delta" in out or b"custom_tool_call" in out or b"reasoning" in out:
-                            has_output = True
-                        _write(out)
+                        # probe-hold：非内容块(response.created 等)握住不发，见首条内容才 flush；
+                        # overflow(无内容)重试时整批丢弃 → 避免重试发多个 response.created
+                        _is_content = (b"output_text.delta" in out or b"function_call_arguments.delta" in out or b"custom_tool_call" in out or b"reasoning" in out)
+                        if _is_content:
+                            if not has_output:
+                                has_output = True
+                                for hb in held:
+                                    _write(hb)
+                                held = []
+                            _write(out)
+                        elif has_output:
+                            _write(out)
+                        else:
+                            held.append(out)
                     if early_err:
                         break
                 # 尾部残余（当前 resp 正常结束；重试时跳过）
@@ -2007,10 +2019,17 @@ class Handler(BaseHTTPRequestHandler):
                             log.info("[#%d]     [429] after block: %s", self._req_id,
                                      {k: datetime.fromtimestamp(v).strftime("%H:%M") for k, v in _channel_blocked_until.items() if v > time.time()})
                     log.warning("[#%d]     !!! %s forwarding response.failed: %s", self._req_id, upstream_name, err)
+                    for hb in held:  # probe-hold：转发前 flush 握住的(含 response.created)，让客户端看到 created+failed
+                        _write(hb)
+                    held = []
                     _write(out_bytes)
                     stream_error = err
 
                 # 正常完成或已真实输出（含中途错误已转发）→ emit response.completed 收尾
+                # 先 flush 还握住的块(若 has_output 期间已 flush 则 held 为空)：保证 created+completed 结构合法
+                for hb in held:
+                    _write(hb)
+                held = []
                 if held_completed is not None:
                     _emit(held_completed)
                 elif not stream_error:
@@ -2150,7 +2169,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.58 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.59 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
