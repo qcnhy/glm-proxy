@@ -3,3 +3,4 @@ __pycache__/
 logs/
 debug_req_*.json
 config.json
+.venv/

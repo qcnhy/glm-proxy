@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.49 — codex-relay + Python 路由层
+GLM API 代理 v2.9.54 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -745,6 +745,45 @@ def _est_tokens(body):
     return len(s.encode()) / 3.5 + n_images * 1500
 
 
+def _patch_msg_usage(block_bytes, est_input):
+    """修正非标准上游（如智谱 BigModel 的 anthropic 端点）流式 usage 的 input_tokens。
+
+    BigModel 把真实 input_tokens 放在 message_delta.usage，而 message_start.usage.input_tokens=0。
+    但 Anthropic SDK（Claude Code）只认 message_start 的 input_tokens（并把 message_delta.usage
+    合并/覆盖到快照）→ 客户端每轮看到的 input_tokens 恒为 0 或极小 → 上下文计数永远很低 →
+    不触发自动压缩 → 长会话最终撞上限、模型吐空（见 #62）。
+
+    用请求体估算的真实输入 token（_est_tokens）同时覆盖 message_start 与 message_delta 的
+    input_tokens：无论 SDK 是「只取 message_start」还是「用 message_delta 覆盖」，客户端都能
+    拿到接近真实的输入 token 数，从而在接近窗口时及时压缩。output_tokens 不动（BigModel 这个值是对的）。"""
+    if not est_input or (b'"message_start"' not in block_bytes and b'"message_delta"' not in block_bytes):
+        return block_bytes
+    try:
+        lines = block_bytes.decode("utf-8", errors="replace").split("\n")
+        changed = False
+        for i, line in enumerate(lines):
+            if not line.startswith("data: "):
+                continue
+            try:
+                p = json.loads(line[6:])
+            except Exception:
+                continue
+            t = p.get("type")
+            if t == "message_delta":
+                u = p.get("usage")
+            elif t == "message_start":
+                u = (p.get("message") or {}).get("usage")
+            else:
+                continue
+            if isinstance(u, dict):
+                u["input_tokens"] = int(est_input)
+                lines[i] = "data: " + json.dumps(p, ensure_ascii=False)
+                changed = True
+        return "\n".join(lines).encode("utf-8") if changed else block_bytes
+    except Exception:
+        return block_bytes
+
+
 # ── HTTP 处理 ─────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -831,16 +870,28 @@ class Handler(BaseHTTPRequestHandler):
         last_err = None
         body_saved = False  # 调试body只保存一次（首次失败时）
 
-        # 客户端发特定 key（"3"）强制走 official
+        # 客户端 Authorization key 路由：
+        # - 纯数字 key=N → 强制走 config.upstreams 第 N 个渠道（1-based，动态，不写死渠道名）
+        # - 其他 key → 默认按配置顺序回退；并受 worktime_only / 429 封锁影响
         client_key = self.headers.get("Authorization", "").replace("Bearer ", "").strip()
-        # key 路由：1=内网千问, 2=外部中转(codex→external-openai, claude→external-claude), 3=官方
-        force_channel = None
-        if client_key == "1":
-            force_channel = "internal"
-        elif client_key == "2":
-            force_channel = "external"
-        elif client_key == "3":
-            force_channel = "official"
+        force_upstream = None  # 强制渠道 name；None 表示默认回退链
+        if client_key.isdigit():
+            idx = int(client_key) - 1
+            if 0 <= idx < len(UPSTREAMS):
+                force_upstream = UPSTREAMS[idx]["name"]
+            else:
+                log.warning("[#%d] key=%s out of range (1..%d), fallback to default chain",
+                            self._req_id, client_key, len(UPSTREAMS))
+
+        # GET/无 body 时也要初始化，避免 ROUTE 日志 NameError
+        req_model = ""
+        if isinstance(body, dict):
+            req_model = body.get("model") or ""
+            # 模型名严格匹配 internal 渠道 model 时强制 internal（数字 key 之外的便捷路由）
+            if not force_upstream:
+                internal_model = next((up.get("model") for up in UPSTREAMS if up.get("name") == "internal"), None)
+                if internal_model and req_model == internal_model:
+                    force_upstream = "internal"
 
         hour = datetime.now().hour
         weekday = datetime.now().weekday()  # 0=Mon, 6=Sun
@@ -854,31 +905,26 @@ class Handler(BaseHTTPRequestHandler):
         needs_completions = is_responses and use_completions
         needs_messages = is_messages or (is_responses and not use_completions)
         blocked_active = {k: datetime.fromtimestamp(v).strftime("%H:%M") for k, v in _channel_blocked_until.items() if v > time.time()}
-        log.info("[#%d] ROUTE: key=%s model=%s force=%s worktime=%s blocked=%s needs_comp=%s needs_msg=%s path=%s",
+        # 动态 key 映射预览：1=第一渠道...
+        key_map = {str(i + 1): up["name"] for i, up in enumerate(UPSTREAMS)}
+        log.info("[#%d] ROUTE: key=%s model=%s force=%s worktime=%s blocked=%s needs_comp=%s needs_msg=%s path=%s key_map=%s",
                  self._req_id, client_key[:20] or "(empty)", req_model or "?",
-                 force_channel, is_worktime, blocked_active or "{}",
-                 needs_completions, needs_messages, self.path)
+                 force_upstream, is_worktime, blocked_active or "{}",
+                 needs_completions, needs_messages, self.path, key_map)
         if has_images:
             log.info("    [image] 含图片 → 走 Messages 路径")
 
         for up in UPSTREAMS:
             if up.get("disabled"):
                 continue
-            # key 路由：强制指定渠道时只走对应渠道
-            if force_channel == "internal" and up["name"] != "internal":
-                continue
-            if force_channel == "official" and up["name"] != "official":
-                continue
-            if force_channel == "external":
-                # codex(/v1/responses→completions)走 external-openai, claude(/v1/messages)走 external-claude
-                if needs_completions and up["name"] != "external-openai":
+            # 数字 key 强制：只走对应渠道（跳过 worktime / 封锁限制）
+            if force_upstream:
+                if up["name"] != force_upstream:
                     continue
-                if needs_messages and up["name"] != "external-claude":
+            else:
+                if up.get("worktime_only") and not is_worktime:
                     continue
-            if not force_channel and up.get("worktime_only") and not is_worktime:
-                continue
-            # 渠道封锁检查：429 限额封锁期内跳过 external 和 official
-            if not force_channel:
+                # 渠道封锁检查：429 限额封锁期内跳过 external 和 official
                 block_key = "external" if up["name"].startswith("external") else up["name"]
                 if _channel_blocked_until.get(block_key, 0) > time.time():
                     log.info("[#%d]     [skip] %s blocked until %s",
@@ -1001,8 +1047,14 @@ class Handler(BaseHTTPRequestHandler):
                                         self._req_id, up["name"], stream_error)
                         return  # 已发响应头，总是 done
                     elif is_messages:
-                        # 增量流式：已发送响应头并边收边发，直接返回（不再回退/不发400）
-                        self._messages_stream(resp, up["name"])
+                        # 增量流式：已发送响应头并边收边发，直接返回（不再回退）
+                        _ho, _u, ctx_exceeded, _se = self._messages_stream(resp, up["name"], _est_tokens(body))
+                        # 缺口3：流式已发200，无法再回发400状态。模型若 stop_reason=model_context_window_exceeded，
+                        # 该 stop_reason 已随 message_delta 原样转发给客户端（客户端据此可知超限并压缩重试）；
+                        # 此处捕获并记录，不再静默丢弃检测信号。
+                        if ctx_exceeded:
+                            log.warning("[#%d] [messages] %s stream: model_context_window_exceeded "
+                                        "(stop_reason 已转发客户端)", self._req_id, up["name"])
                         return
                     else:
                         self._pipe_stream(resp, up["name"])
@@ -1081,12 +1133,9 @@ class Handler(BaseHTTPRequestHandler):
                     _block_channel_on_429(err_body, up["name"], self._req_id)
                     log.info("[#%d]     [429] after block: %s", self._req_id,
                              {k: datetime.fromtimestamp(v).strftime("%H:%M") for k, v in _channel_blocked_until.items() if v > time.time()})
-                # 502/500 可能是上下文超限，返回标准错误触发客户端压缩
+                # 502/500 可能是上下文超限 → 统一入口检测+返400触发客户端压缩重试（缺口1）
                 if e.code in (500, 502) and body and (is_responses or is_messages):
-                    max_ctx = up.get("max_context_tokens", 200000)
-                    est_tokens = _est_tokens(body)  # 剔除 base64 图片，避免虚高
-                    if est_tokens > max_ctx * 0.9:
-                        self._send_context_exceeded(body, up)
+                    if self._send_context_exceeded(body, up):
                         return
                 continue  # 尝试下一个上游（不截断重试）
             except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as e:
@@ -1129,7 +1178,7 @@ class Handler(BaseHTTPRequestHandler):
             log.warning("[#%d]     <<< %s STREAM interrupted", self._req_id, upstream_name)
 
     # ── Messages API 流式处理（缓冲 + 空输出检测 + usage）──
-    def _messages_stream(self, resp, upstream_name):
+    def _messages_stream(self, resp, upstream_name, est_input=0):
         """增量流式转发 Messages API SSE（边收边发，避免客户端超时）。
         遇 error 块就地合成正常结束。返回 (has_output, usage_dict, context_exceeded, stream_error)"""
         has_output = False
@@ -1142,6 +1191,15 @@ class Handler(BaseHTTPRequestHandler):
         total_bytes = 0
         block_count = 0
         size = 0
+        # keepalive：GLM-5.2 思考期(十几~几十秒)上游不吐数据，发 200 头后若静默，
+        # 客户端 idle 超时会断开 → STREAM interrupted。后台线程定期发 SSE 注释(: keepalive)保活。
+        # wlock 串行化所有写，避免 keepalive 与转发循环交错损坏 SSE 流。
+        wlock = threading.Lock()
+        stop_ka = threading.Event()
+        def _write(data):
+            with wlock:
+                self.wfile.write(data); self.wfile.flush()
+        kat = None
         try:
             # 立即发送响应头，开始增量流式（避免客户端长时间等数据超时断开）
             self.send_response(200)
@@ -1152,6 +1210,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             self.close_connection = True
+            def _keepalive():
+                while not stop_ka.wait(3):
+                    try:
+                        _write(b": keepalive\n\n")
+                    except Exception:
+                        break
+            kat = threading.Thread(target=_keepalive, daemon=True)
+            kat.start()
             buf = b""
             while True:
                 chunk = resp.read(4096)
@@ -1238,9 +1304,12 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception:
                         pass
 
+                    # 修正非标准上游 usage.input_tokens（见 _patch_msg_usage），让客户端拿到真实输入 token 数
+                    if est_input:
+                        block = _patch_msg_usage(block, est_input)
                     # 增量转发该块
                     out = block + b"\n\n"
-                    self.wfile.write(out); self.wfile.flush()
+                    _write(out)
                     size += len(out)
                     if b"content_block_delta" in block:
                         has_output = True
@@ -1276,9 +1345,8 @@ class Handler(BaseHTTPRequestHandler):
                 log.warning("[#%d] [messages] %s upstream incomplete (no message_stop), synthesizing close (open=%d, err=%s, %dKB)",
                             self._req_id, upstream_name, len(open_indices), stream_error, total_bytes // 1024)
                 for idx in open_indices:
-                    self.wfile.write(("event: content_block_stop\ndata: {\"type\": \"content_block_stop\", \"index\": " + str(idx) + "}\n\n").encode())
-                self.wfile.write(b'event: message_delta\ndata: {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 0}}\n\nevent: message_stop\ndata: {"type": "message_stop"}\n\n')
-                self.wfile.flush()
+                    _write(("event: content_block_stop\ndata: {\"type\": \"content_block_stop\", \"index\": " + str(idx) + "}\n\n").encode())
+                _write(b'event: message_delta\ndata: {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 0}}\n\nevent: message_stop\ndata: {"type": "message_stop"}\n\n')
             size_str = (str(size // 1024) + "KB") if size >= 1024 else (str(size) + "B")
             if last_usage:
                 log.info("[#%d]     <<< %s STREAM OK (%s, %dms) usage: input=%d output=%d total=%d",
@@ -1295,12 +1363,13 @@ class Handler(BaseHTTPRequestHandler):
                       self._req_id, upstream_name, e)
             try:
                 for idx in open_indices:
-                    self.wfile.write(("event: content_block_stop\ndata: {\"type\": \"content_block_stop\", \"index\": " + str(idx) + "}\n\n").encode())
+                    _write(("event: content_block_stop\ndata: {\"type\": \"content_block_stop\", \"index\": " + str(idx) + "}\n\n").encode())
                 if not saw_message_stop:
-                    self.wfile.write(b'event: message_delta\ndata: {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 0}}\n\nevent: message_stop\ndata: {"type": "message_stop"}\n\n')
-                self.wfile.flush()
+                    _write(b'event: message_delta\ndata: {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 0}}\n\nevent: message_stop\ndata: {"type": "message_stop"}\n\n')
             except Exception:
                 pass
+        finally:
+            stop_ka.set()  # 停 keepalive 线程
 
         return has_output, last_usage, context_exceeded, stream_error
 
@@ -1830,9 +1899,15 @@ class Handler(BaseHTTPRequestHandler):
                 log.warning("client disconnected before error response")
 
     def _send_context_exceeded(self, body, up):
-        """上下文超限时返回 400 invalid_request_error，触发客户端自动压缩。"""
+        """统一的「上下文超限即 400」入口：检测(est>max_ctx*0.9) + 发送合一。
+
+        供缺口1(500/502) 与 缺口3(流式 context_exceeded) 复用。只在上游「确实处理不了」时
+        才拦截返 400 触发客户端压缩重试——不做飞行前预判拦截（用户要求：先让请求发出去试）。
+        返回 True=已发400(调用方应return)；False=未超限不拦截(调用方继续回退下一个上游)。"""
         max_ctx = up.get("max_context_tokens", 200000)
         est_tokens = _est_tokens(body)  # 剔除 base64 图片，避免虚高
+        if est_tokens <= max_ctx * 0.9:
+            return False
         log.warning("[#%d]     !!! context overflow (~%dK > %dK), returning 400 to client",
                      getattr(self, '_req_id', 0), int(est_tokens // 1000), max_ctx // 1000)
         err_resp = json.dumps({
@@ -1843,6 +1918,7 @@ class Handler(BaseHTTPRequestHandler):
             }
         }).encode()
         self._send_raw(400, err_resp, "application/json")
+        return True
 
     def _save_debug(self, body):
         ts = time.strftime("%Y%m%d_%H%M%S")
@@ -1881,7 +1957,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.49 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.54 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
