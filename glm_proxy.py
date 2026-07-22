@@ -739,17 +739,14 @@ def _est_tokens(body):
 
 
 def _patch_msg_usage(block_bytes, est_input):
-    """修正非标准上游（如智谱 BigModel 的 anthropic 端点）流式 usage 的 input_tokens。
+    """修正 BigModel 的 message_start.usage.input_tokens=0（真实值在 message_delta）。
 
-    BigModel 把真实 input_tokens 放在 message_delta.usage，而 message_start.usage.input_tokens=0。
-    但 Anthropic SDK（Claude Code）只认 message_start 的 input_tokens（并把 message_delta.usage
-    合并/覆盖到快照）→ 客户端每轮看到的 input_tokens 恒为 0 或极小 → 上下文计数永远很低 →
-    不触发自动压缩 → 长会话最终撞上限、模型吐空（见 #62）。
-
-    用请求体估算的真实输入 token（_est_tokens）同时覆盖 message_start 与 message_delta 的
-    input_tokens：无论 SDK 是「只取 message_start」还是「用 message_delta 覆盖」，客户端都能
-    拿到接近真实的输入 token 数，从而在接近窗口时及时压缩。output_tokens 不动（BigModel 这个值是对的）。"""
-    if not est_input or (b'"message_start"' not in block_bytes and b'"message_delta"' not in block_bytes):
+    **只覆盖 message_start**（用 est_input 作为兜底）；**不覆盖 message_delta**（保留 BigModel 的
+    真实 token 计数——比估算更准确，中文内容 est_input 会低估约 14%）。这样：
+    - SDK 只读 message_start → 看到 est_input（近似，非 0）✓
+    - SDK 合并 delta→start → 看到 BigModel 的**真实** input_tokens（最准）✓
+    客户端拿到准确的上下文大小 → 在接近窗口时主动压缩 → 不再超限。"""
+    if not est_input or b'"message_start"' not in block_bytes:
         return block_bytes
     try:
         lines = block_bytes.decode("utf-8", errors="replace").split("\n")
@@ -761,17 +758,12 @@ def _patch_msg_usage(block_bytes, est_input):
                 p = json.loads(line[6:])
             except Exception:
                 continue
-            t = p.get("type")
-            if t == "message_delta":
-                u = p.get("usage")
-            elif t == "message_start":
+            if p.get("type") == "message_start":
                 u = (p.get("message") or {}).get("usage")
-            else:
-                continue
-            if isinstance(u, dict):
-                u["input_tokens"] = int(est_input)
-                lines[i] = "data: " + json.dumps(p, ensure_ascii=False)
-                changed = True
+                if isinstance(u, dict):
+                    u["input_tokens"] = int(est_input)
+                    lines[i] = "data: " + json.dumps(p, ensure_ascii=False)
+                    changed = True
         return "\n".join(lines).encode("utf-8") if changed else block_bytes
     except Exception:
         return block_bytes
