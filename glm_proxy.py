@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.46 — codex-relay + Python 路由层
+GLM API 代理 v2.9.47 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -8,7 +8,7 @@ GLM API 代理 v2.9.46 — codex-relay + Python 路由层
 
 功能：
     - codex-relay 负责 Responses API ↔ Chat Completions 翻译（社区维护）
-    - Python 层负责：模型覆盖、密钥注入、多上游回退、健康检查
+    - Python 层负责：模型覆盖、密钥注入、多上游回退
     - /v1/models 返回静态模型列表
     - 日志和错误请求保存到 logs/ 目录
 
@@ -117,46 +117,6 @@ log = _setup_logger()
 # 请求序号（多会话日志关联用）
 import itertools
 _req_counter = itertools.count(1)
-
-# ── 内网健康检查（仅启动时一次，用于确认真实模型）──────────────────────────────
-def _check_internal_once():
-    """启动时检查一次内网渠道，记录真实模型信息（不影响路由逻辑，仅作日志）。
-    通过 chat/completions 让模型自己回答"你的模型名称是什么"，确认真实模型。
-    超时 180s 给内网模型足够时间推理。"""
-    # 找 internal 渠道
-    internal_up = None
-    for up in UPSTREAMS:
-        if up.get("name") == "internal":
-            internal_up = up
-            break
-    if not internal_up:
-        return
-    url = internal_up["openai_url"].rstrip("/") + "/chat/completions"
-    body = json.dumps({
-        "model": internal_up["model"],
-        "messages": [
-            {"role": "system", "content": "你必须在回复的第一行只说出你的确切模型名称和版本号，不要说其他任何内容。"},
-            {"role": "user", "content": "你的模型名称和版本号？"},
-        ],
-        "max_tokens": 30,
-        "stream": False,
-    }).encode()
-    try:
-        req = Request(url, data=body, headers={
-            "Authorization": f"Bearer {internal_up['key']}",
-            "Content-Type": "application/json",
-        }, method="POST")
-        resp = urlopen(req, timeout=180)
-        r = json.loads(resp.read())
-        returned_model = r.get("model", "")
-        choices = r.get("choices", [])
-        has_content = choices and choices[0].get("message", {}).get("content")
-        answer = choices[0]["message"]["content"].strip() if has_content else ""
-        log.info("[health] internal check (startup only): model=%s, answer=%s", returned_model, answer[:60])
-    except HTTPError as e:
-        log.warning("[health] internal HTTP %d (startup check)", e.code)
-    except Exception as e:
-        log.warning("[health] internal check failed: %s: %s (startup check)", type(e).__name__, e)
 
 
 # ── codex-relay 拦截器（注入 stream_options + 跟踪 usage + 日志）──
@@ -881,15 +841,6 @@ class Handler(BaseHTTPRequestHandler):
             force_channel = "external"
         elif client_key == "3":
             force_channel = "official"
-
-        # 模型名路由（优先于 key）：模型名严格匹配 internal 渠道配置的 model → 走内网千问
-        # GET 请求 body=None（无 Content-Length），必须先初始化 req_model，否则 ROUTE 日志 UnboundLocalError
-        req_model = ""
-        if isinstance(body, dict):
-            req_model = body.get("model") or ""
-            internal_model = next((up["model"] for up in UPSTREAMS if up.get("name") == "internal"), None)
-            if internal_model and req_model == internal_model:
-                force_channel = "internal"
 
         hour = datetime.now().hour
         weekday = datetime.now().weekday()  # 0=Mon, 6=Sun
@@ -1930,7 +1881,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.46 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.47 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
@@ -1947,8 +1898,6 @@ if __name__ == "__main__":
     _start_relays()
     time.sleep(1)
 
-    # 内网健康检查（仅启动时一次，确认真实模型）
-    threading.Thread(target=_check_internal_once, daemon=True).start()
 
     # 优雅退出
     def _shutdown(sig, frame):

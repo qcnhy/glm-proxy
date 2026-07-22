@@ -27,6 +27,19 @@
       "worktime_only": true
     },
     {
+      "_comment": "Venus DeepSeek (fallback mid priority)",
+      "name": "venus-deepseek",
+      "openai_url": "https://aigateway.venusgroup.com.cn/ai/deepseek/openai/v1",
+      "anthropic_url": "https://aigateway.venusgroup.com.cn/ai/deepseek/anthropic/v1/messages",
+      "anthropic_auth": "bearer",
+      "key": "YOUR_INTERNAL_KEY",
+      "relay_port": 4444,
+      "interceptor_port": 14444,
+      "model": "deepseek-v4-pro",
+      "messages_model": "deepseek-v4-pro",
+      "max_context_tokens": 128000
+    },
+    {
       "_comment": "智谱官方：原生两端点，一个 key 通吃。openai_url 用 coding 路径。",
       "name": "official",
       "openai_url": "https://open.bigmodel.cn/api/coding/paas/v4",
@@ -38,19 +51,6 @@
       "model": "glm-5.2",
       "messages_model": "glm-5.2",
       "max_context_tokens": 1000000
-    },
-    {
-      "_comment": "内网网关（兜底）：阿里云 GLM 中转，需 VPN。require_health 健康检查不过则跳过。放在最后，仅当其他渠道都失败时使用。",
-      "name": "internal",
-      "openai_url": "https://your-internal-gateway/aliyun/openai/v1",
-      "anthropic_url": "https://your-internal-gateway/aliyun/anthropic/v1/messages",
-      "anthropic_auth": "bearer",
-      "key": "YOUR_INTERNAL_KEY",
-      "relay_port": 4444,
-      "interceptor_port": 14444,
-      "model": "glm-5.2",
-      "max_context_tokens": 1000000,
-      "require_health": true
     }
   ]
 }
