@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.65 — codex-relay + Python 路由层
+GLM API 代理 v2.9.66 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -955,6 +955,9 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             if needs_messages and "anthropic_url" not in up:
                 continue
+            # 通用 OpenAI 路径（/v1/chat/completions 等）：必须有 openai_url
+            if not is_responses and not is_messages and "openai_url" not in up:
+                continue
 
             # 构建目标 URL 和请求头（每个上游只需一次）
             is_responses_converted = False
@@ -995,6 +998,9 @@ class Handler(BaseHTTPRequestHandler):
                     **auth_header,
                 }
             else:
+                # 通用 OpenAI 路径（/v1/chat/completions 等）
+                if "openai_url" not in up:
+                    continue
                 api_path = self.path
                 if api_path.startswith("/v1/"):
                     api_path = api_path[3:]
@@ -2084,7 +2090,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.65 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.66 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
