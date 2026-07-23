@@ -12,8 +12,7 @@
       "relay_port": 4445,
       "interceptor_port": 14445,
       "model": "glm-5.2",
-      "max_context_tokens": 1000000,
-      "worktime_only": true
+      "max_context_tokens": 1000000
     },
     {
       "_comment": "中转站 Messages 端点：用 Claude key（与 OpenAI key 不同），仅工作时间。无需 relay（Messages 直连）。",
@@ -23,8 +22,7 @@
       "key": "YOUR_CLAUDE_KEY",
       "model": "glm-5.2",
       "messages_model": "glm-5.2",
-      "max_context_tokens": 1000000,
-      "worktime_only": true
+      "max_context_tokens": 1000000
     },
     {
       "_comment": "智谱官方：原生两端点，一个 key 通吃。openai_url 用 coding 路径。",

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.64 — codex-relay + Python 路由层
+GLM API 代理 v2.9.65 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -892,7 +892,7 @@ class Handler(BaseHTTPRequestHandler):
 
         # 客户端 Authorization key 路由：
         # - 纯数字 key=N → 强制走 config.upstreams 第 N 个渠道（1-based，动态，不写死渠道名）
-        # - 其他 key → 默认按配置顺序回退；并受 worktime_only / 429 封锁影响
+        # - 其他 key → 默认按配置顺序回退；并受模型钉选 / 429 封锁影响
         client_key = self.headers.get("Authorization", "").replace("Bearer ", "").strip()
         force_upstream = None  # 强制渠道 name；None 表示默认回退链
         if client_key.isdigit():
@@ -905,17 +905,14 @@ class Handler(BaseHTTPRequestHandler):
 
         # GET/无 body 时也要初始化，避免 ROUTE 日志 NameError
         req_model = ""
+        # 模型名钉选：客户端指定的 model 若在 config 里有匹配 → 只按顺序走匹配的渠道，不回退到其他模型
+        model_pinned = False  # True=只走 model 匹配的渠道
         if isinstance(body, dict):
             req_model = body.get("model") or ""
-            # 模型名严格匹配 internal 渠道 model 时强制 internal（数字 key 之外的便捷路由）
-            if not force_upstream:
-                internal_model = next((up.get("model") for up in UPSTREAMS if up.get("name") == "internal"), None)
-                if internal_model and req_model == internal_model:
-                    force_upstream = "internal"
-
-        hour = datetime.now().hour
-        weekday = datetime.now().weekday()  # 0=Mon, 6=Sun
-        is_worktime = weekday < 5 and 9 <= hour < 18  # 工作日 9:00-18:00
+            if req_model and not force_upstream:
+                # 检查是否有任何渠道的 model == req_model
+                if any(up.get("model") == req_model or up.get("messages_model") == req_model for up in UPSTREAMS):
+                    model_pinned = True
 
         # 检测图片：有图片强制走 Messages（Completions 不支持图片，Messages 支持）
         has_images = is_responses and isinstance(body, dict) and _request_has_images(body)
@@ -927,9 +924,9 @@ class Handler(BaseHTTPRequestHandler):
         blocked_active = {k: datetime.fromtimestamp(v).strftime("%H:%M") for k, v in _channel_blocked_until.items() if v > time.time()}
         # 动态 key 映射预览：1=第一渠道...
         key_map = {str(i + 1): up["name"] for i, up in enumerate(UPSTREAMS)}
-        log.info("[#%d] ROUTE: key=%s model=%s force=%s worktime=%s blocked=%s needs_comp=%s needs_msg=%s path=%s key_map=%s",
+        log.info("[#%d] ROUTE: key=%s model=%s force=%s pinned=%s blocked=%s needs_comp=%s needs_msg=%s path=%s key_map=%s",
                  self._req_id, client_key[:20] or "(empty)", req_model or "?",
-                 force_upstream, is_worktime, blocked_active or "{}",
+                 force_upstream, model_pinned, blocked_active or "{}",
                  needs_completions, needs_messages, self.path, key_map)
         if has_images:
             log.info("    [image] 含图片 → 走 Messages 路径")
@@ -937,13 +934,15 @@ class Handler(BaseHTTPRequestHandler):
         for up in UPSTREAMS:
             if up.get("disabled"):
                 continue
-            # 数字 key 强制：只走对应渠道（跳过 worktime / 封锁限制）
+            # 数字 key 强制：只走对应渠道
             if force_upstream:
                 if up["name"] != force_upstream:
                     continue
             else:
-                if up.get("worktime_only") and not is_worktime:
-                    continue
+                # 模型名钉选：只走 model 匹配的渠道，跳过不匹配的
+                if model_pinned:
+                    if req_model != up.get("model") and req_model != up.get("messages_model"):
+                        continue
                 # 渠道封锁检查：429 限额封锁期内跳过 external 和 official
                 block_key = "external" if up["name"].startswith("external") else up["name"]
                 if _channel_blocked_until.get(block_key, 0) > time.time():
@@ -2085,7 +2084,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.64 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.65 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
