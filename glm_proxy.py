@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.66 — codex-relay + Python 路由层
+GLM API 代理 v2.9.67 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -738,15 +738,15 @@ def _est_tokens(body):
     return len(s.encode()) / 3.5 + n_images * 1500
 
 
-def _patch_msg_usage(block_bytes, est_input):
-    """修正 BigModel 的 message_start.usage.input_tokens=0（真实值在 message_delta）。
+def _patch_msg_usage(block_bytes, est_input=0, model=None):
+    """修正 message_start：① usage.input_tokens 兜底（BigModel 真值在 message_delta）② model 改回客户端模型名。
 
-    **只覆盖 message_start**（用 est_input 作为兜底）；**不覆盖 message_delta**（保留 BigModel 的
-    真实 token 计数——比估算更准确，中文内容 est_input 会低估约 14%）。这样：
-    - SDK 只读 message_start → 看到 est_input（近似，非 0）✓
-    - SDK 合并 delta→start → 看到 BigModel 的**真实** input_tokens（最准）✓
-    客户端拿到准确的上下文大小 → 在接近窗口时主动压缩 → 不再超限。"""
-    if not est_input or b'"message_start"' not in block_bytes:
+    ① 只覆盖 message_start.usage.input_tokens（est_input 兜底）；不覆盖 message_delta（保留 BigModel 真实计数）。
+    ② 上游响应 message_start.model 通常是上游模型名（glm-5.2 / grok-4.5-build-free 等），原样转发会污染
+       客户端会话存档 → 恢复会话报"模型无法识别"并回退默认模型。改成客户端发来的 model 即可让代理透明。"""
+    if b'"message_start"' not in block_bytes:
+        return block_bytes
+    if not est_input and not model:
         return block_bytes
     try:
         lines = block_bytes.decode("utf-8", errors="replace").split("\n")
@@ -759,11 +759,17 @@ def _patch_msg_usage(block_bytes, est_input):
             except Exception:
                 continue
             if p.get("type") == "message_start":
-                u = (p.get("message") or {}).get("usage")
-                if isinstance(u, dict):
-                    u["input_tokens"] = int(est_input)
-                    lines[i] = "data: " + json.dumps(p, ensure_ascii=False)
-                    changed = True
+                msg = p.get("message")
+                if not isinstance(msg, dict):
+                    continue
+                if est_input:
+                    u = msg.get("usage")
+                    if isinstance(u, dict):
+                        u["input_tokens"] = int(est_input)
+                if model:
+                    msg["model"] = model
+                lines[i] = "data: " + json.dumps(p, ensure_ascii=False)
+                changed = True
         return "\n".join(lines).encode("utf-8") if changed else block_bytes
     except Exception:
         return block_bytes
@@ -1075,7 +1081,7 @@ class Handler(BaseHTTPRequestHandler):
                         # 流式（probe-before-commit）：延迟提交 200，握住到首条内容才 flush；
                         # 上游实际返回超限(含 200 流式超限信号) → 返干净 400 触发客户端 auto-compact（不做 est 预判）。
                         # est_input 仅用于上报 input_tokens 让客户端看到真实上下文。
-                        self._messages_stream(resp, up, up_headers, body, _est_tokens(body))
+                        self._messages_stream(resp, up, up_headers, body, _est_tokens(body), req_model)
                         return
                     else:
                         self._pipe_stream(resp, up["name"])
@@ -1202,7 +1208,7 @@ class Handler(BaseHTTPRequestHandler):
         except (ConnectionResetError, BrokenPipeError):
             log.warning("[#%d]     <<< %s STREAM interrupted", self._req_id, upstream_name)
 
-    def _messages_stream(self, first_resp, up, up_headers, body, est_input=0):
+    def _messages_stream(self, first_resp, up, up_headers, body, est_input=0, orig_model=""):
         """Messages 流式（probe-before-commit，靠上游实际响应驱动超限检测，不用 est 预判）。
         **延迟提交 200**：先握住上游块不发响应头，直到看见首条内容(content_block_delta)：
           - 见内容 → 提交 200 + flush 已握住的块 + 继续正常增量流式（keepalive 随之启动）；
@@ -1325,8 +1331,8 @@ class Handler(BaseHTTPRequestHandler):
                             except Exception:
                                 pass
 
-                            if est_input:
-                                block = _patch_msg_usage(block, est_input)
+                            if est_input or orig_model:
+                                block = _patch_msg_usage(block, est_input, orig_model)
                             out = block + b"\n\n"
 
                             # === 探测：未 flush 前握住，见首条内容才 flush ===
@@ -2090,7 +2096,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.66 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.67 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
