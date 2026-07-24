@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.67 — codex-relay + Python 路由层
+GLM API 代理 v2.9.68 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -74,6 +74,9 @@ _cfg = _load_config()
 
 LISTEN = ("0.0.0.0", 9999)
 REQUEST_TIMEOUT = 300
+# 部分 upstream 套 Cloudflare bot 防护（如 hybgzs），Python-urllib 默认 UA 会被 1010 拦截。
+# 统一伪装浏览器 UA，对其他 upstream 无副作用。
+_UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 
 # Responses API 路由路径（config.json 的 responses_use_completions 控制）：
@@ -178,6 +181,7 @@ class InterceptorHandler(BaseHTTPRequestHandler):
         headers = {
             "Content-Type": self.headers.get("Content-Type", "application/json"),
             "Authorization": f"Bearer {up['key']}",
+            "User-Agent": _UPSTREAM_UA,  # 防 Cloudflare 1010
         }
         try:
             req = Request(url, data=body, headers=headers, method="POST")
@@ -255,6 +259,7 @@ class InterceptorHandler(BaseHTTPRequestHandler):
             req = Request(url, headers={
                 "Authorization": f"Bearer {up['key']}",
                 "Connection": "close",
+                "User-Agent": _UPSTREAM_UA,  # 防 Cloudflare 1010
             }, method="GET")
             resp = urlopen(req, timeout=30)
             result = resp.read()
@@ -1034,7 +1039,9 @@ class Handler(BaseHTTPRequestHandler):
             # 生成 payload（每个 upstream 只尝试一次，不截断重试——客户端会自动压缩）
             payload = None
             if body is not None:
-                body["model"] = up["model"]
+                # Messages 路径走 Anthropic 端点，用 messages_model（如 grok-4.5-claude）；
+                # relay/通用 OpenAI 路径用 model（OpenAI 名）。converted 路径下方再覆盖。
+                body["model"] = up.get("messages_model", up["model"]) if is_messages else up["model"]
                 if is_responses and body.get("previous_response_id"):
                     pid_len = len(json.dumps(body, ensure_ascii=False))
                     if pid_len > 200000:
@@ -1055,6 +1062,7 @@ class Handler(BaseHTTPRequestHandler):
                     payload = json.dumps(body).encode()
                 if "Content-Type" not in up_headers and payload is not None:
                     up_headers["Content-Type"] = "application/json"
+            up_headers["User-Agent"] = _UPSTREAM_UA  # 防 Cloudflare 1010
 
             log.info("[#%d]     -> %s", self._req_id, up["name"])
 
@@ -2096,7 +2104,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.67 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.68 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
