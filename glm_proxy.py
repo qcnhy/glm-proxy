@@ -1048,6 +1048,12 @@ class Handler(BaseHTTPRequestHandler):
                         log.warning("    payload %dKB, stripping previous_response_id", pid_len // 1024)
                         del body["previous_response_id"]
                 _inject_apply_patch_rules(body)  # 统一注入（relay + converted 都覆盖）
+                # venus-deepseek 等 anthropic 端点不认得 custom 类型的 tool（如 apply_patch/web_search）
+                # → 转发前剔掉（只认 web_search_20250305/web_search_20260209）
+                _tools_bak = None
+                if up.get("strip_custom_tools") and isinstance(body.get("tools"), list):
+                    _tools_bak = body["tools"]
+                    body["tools"] = [t for t in _tools_bak if t.get("type") != "custom"]
                 if is_responses_converted:
                     converted = _convert_responses_to_messages(body)
                     converted["model"] = up.get("messages_model", up["model"])
@@ -1062,6 +1068,8 @@ class Handler(BaseHTTPRequestHandler):
                     payload = json.dumps(body).encode()
                 if "Content-Type" not in up_headers and payload is not None:
                     up_headers["Content-Type"] = "application/json"
+                if _tools_bak is not None:
+                    body["tools"] = _tools_bak  # 恢复 tools（回退下一上游时原样）
             up_headers["User-Agent"] = _UPSTREAM_UA  # 防 Cloudflare 1010
 
             log.info("[#%d]     -> %s", self._req_id, up["name"])
