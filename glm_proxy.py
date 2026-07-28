@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.68 — codex-relay + Python 路由层
+GLM API 代理 v2.9.69 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -1953,6 +1953,9 @@ class Handler(BaseHTTPRequestHandler):
                             u = held_completed.setdefault("response", {}).setdefault("usage", {})
                             u["input_tokens"] = int(est_input)
                             u["total_tokens"] = int(est_input) + int(u.get("output_tokens", 0) or 0)
+                            # 同步到 last_usage（日志用——否则 last_usage 是上游原始值=0）
+                            last_usage["input_tokens"] = int(est_input)
+                            last_usage["total_tokens"] = int(est_input) + int(last_usage.get("output_tokens", 0) or 0)
                         except Exception:
                             pass
                     _emit(held_completed)
@@ -2112,7 +2115,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.68 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.69 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
