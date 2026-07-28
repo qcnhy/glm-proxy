@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.69 — codex-relay + Python 路由层
+GLM API 代理 v2.9.79 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -638,7 +638,10 @@ def _convert_responses_to_messages(body):
         result["system"] = "\n\n".join(system_parts)
     result["messages"] = messages
 
-    # 转换 tools
+    # 转换 tools → Anthropic Messages 标准格式（name + description + input_schema，**不带 type**）
+    # 关键：绝不能加 "type":"custom"——venus-deepseek 等 anthropic 端点会报 unknown variant 'custom'，
+    # 且若为此 strip 掉工具，模型在缺工具定义时会用原生 DSML 格式输出伪 tool_call 污染正文。
+    # 标准 tool 格式（无 type）所有 anthropic 兼容端点通用，实测 venus deepseek-v4-pro 正常 tool_use。
     tools_out = []
     for tool in body.get("tools", []):
         if not isinstance(tool, dict):
@@ -647,11 +650,11 @@ def _convert_responses_to_messages(body):
         if t == "function":
             fn_name = tool.get("name", "")
             if fn_name == "apply_patch":
-                # apply_patch：保留 description（含规则注入），转 custom 格式
+                # apply_patch：保留 description（含规则注入），patch 包成 object
                 desc = tool.get("description", "")
                 tools_out.append({
-                    "type": "custom",
                     "name": fn_name,
+                    "description": desc,
                     "input_schema": {
                         "type": "object",
                         "properties": {
@@ -661,36 +664,45 @@ def _convert_responses_to_messages(body):
                     },
                 })
             else:
-                tools_out.append({
-                    "type": "custom",
+                t_out = {
                     "name": fn_name,
                     "input_schema": tool.get("parameters", tool.get("input_schema", {})),
-                })
+                }
+                if tool.get("description"):
+                    t_out["description"] = tool["description"]
+                tools_out.append(t_out)
         elif t == "custom":
-            # apply_patch 等 custom/grammar 工具 → 转 function 让 GLM 能调用（规则已在上方统一注入）
+            # apply_patch 等 custom/grammar 工具 → 标准 tool 格式（规则已在上方统一注入）
             desc = tool.get("description", "")
             tools_out.append({
-                "type": "custom",
                 "name": tool.get("name", ""),
+                "description": desc,
                 "input_schema": {
                     "type": "object",
                     "properties": {
-                        "patch": {"type": "string",
-                                  "description": desc},
+                        "patch": {"type": "string", "description": desc},
                     },
                     "required": ["patch"],
                 },
             })
         elif t == "namespace":
-            # 展平 namespace 子工具
+            # 展平 namespace 子工具。连接符用 '-'（非 '.'）：
+            # ① OpenAI function name 校验 ^[a-zA-Z0-9_-]+$ 不允许点号（venus/deepseek 会 400）；
+            # ② Codex 调用 namespace 子工具的 name 实测为 "{ns}-{sub}"（如 codex_app-read_thread_terminal）。
             ns_name = tool.get("name", "")
             for sub in tool.get("tools", []):
                 sub_name = sub.get("name", "")
-                tools_out.append({
-                    "type": "custom",
-                    "name": f"{ns_name}.{sub_name}" if ns_name else sub_name,
+                t_out = {
+                    "name": f"{ns_name}-{sub_name}" if ns_name else sub_name,
                     "input_schema": sub.get("parameters", sub.get("input_schema", {})),
-                })
+                }
+                if sub.get("description"):
+                    t_out["description"] = sub["description"]
+                tools_out.append(t_out)
+        elif t.startswith("web_search_"):
+            # DeepSeek 原生支持 web_search_20250305 / web_search_20260209，直通（保留其 type）
+            tools_out.append(tool)
+        # 其他未知类型（如 tool_search）跳过，不发往不支持的上游
     if tools_out:
         result["tools"] = tools_out
 
@@ -776,6 +788,25 @@ def _patch_msg_usage(block_bytes, est_input=0, model=None):
                 lines[i] = "data: " + json.dumps(p, ensure_ascii=False)
                 changed = True
         return "\n".join(lines).encode("utf-8") if changed else block_bytes
+    except Exception:
+        return block_bytes
+
+
+def _normalize_sse_block(block_bytes):
+    """规范化上游 SSE：兼容千问等网关 "event:foo"/"data:foo"(冒号后无空格) → 标准 "event: foo"/"data: foo"。
+
+    标准允许冒号后空格可选，但 ① 本代理多处解析用 startswith("event: ")/("data: ") 硬要求空格
+    （含 _patch_msg_usage / _process_sse_block / messages 探测逻辑）；② 客户端(Claude Code)的 SSE
+    解析器对无空格格式不一定兼容。故在 messages 路径分块后统一规范化一次：下游所有解析与转发给
+    客户端的字节都用标准格式。converted 路径重建式输出、relay 路径读 codex-relay 重建输出，均不受影响。"""
+    try:
+        lines = block_bytes.split(b"\n")
+        for i, ln in enumerate(lines):
+            if ln.startswith(b"event:") and not ln.startswith(b"event: "):
+                lines[i] = b"event: " + ln[6:].lstrip(b" ")
+            elif ln.startswith(b"data:") and not ln.startswith(b"data: "):
+                lines[i] = b"data: " + ln[5:].lstrip(b" ")
+        return b"\n".join(lines)
     except Exception:
         return block_bytes
 
@@ -1048,12 +1079,18 @@ class Handler(BaseHTTPRequestHandler):
                         log.warning("    payload %dKB, stripping previous_response_id", pid_len // 1024)
                         del body["previous_response_id"]
                 _inject_apply_patch_rules(body)  # 统一注入（relay + converted 都覆盖）
-                # venus-deepseek 等 anthropic 端点不认得 custom 类型的 tool（如 apply_patch/web_search）
-                # → 转发前剔掉（只认 web_search_20250305/web_search_20260209）
+                # converted 路径转换后已是标准 Anthropic tool 格式（无 type），venus 等端点直接接受，无需 strip。
+                # messages 路径防御：若 tools 仍含 "type":"custom"（不应出现）则剔之。
                 _tools_bak = None
-                if up.get("strip_custom_tools") and isinstance(body.get("tools"), list):
-                    _tools_bak = body["tools"]
-                    body["tools"] = [t for t in _tools_bak if t.get("type") != "custom"]
+                if up.get("strip_custom_tools") and not is_responses_converted:
+                    _tools_list = body.get("tools")
+                    if isinstance(_tools_list, list) and _tools_list:
+                        _tools_bak = body["tools"]
+                        _before = len(_tools_bak)
+                        body["tools"] = [t for t in _tools_bak if t.get("type") != "custom"]
+                        if len(body["tools"]) != _before:
+                            log.info("    [strip] %s: %d → %d tools (stripped custom)", up["name"], _before, len(body["tools"]))
+
                 if is_responses_converted:
                     converted = _convert_responses_to_messages(body)
                     converted["model"] = up.get("messages_model", up["model"])
@@ -1295,6 +1332,7 @@ class Handler(BaseHTTPRequestHandler):
                             else:
                                 block, buf = buf.split(b"\n\n", 1)
                             block = block.replace(b"\r\n", b"\n")
+                            block = _normalize_sse_block(block)  # 千问等无空格 SSE → 标准化（解析+转发+patch 全受益）
 
                             is_error_block = b"event: error" in block
                             if is_error_block:
@@ -1708,11 +1746,11 @@ class Handler(BaseHTTPRequestHandler):
                         block = block.replace(b"\r\n", b"\n")
                         et, dj = None, None
                         for line in block.decode("utf-8", errors="replace").split("\n"):
-                            if line.startswith("event: "):
-                                et = line[7:].strip()
-                            elif line.startswith("data: "):
+                            if line.startswith("event:"):
+                                et = line[6:].strip()  # 兼容千问 "event:xxx"(无空格) 与标准 "event: xxx"
+                            elif line.startswith("data:"):
                                 try:
-                                    dj = json.loads(line[6:])
+                                    dj = json.loads(line[5:].strip())
                                 except Exception:
                                     pass
                         if not et or not dj:
@@ -1737,6 +1775,13 @@ class Handler(BaseHTTPRequestHandler):
                     log.warning("[#%d] [converted] %s upstream EOF without message_stop, synthesizing completed",
                                 self._req_id, upstream_name)
                     _emit_created()
+                    # 空收尾(out=0)时从未发 content delta → 未 _commit，held 里的 created/completed
+                    # 缓冲发不出去，客户端会挂死。强制提交 + flush held。
+                    if not committed[0]:
+                        _commit()
+                        for hb in held:
+                            _write(hb)
+                        held.clear()
                     _emit({"sequence_number": nseq(), "type": "response.completed", "response": _resp_obj("completed")})
                     done = True
                 if done:
@@ -2115,7 +2160,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.69 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.79 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
