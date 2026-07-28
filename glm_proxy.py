@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.79 — codex-relay + Python 路由层
+GLM API 代理 v2.9.80 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -74,6 +74,11 @@ _cfg = _load_config()
 
 LISTEN = ("0.0.0.0", 9999)
 REQUEST_TIMEOUT = 300
+# probe-before-commit 兜底：messages/converted 路径上游首内容前 hold 住响应头（便于检测超限改返 400），
+# 但探测期客户端收不到任何字节。超过此秒数仍无首内容（上游首 token 慢/深度推理）→ 强制 commit + keepalive，
+# 防客户端流式空闲超时（"Stream idle timeout - no chunks received"，约 60s）。15s 远小于该阈值，
+# 且超限/空收尾信号通常几秒内返回，足够探测到。
+PROBE_TIMEOUT = 15
 # 部分 upstream 套 Cloudflare bot 防护（如 hybgzs），Python-urllib 默认 UA 会被 1010 拦截。
 # 统一伪装浏览器 UA，对其他 upstream 无副作用。
 _UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -1293,18 +1298,33 @@ class Handler(BaseHTTPRequestHandler):
         def _commit():
             # 延迟提交 200（probe-before-commit）：探测期(到首条内容前)不发响应头，
             # 便于检测到上游"200 流式却超限"时改返干净 400（200 已发就回不去 400）。
-            if committed[0]:
-                return
-            self.send_response(200)
-            for h in ["Content-Type", "Cache-Control"]:
-                v = first_resp.headers.get(h)
-                if v:
-                    self.send_header(h, v)
-            self.send_header("Connection", "close")
-            self.end_headers()
-            self.close_connection = True
-            committed[0] = True
+            with wlock:
+                if committed[0]:
+                    return
+                self.send_response(200)
+                for h in ["Content-Type", "Cache-Control"]:
+                    v = first_resp.headers.get(h)
+                    if v:
+                        self.send_header(h, v)
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.close_connection = True
+                committed[0] = True
             threading.Thread(target=_keepalive, daemon=True).start()
+        def _probe_watchdog():
+            # probe-hold 兜底：超过 PROBE_TIMEOUT 仍无首内容（上游首 token 慢/深度推理）→ 强制 commit
+            # + keepalive，防客户端流式空闲超时("Stream idle timeout - no chunks received")。
+            # stop_ka 在结束/overflow-400 时置位 → 提前退出；否则等满超时检查 committed。
+            if stop_ka.wait(PROBE_TIMEOUT):
+                return
+            if not committed[0]:
+                log.info("[#%d] [messages] %s probe-hold %ds 无首内容，强制提交防 idle timeout",
+                         self._req_id, upstream_name, PROBE_TIMEOUT)
+                try:
+                    _commit()
+                except Exception:
+                    pass
+        threading.Thread(target=_probe_watchdog, daemon=True).start()
 
         resp = first_resp
         last_usage = {}
@@ -1528,6 +1548,19 @@ class Handler(BaseHTTPRequestHandler):
                 self.close_connection = True
                 committed[0] = True
             threading.Thread(target=_keepalive, daemon=True).start()
+        def _probe_watchdog():
+            # probe-hold 兜底：超过 PROBE_TIMEOUT 仍无首内容（上游首 token 慢/深度推理）→ 强制 commit
+            # + keepalive，防客户端流式空闲超时("Stream idle timeout - no chunks received")。
+            if stop_ka.wait(PROBE_TIMEOUT):
+                return
+            if not committed[0]:
+                log.info("[#%d] [converted] %s probe-hold %ds 无首内容，强制提交防 idle timeout",
+                         self._req_id, upstream_name, PROBE_TIMEOUT)
+                try:
+                    _commit()
+                except Exception:
+                    pass
+        threading.Thread(target=_probe_watchdog, daemon=True).start()
         def _emit(ed):
             t = ed.get("type", "")
             _is_content = t.endswith(".delta") and ("output_text" in t or "reasoning_summary_text" in t
@@ -2160,7 +2193,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.79 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.80 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
