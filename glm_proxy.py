@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.80 — codex-relay + Python 路由层
+GLM API 代理 v2.9.81 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -961,6 +961,11 @@ class Handler(BaseHTTPRequestHandler):
                 if any(up.get("model") == req_model or up.get("messages_model") == req_model for up in UPSTREAMS):
                     model_pinned = True
 
+        # 工作时间判定：工作日 9:00-18:00（用于 worktime_only 渠道）
+        hour = datetime.now().hour
+        weekday = datetime.now().weekday()  # 0=Mon, 6=Sun
+        is_worktime = weekday < 5 and 9 <= hour < 18
+
         # 检测图片：有图片强制走 Messages（Completions 不支持图片，Messages 支持）
         has_images = is_responses and isinstance(body, dict) and _request_has_images(body)
         use_completions = RESPONSES_USE_COMPLETIONS and not has_images
@@ -971,9 +976,9 @@ class Handler(BaseHTTPRequestHandler):
         blocked_active = {k: datetime.fromtimestamp(v).strftime("%H:%M") for k, v in _channel_blocked_until.items() if v > time.time()}
         # 动态 key 映射预览：1=第一渠道...
         key_map = {str(i + 1): up["name"] for i, up in enumerate(UPSTREAMS)}
-        log.info("[#%d] ROUTE: key=%s model=%s force=%s pinned=%s blocked=%s needs_comp=%s needs_msg=%s path=%s key_map=%s",
+        log.info("[#%d] ROUTE: key=%s model=%s force=%s pinned=%s worktime=%s blocked=%s needs_comp=%s needs_msg=%s path=%s key_map=%s",
                  self._req_id, client_key[:20] or "(empty)", req_model or "?",
-                 force_upstream, model_pinned, blocked_active or "{}",
+                 force_upstream, model_pinned, is_worktime, blocked_active or "{}",
                  needs_completions, needs_messages, self.path, key_map)
         if has_images:
             log.info("    [image] 含图片 → 走 Messages 路径")
@@ -981,7 +986,7 @@ class Handler(BaseHTTPRequestHandler):
         for up in UPSTREAMS:
             if up.get("disabled"):
                 continue
-            # 数字 key 强制：只走对应渠道
+            # 数字 key 强制：只走对应渠道（跳过 worktime / 封锁限制）
             if force_upstream:
                 if up["name"] != force_upstream:
                     continue
@@ -990,6 +995,9 @@ class Handler(BaseHTTPRequestHandler):
                 if model_pinned:
                     if req_model != up.get("model") and req_model != up.get("messages_model"):
                         continue
+                # 非工作时间：worktime_only 渠道跳过（如 external）
+                if up.get("worktime_only") and not is_worktime:
+                    continue
                 # 渠道封锁检查：429 限额封锁期内跳过 external 和 official
                 block_key = "external" if up["name"].startswith("external") else up["name"]
                 if _channel_blocked_until.get(block_key, 0) > time.time():
@@ -2193,7 +2201,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.80 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.81 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
