@@ -4,3 +4,4 @@ logs/
 debug_req_*.json
 config.json
 .venv/
+proxy.log

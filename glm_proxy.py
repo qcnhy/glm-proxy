@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.81 — codex-relay + Python 路由层
+GLM API 代理 v2.9.84 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -534,27 +534,82 @@ def _append_tool_result(messages, output_item):
     messages.append({"role": "user", "content": [tool_result]})
 
 
-# apply_patch 的 patch 格式规则（GLM 不原生支持 FREEFORM 工具，靠描述教它）
-_APPLY_PATCH_RULES = (
-    "\n\nSTOP! Read this before calling apply_patch:\n"
-    "MANDATORY: You MUST use apply_patch for ALL file operations (create, edit, delete). "
-    "Do NOT use shell commands (echo, cat, sed, node, python, powershell) to write files. "
-    "apply_patch is the ONLY correct way.\n\n"
-    "PATCH FORMAT (the patch field is FREEFORM TEXT, not JSON):\n"
-    "1. EVERY content line in BOTH *** Add File and *** Update File MUST start with:\n"
-    "   - plus (+) = line to add | minus (-) = line to remove | space ( ) = context line\n"
-    "   NEVER write bare text lines without a prefix character!\n"
-    "2. Example - create a new file:\n"
-    "   *** Begin Patch\n*** Add File: hello.txt\n+line one\n+line two\n*** End Patch\n"
-    "3. Use @@ to separate change hunks within Update File.\n"
-    "4. *** Begin Patch / *** End Patch are commands, not content (no prefix).\n"
-    "5. Each file can only be Added ONCE. To modify existing, use *** Update File.\n"
-    "6. Content with --- # @ etc is FINE with +/- prefix. Do NOT avoid any content.\n"
-    "7. Do NOT wrap content in markdown code blocks (```).\n"
+# apply_patch 独立工具规则已移除：Codex 新版不再声明 apply_patch 为独立工具，
+# 改用 exec（JS 编排器）架构，apply_patch 降为 exec 的嵌套工具（tools.apply_patch()）。
+# 教模型用法的规则在下方 _EXEC_FILE_EDIT_RULES（注入到 exec 描述）。
+
+# exec 工具（Codex 新版 JS 编排器）的文件操作规则注入。
+# glm-5.2 等模型常把 exec 的纯 V8 沙箱当 shell/Node 用（require('fs')、PowerShell
+# $var/foreach），导致文件操作必然在沙箱里 THROW。这里强制教它用嵌套
+# tools.apply_patch() 编辑文件、tools.exec_command() 执行命令。
+_EXEC_FILE_EDIT_RULES = (
+    "\n\nSTOP! READ THIS BEFORE WRITING JS — CRITICAL SANDBOX RULES:\n"
+    "This `exec` tool runs PURE V8 JavaScript only. The following DO NOT EXIST here and will THROW:\n"
+    "  - require() / import (NO Node.js). require('fs'), require('child_process') → THROW.\n"
+    "  - Node globals: fs, process, Buffer, __dirname, path → DO NOT EXIST.\n"
+    "  - Shell / PowerShell: `$var`, `foreach`, `cp`, `cat`, `>`, pipes → NOT JS syntax here.\n"
+    "You CANNOT touch the filesystem directly from this sandbox. To do ANYTHING outside pure\n"
+    "computation, call the nested tools on the global `tools` object:\n"
+    "  • Edit / create / delete a file → await tools.apply_patch(\"*** Begin Patch\\n*** Update File: path\\n context\\n-old\\n+new\\n*** End Patch\")\n"
+    "  • Run a shell command          → await tools.exec_command({ cmd: \"ls -la\" })\n"
+    "  • Read a file                  → await tools.exec_command({ cmd: \"cat path\" })\n"
+    "tools.apply_patch takes ONE argument: the RAW PATCH TEXT (a plain string), NOT JSON.\n"
+    "PATCH FORMAT:\n"
+    "1. Every content line under *** Add File / *** Update File MUST start with a prefix char:\n"
+    "   + (add) | - (remove) | space (context). NEVER write a bare line without +, -, or a leading space!\n"
+    "2. Create a file: *** Begin Patch\\n*** Add File: hello.txt\\n+line one\\n+line two\\n*** End Patch\n"
+    "3. *** Begin Patch / *** End Patch are commands (no prefix). *** Update File: <path> for existing files.\n"
+    "4. Do NOT wrap the patch in markdown code blocks (```).\n"
 )
 
-def _inject_apply_patch_rules(body):
-    """给 apply_patch 工具的描述注入格式规则（relay + converted 路径都用）"""
+def _extract_additional_tools(body):
+    """Codex 新版把工具声明放在 input 数组的 additional_tools item
+    （{type:"additional_tools", role:"developer", tools:[...]}），而非顶层 tools。
+    本代理三条路径（relay/converted/messages）和 codex-relay 都只认顶层 tools，
+    不处理 additional_tools → 工具定义全丢 → 模型看不到工具、无法 tool_call、
+    输出一句意图就结束。
+
+    这里在转发前把 additional_tools 的工具提取合并到顶层 body["tools"]（按 name 去重），
+    并从 input 移除该 item（避免被 codex-relay/converted 当 developer 消息污染上下文）。
+    幂等：已提取后再次调用 input 里无 additional_tools，直接 no-op。"""
+    if not isinstance(body, dict):
+        return body
+    inp = body.get("input")
+    if not isinstance(inp, list):
+        return body
+    extra = []
+    kept = []
+    for item in inp:
+        if isinstance(item, dict) and item.get("type") == "additional_tools":
+            ts = item.get("tools")
+            if isinstance(ts, list):
+                extra.extend(t for t in ts if isinstance(t, dict))
+        else:
+            kept.append(item)
+    if extra:
+        body["input"] = kept
+        existing = body.get("tools")
+        if not isinstance(existing, list):
+            existing = []
+        seen = {t.get("name") for t in existing if isinstance(t, dict)}
+        added = []
+        for t in extra:
+            nm = t.get("name")
+            if nm not in seen:
+                existing.append(t)
+                seen.add(nm)
+                added.append("%s:%s" % (t.get("type", "?"), nm))
+        body["tools"] = existing
+        if added:
+            log.info("    [additional_tools] extracted %d → top-level tools: %s",
+                     len(added), ", ".join(added))
+    return body
+
+
+def _inject_tool_rules(body):
+    """注入工具描述规则：Codex 新版 exec（JS 编排器）→ V8 沙箱约束 + tools.apply_patch()/exec_command() 用法。
+    apply_patch 在新版已降为 exec 的嵌套工具（非独立工具），靠 exec 描述教模型调 tools.apply_patch()。
+    relay + converted 路径都覆盖。"""
     if not isinstance(body, dict):
         return body
     tools = body.get("tools") or body.get("input", [])
@@ -565,18 +620,16 @@ def _inject_apply_patch_rules(body):
         if not isinstance(tool, dict):
             continue
         name = tool.get("name", "")
-        ttype = tool.get("type", "")
-        # Responses API 格式: {"type":"function","name":"apply_patch",...}
-        # 或 custom 格式: {"type":"custom","name":"apply_patch",...}
-        if name == "apply_patch" and "description" in tool:
-            if _APPLY_PATCH_RULES.strip() not in (tool.get("description") or ""):
-                tool["description"] = (tool.get("description") or "") + _APPLY_PATCH_RULES
+        # Codex 新版 exec 工具（custom/function/嵌套均匹配）：注入 V8 沙箱约束 +
+        # tools.apply_patch()/exec_command() 用法。glm-5.2 会把 exec 当 shell/Node 用 → 必 THROW
+        if name == "exec" and "description" in tool:
+            if _EXEC_FILE_EDIT_RULES.strip() not in (tool.get("description") or ""):
+                tool["description"] = (tool.get("description") or "") + _EXEC_FILE_EDIT_RULES
                 modified = True
-        # 嵌套格式: {"type":"function","function":{"name":"apply_patch",...}}
         func = tool.get("function")
-        if isinstance(func, dict) and func.get("name") == "apply_patch":
-            if _APPLY_PATCH_RULES.strip() not in (func.get("description") or ""):
-                func["description"] = (func.get("description") or "") + _APPLY_PATCH_RULES
+        if isinstance(func, dict) and func.get("name") == "exec":
+            if _EXEC_FILE_EDIT_RULES.strip() not in (func.get("description") or ""):
+                func["description"] = (func.get("description") or "") + _EXEC_FILE_EDIT_RULES
                 modified = True
     return body
 
@@ -623,14 +676,10 @@ def _convert_responses_to_messages(body):
             elif item_type == "function_call_output":
                 _append_tool_result(messages, item)
             elif item_type == "custom_tool_call":
-                # custom_tool_call → function_call（apply_patch 等）
-                # 关键：input 是 FREEFORM 文本（patch），不是 JSON
-                # 必须包成 {"patch": "..."} 否则 _safe_parse_json 返回 {} 教坏 GLM
+                # custom_tool_call → function_call（exec 等 FREEFORM 工具历史回放）
+                # input 是 FREEFORM 文本（如 exec 的 JS 代码），包成 {"input": "..."} 给 _append_tool_use
                 raw_input = item.get("input", "")
-                if item.get("name") == "apply_patch" and isinstance(raw_input, str):
-                    arguments = json.dumps({"patch": raw_input}, ensure_ascii=False)
-                else:
-                    arguments = raw_input
+                arguments = json.dumps({"input": raw_input}, ensure_ascii=False) if isinstance(raw_input, str) else raw_input
                 _append_tool_use(messages, {**item, "type": "function_call",
                                             "arguments": arguments})
             elif item_type == "custom_tool_call_output":
@@ -654,30 +703,17 @@ def _convert_responses_to_messages(body):
         t = tool.get("type", "")
         if t == "function":
             fn_name = tool.get("name", "")
-            if fn_name == "apply_patch":
-                # apply_patch：保留 description（含规则注入），patch 包成 object
-                desc = tool.get("description", "")
-                tools_out.append({
-                    "name": fn_name,
-                    "description": desc,
-                    "input_schema": {
-                        "type": "object",
-                        "properties": {
-                            "patch": {"type": "string", "description": desc},
-                        },
-                        "required": ["patch"],
-                    },
-                })
-            else:
-                t_out = {
-                    "name": fn_name,
-                    "input_schema": tool.get("parameters", tool.get("input_schema", {})),
-                }
-                if tool.get("description"):
-                    t_out["description"] = tool["description"]
-                tools_out.append(t_out)
+            t_out = {
+                "name": fn_name,
+                "input_schema": tool.get("parameters", tool.get("input_schema", {})),
+            }
+            if tool.get("description"):
+                t_out["description"] = tool["description"]
+            tools_out.append(t_out)
         elif t == "custom":
-            # apply_patch 等 custom/grammar 工具 → 标准 tool 格式（规则已在上方统一注入）
+            # custom/FREEFORM 工具（如 Codex exec JS 编排器）→ 标准 tool 格式
+            # input_schema 用单一 string 字段 "input" 接收 FREEFORM 文本（exec 的 JS 代码等）；
+            # 合成时从 input 字段提取还原为 custom_tool_call（见 _converted_stream_with_retry）
             desc = tool.get("description", "")
             tools_out.append({
                 "name": tool.get("name", ""),
@@ -685,9 +721,9 @@ def _convert_responses_to_messages(body):
                 "input_schema": {
                     "type": "object",
                     "properties": {
-                        "patch": {"type": "string", "description": desc},
+                        "input": {"type": "string", "description": desc},
                     },
-                    "required": ["patch"],
+                    "required": ["input"],
                 },
             })
         elif t == "namespace":
@@ -741,7 +777,7 @@ def _convert_messages_error_to_responses(err_body):
 
 
 
-# ── apply_patch 转换 ──────────────────────────────────
+# ── token 估算 ──────────────────────────────────────
 
 def _est_tokens(body):
     """估算请求 token 数：剔除 base64 图片数据（图片按分辨率约 1-3K token，不按 base64 字节长度算）。
@@ -1091,7 +1127,8 @@ class Handler(BaseHTTPRequestHandler):
                     if pid_len > 200000:
                         log.warning("    payload %dKB, stripping previous_response_id", pid_len // 1024)
                         del body["previous_response_id"]
-                _inject_apply_patch_rules(body)  # 统一注入（relay + converted 都覆盖）
+                _extract_additional_tools(body)  # Codex additional_tools(input 内) → 顶层 tools
+                _inject_tool_rules(body)  # 注入 exec 沙箱规则（relay + converted 都覆盖）
                 # converted 路径转换后已是标准 Anthropic tool 格式（无 type），venus 等端点直接接受，无需 strip。
                 # messages 路径防御：若 tools 仍含 "type":"custom"（不应出现）则剔之。
                 _tools_bak = None
@@ -1131,7 +1168,8 @@ class Handler(BaseHTTPRequestHandler):
                 if is_stream:
                     if is_responses_converted:
                         # Responses→Messages 转换路径：增量流式 + 早期错误退避重试 + 错误转发
-                        cres = self._converted_stream_with_retry(resp, up, url, up_headers, payload, method)
+                        _custom_ff = {t.get("name") for t in body.get("tools", []) if isinstance(t, dict) and t.get("type") == "custom"}
+                        cres = self._converted_stream_with_retry(resp, up, url, up_headers, payload, method, custom_freeform_tools=_custom_ff)
                         if cres.get("done"):
                             return
                         # 真空输出（无错误）→ 尝试下一个上游
@@ -1522,12 +1560,13 @@ class Handler(BaseHTTPRequestHandler):
             stop_ka.set()
 
     # ── Responses→Messages 转换流式处理（旧：整段缓冲，留作兜底）──
-    def _converted_stream_with_retry(self, first_resp, up, url, up_headers, payload, method):
+    def _converted_stream_with_retry(self, first_resp, up, url, up_headers, payload, method, custom_freeform_tools=None):
         """converted 路径（probe-before-commit）：同步翻译 Anthropic→Responses。
         延迟提交 200：首条内容前缓冲，见内容才提交+flush；overflow(超限 stop_reason / 空收尾 / error 体)
         → 返干净 400(as_responses)触发客户端压缩；其他早期错误转发 response.failed。"""
         import threading
         upstream_name = up["name"]
+        custom_ff = custom_freeform_tools or set()  # FREEFORM/custom 工具名集合（如 exec），合成 custom_tool_call 用
         wlock = threading.Lock()
         stop_ka = threading.Event()
         committed = [False]
@@ -1651,8 +1690,8 @@ class Handler(BaseHTTPRequestHandler):
                     name = cb.get("name", "")
                     iid = "fc_" + call_id
                     blocks[idx] = {"type": "tool_use", "iid": iid, "oi": oi, "call_id": call_id, "name": name, "args": ""}
-                    # apply_patch 缓冲到 stop 时合成 custom_tool_call，此处不发 function_call 事件
-                    if name != "apply_patch":
+                    # custom/FREEFORM 工具（如 exec）缓冲到 stop 时合成 custom_tool_call，此处不发 function_call 事件
+                    if name not in custom_ff:
                         _emit({"sequence_number": nseq(), "type": "response.output_item.added", "output_index": oi,
                                "item": {"id": iid, "type": "function_call", "status": "in_progress", "call_id": call_id, "name": name}})
             elif et == "content_block_delta":
@@ -1677,12 +1716,8 @@ class Handler(BaseHTTPRequestHandler):
                 elif dt == "input_json_delta":
                     t = delta.get("partial_json", "")
                     b["args"] += t
-                    # 调试：apply_patch 的每个 delta
-                    if b.get("name") == "apply_patch":
-                        log.warning("[#%d] [converted] PATCH_DELTA: len=%d frag=%s (accumulated=%d)",
-                                    getattr(self, '_req_id', 0), len(t), repr(t[:100]), len(b["args"]))
-                    # apply_patch 的 args 缓冲（不发 delta，stop 时一次性合成 custom_tool_call）
-                    if b.get("name") != "apply_patch":
+                    # custom/FREEFORM 工具的 args 缓冲（不发 delta，stop 时一次性合成 custom_tool_call）
+                    if b.get("name") not in custom_ff:
                         _emit({"sequence_number": nseq(), "type": "response.function_call_arguments.delta", "item_id": b["iid"],
                                "output_index": b["oi"], "delta": t})
                         has_output[0] = True; stop_ka.set()
@@ -1711,31 +1746,29 @@ class Handler(BaseHTTPRequestHandler):
                     # 调试日志：看 GLM 实际生成的 tool_use
                     log.warning("[#%d] [converted] TOOL_USE: name=%s args_len=%d args_raw=%s",
                                 getattr(self, '_req_id', 0), b.get("name",""), len(b.get("args","")), repr(b.get("args","")[:300]))
-                    if b.get("name") == "apply_patch":
+                    if b.get("name") in custom_ff:
+                        # custom/FREEFORM 工具（如 exec）：从 input 字段提取 FREEFORM 文本（JS 代码等），
+                        # 合成 custom_tool_call。不包 *** Begin/End Patch（那是 apply_patch 专用格式）
                         raw_args = b["args"]
                         try:
                             parsed = json.loads(raw_args)
-                            patch_text = parsed.get("patch", raw_args) if isinstance(parsed, dict) else raw_args
+                            ff_text = parsed.get("input", raw_args) if isinstance(parsed, dict) else raw_args
                         except Exception:
-                            patch_text = raw_args
-                        if not patch_text.startswith("*** Begin Patch"):
-                            patch_text = "*** Begin Patch\n" + patch_text
-                        if not patch_text.rstrip().endswith("*** End Patch"):
-                            patch_text = patch_text.rstrip() + "\n*** End Patch"
+                            ff_text = raw_args
                         ctc_id = "ctc_" + b["call_id"]
                         s = nseq()
                         _emit({"sequence_number": s, "type": "response.output_item.added", "output_index": b["oi"],
-                               "item": {"id": ctc_id, "type": "custom_tool_call", "status": "in_progress", "call_id": b["call_id"], "name": "apply_patch"}})
-                        for ck in [patch_text[i:i+20] for i in range(0, len(patch_text), 20)]:
+                               "item": {"id": ctc_id, "type": "custom_tool_call", "status": "in_progress", "call_id": b["call_id"], "name": b["name"]}})
+                        for ck in [ff_text[i:i+20] for i in range(0, len(ff_text), 20)]:
                             s += 1
                             _emit({"sequence_number": s, "type": "response.custom_tool_call_input.delta",
                                    "delta": ck, "item_id": ctc_id, "output_index": b["oi"]})
                         s += 1
                         _emit({"sequence_number": s, "type": "response.custom_tool_call_input.done",
-                               "input": patch_text, "item_id": ctc_id, "output_index": b["oi"]})
+                               "input": ff_text, "item_id": ctc_id, "output_index": b["oi"]})
                         s += 1
                         item = {"id": ctc_id, "type": "custom_tool_call", "status": "completed",
-                                "call_id": b["call_id"], "name": "apply_patch", "input": patch_text}
+                                "call_id": b["call_id"], "name": b["name"], "input": ff_text}
                         _emit({"sequence_number": s, "type": "response.output_item.done", "output_index": b["oi"], "item": item})
                         output_items.append(item)
                         has_output[0] = True
@@ -1873,7 +1906,6 @@ class Handler(BaseHTTPRequestHandler):
     # ── 流式转发 ─────────────────────────────────────
     def _relay_stream_with_retry(self, first_resp, up, url, up_headers, payload, method, est_input=0):
         """增量流式转发 codex-relay 的 Responses SSE（probe-before-commit，靠 codex-relay 自带 keepalive）。
-        apply_patch 项缓冲后合成 custom_tool_call。
         延迟提交 200：非内容块(response.created 等)握住不发，首次 _write 才提交 200+flush；
         overflow(超限信号/空completed)→返干净 400(as_responses)触发客户端压缩；其他错误与 messages 一致直接转发(429另封锁渠道)。
         返回 (events, has_output, stream_error)。已发响应头即视为完成（不回退下一上游）。"""
@@ -2201,7 +2233,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.81 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.84 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
