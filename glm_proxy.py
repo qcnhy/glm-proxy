@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.84 — codex-relay + Python 路由层
+GLM API 代理 v2.9.87 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -98,6 +98,13 @@ STATIC_MODELS = json.dumps({
                                 "context_window": up.get("max_context_tokens", 128000),
                                 "max_context_window": up.get("max_context_tokens", 128000)}
                   for up in UPSTREAMS}.values()),
+    # v2.9.87: Codex models_manager 期望 "models" 字段（非标准 OpenAI "data"），
+    # 缺失会每 3 分钟报 "failed to decode models response: missing field models"
+    "models": list({up["model"]: {"id": up["model"], "object": "model",
+                                 "owned_by": up.get("owned_by", "zhipu"),
+                                 "context_window": up.get("max_context_tokens", 128000),
+                                 "max_context_window": up.get("max_context_tokens", 128000)}
+                   for up in UPSTREAMS}.values()),
 }, ensure_ascii=False).encode()
 
 # ── 日志 ──────────────────────────────────────────────
@@ -541,7 +548,7 @@ def _append_tool_result(messages, output_item):
 # exec 工具（Codex 新版 JS 编排器）的文件操作规则注入。
 # glm-5.2 等模型常把 exec 的纯 V8 沙箱当 shell/Node 用（require('fs')、PowerShell
 # $var/foreach），导致文件操作必然在沙箱里 THROW。这里强制教它用嵌套
-# tools.apply_patch() 编辑文件、tools.exec_command() 执行命令。
+# tools.apply_patch() 编辑文件、tools.shell_command() 执行命令。
 _EXEC_FILE_EDIT_RULES = (
     "\n\nSTOP! READ THIS BEFORE WRITING JS — CRITICAL SANDBOX RULES:\n"
     "This `exec` tool runs PURE V8 JavaScript only. The following DO NOT EXIST here and will THROW:\n"
@@ -551,12 +558,18 @@ _EXEC_FILE_EDIT_RULES = (
     "You CANNOT touch the filesystem directly from this sandbox. To do ANYTHING outside pure\n"
     "computation, call the nested tools on the global `tools` object:\n"
     "  • Edit / create / delete a file → await tools.apply_patch(\"*** Begin Patch\\n*** Update File: path\\n context\\n-old\\n+new\\n*** End Patch\")\n"
-    "  • Run a shell command          → await tools.exec_command({ cmd: \"ls -la\" })\n"
-    "  • Read a file                  → await tools.exec_command({ cmd: \"cat path\" })\n"
+    "  • Run a shell command          → await tools.shell_command({ command: \"ls -la\" })\n"
+    "  • Read a file                  → await tools.shell_command({ command: \"cat path\" })\n"
+    ">>> apply_patch is the ONLY way to edit files. If a run errors (verification failed,\n"
+    "    sandbox helper, etc.), DO NOT switch to Node/fs/require — they DO NOT EXIST here,\n"
+    "    so that always fails. Retry apply_patch or fix the patch format. The thought\n"
+    "    'Node / 直接改 is more reliable' is WRONG in this sandbox (there is no Node).\n"
     "tools.apply_patch takes ONE argument: the RAW PATCH TEXT (a plain string), NOT JSON.\n"
     "PATCH FORMAT:\n"
-    "1. Every content line under *** Add File / *** Update File MUST start with a prefix char:\n"
-    "   + (add) | - (remove) | space (context). NEVER write a bare line without +, -, or a leading space!\n"
+    "1. The ONLY lines without a +/-/space prefix are the 4 commands: `*** Begin Patch`,\n"
+    "   `*** End Patch`, `*** Add File: <path>`, `*** Update File: <path>`. No other line may\n"
+    "   start with `***`. NEVER put a bare `**`, `***`, or markdown `**bold**` inside a hunk —\n"
+    "   every body line MUST start with `+` (add) | `-` (remove) | ` ` (context, one space).\n"
     "2. Create a file: *** Begin Patch\\n*** Add File: hello.txt\\n+line one\\n+line two\\n*** End Patch\n"
     "3. *** Begin Patch / *** End Patch are commands (no prefix). *** Update File: <path> for existing files.\n"
     "4. Do NOT wrap the patch in markdown code blocks (```).\n"
@@ -607,7 +620,7 @@ def _extract_additional_tools(body):
 
 
 def _inject_tool_rules(body):
-    """注入工具描述规则：Codex 新版 exec（JS 编排器）→ V8 沙箱约束 + tools.apply_patch()/exec_command() 用法。
+    """注入工具描述规则：Codex 新版 exec（JS 编排器）→ V8 沙箱约束 + tools.apply_patch()/shell_command() 用法。
     apply_patch 在新版已降为 exec 的嵌套工具（非独立工具），靠 exec 描述教模型调 tools.apply_patch()。
     relay + converted 路径都覆盖。"""
     if not isinstance(body, dict):
@@ -621,7 +634,7 @@ def _inject_tool_rules(body):
             continue
         name = tool.get("name", "")
         # Codex 新版 exec 工具（custom/function/嵌套均匹配）：注入 V8 沙箱约束 +
-        # tools.apply_patch()/exec_command() 用法。glm-5.2 会把 exec 当 shell/Node 用 → 必 THROW
+        # tools.apply_patch()/shell_command() 用法。glm-5.2 会把 exec 当 shell/Node 用 → 必 THROW
         if name == "exec" and "description" in tool:
             if _EXEC_FILE_EDIT_RULES.strip() not in (tool.get("description") or ""):
                 tool["description"] = (tool.get("description") or "") + _EXEC_FILE_EDIT_RULES
@@ -1756,20 +1769,18 @@ class Handler(BaseHTTPRequestHandler):
                         except Exception:
                             ff_text = raw_args
                         ctc_id = "ctc_" + b["call_id"]
-                        s = nseq()
-                        _emit({"sequence_number": s, "type": "response.output_item.added", "output_index": b["oi"],
+                        # v2.9.87: 用 nseq() 替代局部 s 计数器，确保 seq[0] 持续递增
+                        # （旧代码 s 递增不同步 seq[0] → response.completed sequence_number 倒退 → exec 输出通道中断）
+                        _emit({"sequence_number": nseq(), "type": "response.output_item.added", "output_index": b["oi"],
                                "item": {"id": ctc_id, "type": "custom_tool_call", "status": "in_progress", "call_id": b["call_id"], "name": b["name"]}})
                         for ck in [ff_text[i:i+20] for i in range(0, len(ff_text), 20)]:
-                            s += 1
-                            _emit({"sequence_number": s, "type": "response.custom_tool_call_input.delta",
+                            _emit({"sequence_number": nseq(), "type": "response.custom_tool_call_input.delta",
                                    "delta": ck, "item_id": ctc_id, "output_index": b["oi"]})
-                        s += 1
-                        _emit({"sequence_number": s, "type": "response.custom_tool_call_input.done",
+                        _emit({"sequence_number": nseq(), "type": "response.custom_tool_call_input.done",
                                "input": ff_text, "item_id": ctc_id, "output_index": b["oi"]})
-                        s += 1
                         item = {"id": ctc_id, "type": "custom_tool_call", "status": "completed",
                                 "call_id": b["call_id"], "name": b["name"], "input": ff_text}
-                        _emit({"sequence_number": s, "type": "response.output_item.done", "output_index": b["oi"], "item": item})
+                        _emit({"sequence_number": nseq(), "type": "response.output_item.done", "output_index": b["oi"], "item": item})
                         output_items.append(item)
                         has_output[0] = True
                     else:
@@ -2233,7 +2244,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.84 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.87 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
