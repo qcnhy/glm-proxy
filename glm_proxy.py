@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.88 — codex-relay + Python 路由层
+GLM API 代理 v2.9.89 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -558,27 +558,36 @@ _EXEC_FILE_EDIT_RULES = (
     "You CANNOT touch the filesystem directly from this sandbox. To do ANYTHING outside pure\n"
     "computation, call the nested tools on the global `tools` object:\n"
     "  • Edit / create / delete a file → await tools.apply_patch(\"*** Begin Patch\\n*** Update File: path\\n@@\\n context\\n-old\\n+new\\n*** End Patch\")\n"
-    "    apply_patch is the ONLY allowed way to EDIT files. Editing via sed -i / awk / tee / `>` /\n"
-    "    printf / cp is FORBIDDEN. (Reading is fine: cat / head / tail / grep — those do NOT edit.)\n"
+    "    apply_patch is the ONLY allowed way to EDIT files — NO EXCEPTIONS. Every other edit path\n"
+    "    is FORBIDDEN: sed -i / awk / tee / `>` / printf / cp, AND python (open().write / pathlib /\n"
+    "    subprocess / `python -c`), heredocs (cat > f <<EOF), perl -i. This INCLUDES running them\n"
+    "    via tools.shell_command — shell_command is READ-ONLY (ls / cat / head / grep / php -l)\n"
+    "    ONLY, NEVER for writing. Writing a script to edit a file is EVASION. The ONLY edit call\n"
+    "    is `await tools.apply_patch(...)`.\n"
     "  • Run a shell command (non-editing) → await tools.shell_command({ command: \"ls -la\" })\n"
     "  • Read a file → await tools.shell_command({ command: \"cat -n path\" })\n"
     ">>> apply_patch 'no match' / 'line too long' / 'invalid hunk' = your patch is malformed or\n"
-    "    the `-` line differs from the file. STAY in apply_patch. FIX in order: ① each Update hunk\n"
-    "    MUST start with its own `@@` line (the top cause of 'invalid hunk: expected @@'); ② read\n"
+    "    the `-` line differs from the file. STAY in apply_patch (do NOT switch to python / Node /\n"
+    "    sed — python & Node CANNOT edit here). FIX in order: ① EACH `*** Update File:` block MUST\n"
+    "    start with its OWN `@@` line — TWO `*** Update File:` lines ⇒ TWO `@@` lines (the top\n"
+    "    cause of 'invalid hunk: expected @@' is a missing @@ on the 2nd block); ② read\n"
     "    EXACT bytes with `await tools.shell_command({command:\"cat -n path\"})`, copy verbatim into\n"
     "    the `-` line; ③ for an unmatchable long line, rebuild via *** Delete + *** Add. Do NOT\n"
     "    switch to Node/fs/require/PowerShell (they DO NOT EXIST here, always THROW) and do NOT\n"
-    "    edit via sed/awk. 'Node / 直接改 is more reliable' is WRONG (no Node).\n"
+    "    edit via sed/awk. 'python / Node / 直接改 is more reliable' is WRONG (no Node; python\n"
+    "    editing is FORBIDDEN — apply_patch is the only edit call).\n"
     "tools.apply_patch takes ONE argument: the RAW PATCH TEXT (a plain string), NOT JSON.\n"
     "PATCH FORMAT (file paths must be RELATIVE, never absolute):\n"
-    "1. Each Update File hunk MUST start with a `@@` line — 'invalid hunk: expected @@' means you\n"
-    "   forgot it. `@@` may carry an anchor to disambiguate, e.g. `@@ def greet():`. Lines with NO\n"
-    "   prefix are ONLY: `*** Begin/End Patch`, `*** Add/Update/Delete File: <path>`, and `@@`.\n"
-    "   Every other line MUST start with `+`|`-`|` ` (space). NEVER put bare `**`/`***`/`**bold**`\n"
-    "   in a hunk.\n"
+    "1. EACH `*** Update File:` block MUST start with a `@@` line right after it — 'invalid hunk:\n"
+    "   expected @@' means you forgot it. CRITICAL: a 2nd `*** Update File:` needs its OWN new `@@`,\n"
+    "   never share one `@@` across two blocks. `@@` may carry an anchor, e.g. `@@ def greet():`.\n"
+    "   Lines with NO prefix are ONLY: `*** Begin/End Patch`, `*** Add/Update/Delete File: <path>`,\n"
+    "   and `@@`. Every other line MUST start with `+`|`-`|` ` (space). NEVER bare `**`/`***` in hunk.\n"
     "2. Create: *** Begin Patch\\n*** Add File: hello.txt\\n+line one\\n+line two\\n*** End Patch\n"
     "3. Update: *** Begin Patch\\n*** Update File: src/app.py\\n@@ def main():\\n print('hi')\\n-old\\n+new\\n*** End Patch\n"
-    "4. Do NOT wrap the patch in markdown code blocks (```).\n"
+    "4. Update 2 files — EACH `*** Update File:` gets its OWN `@@`:\n"
+    "   *** Begin Patch\\n*** Update File: a.py\\n@@ def a():\\n x\\n-y\\n+z\\n*** Update File: b.py\\n@@ def b():\\n m\\n-n\\n+o\\n*** End Patch\n"
+    "5. Do NOT wrap the patch in markdown code blocks (```).\n"
 )
 
 def _extract_additional_tools(body):
@@ -676,20 +685,36 @@ def _log_exec_io(reqid, body):
         cin_s = cin if isinstance(cin, str) else json.dumps(cin, ensure_ascii=False)
         out = it.get("output", "")
         out_s = out if isinstance(out, str) else json.dumps(out, ensure_ascii=False)
-        has_ap = "apply_patch" in cin_s
-        low = out_s.lower()
+        low_out = out_s.lower()
         flag = next((kw for kw in ("no match", "line too long", "invalid hunk", "verification",
-                                   "failed", "error", "throw", "sandbox", "exception") if kw in low), "")
-        if not (has_ap or flag):
-            continue  # 只记 apply_patch 调用 或 失败的 exec，减少噪音
-        snippet = ""
+                                   "failed", "error", "throw", "sandbox", "exception") if kw in low_out), "")
+        # php -l 等成功输出含 "error" 字样（"No syntax errors detected"），排除误报
+        if flag and "no syntax errors detected" in low_out:
+            flag = ""
+        low_in = cin_s.lower()
+        has_ap = "apply_patch" in low_in
+        # 检测 apply_patch 以外的编辑方式：python/subprocess/heredoc 写文件（模型逃避 apply_patch）
+        py_edit = (not has_ap) and any(p in low_in for p in ("python", "subprocess", "pathlib")) and \
+                  any(w in low_in for w in ("write", "open(", "writelines", "dump", "<<", "> "))
+        if not (has_ap or py_edit or flag):
+            continue
+        out_snip = ""
         if flag:
-            i = low.find(flag)
-            snippet = out_s[max(0, i - 30):i + 120].replace("\n", " ")
-        log.info("[#%d] [exec-io] %sout_len=%d%s%s",
-                 reqid, "apply_patch " if has_ap else "", len(out_s),
+            i = low_out.find(flag)
+            out_snip = " …" + out_s[max(0, i - 20):i + 100].replace("\n", " ")
+        # apply_patch 失败 → 记 input 的 patch 摘要看 @@ 在不在；python 逃避 → 记代码片段
+        in_snip = ""
+        if has_ap and flag:
+            j = cin_s.find("***")
+            seg = cin_s[j:j + 160] if j >= 0 else cin_s[:160]
+            in_snip = " in:" + seg.replace("\n", "|").replace("\r", "")
+        elif py_edit:
+            in_snip = " in:" + cin_s[:160].replace("\n", "|").replace("\r", "")
+        tag = "apply_patch " if has_ap else ("python-edit? " if py_edit else "")
+        log.info("[#%d] [exec-io] %sout_len=%d%s%s%s",
+                 reqid, tag, len(out_s),
                  " ✗ " + flag if flag else " ✓",
-                 " …" + snippet if snippet else "")
+                 out_snip, in_snip)
 
 
 
@@ -2290,7 +2315,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.88 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.89 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
