@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.87 — codex-relay + Python 路由层
+GLM API 代理 v2.9.88 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -557,21 +557,27 @@ _EXEC_FILE_EDIT_RULES = (
     "  - Shell / PowerShell: `$var`, `foreach`, `cp`, `cat`, `>`, pipes → NOT JS syntax here.\n"
     "You CANNOT touch the filesystem directly from this sandbox. To do ANYTHING outside pure\n"
     "computation, call the nested tools on the global `tools` object:\n"
-    "  • Edit / create / delete a file → await tools.apply_patch(\"*** Begin Patch\\n*** Update File: path\\n context\\n-old\\n+new\\n*** End Patch\")\n"
-    "  • Run a shell command          → await tools.shell_command({ command: \"ls -la\" })\n"
-    "  • Read a file                  → await tools.shell_command({ command: \"cat path\" })\n"
-    ">>> apply_patch is the ONLY way to edit files. If a run errors (verification failed,\n"
-    "    sandbox helper, etc.), DO NOT switch to Node/fs/require — they DO NOT EXIST here,\n"
-    "    so that always fails. Retry apply_patch or fix the patch format. The thought\n"
-    "    'Node / 直接改 is more reliable' is WRONG in this sandbox (there is no Node).\n"
+    "  • Edit / create / delete a file → await tools.apply_patch(\"*** Begin Patch\\n*** Update File: path\\n@@\\n context\\n-old\\n+new\\n*** End Patch\")\n"
+    "    apply_patch is the ONLY allowed way to EDIT files. Editing via sed -i / awk / tee / `>` /\n"
+    "    printf / cp is FORBIDDEN. (Reading is fine: cat / head / tail / grep — those do NOT edit.)\n"
+    "  • Run a shell command (non-editing) → await tools.shell_command({ command: \"ls -la\" })\n"
+    "  • Read a file → await tools.shell_command({ command: \"cat -n path\" })\n"
+    ">>> apply_patch 'no match' / 'line too long' / 'invalid hunk' = your patch is malformed or\n"
+    "    the `-` line differs from the file. STAY in apply_patch. FIX in order: ① each Update hunk\n"
+    "    MUST start with its own `@@` line (the top cause of 'invalid hunk: expected @@'); ② read\n"
+    "    EXACT bytes with `await tools.shell_command({command:\"cat -n path\"})`, copy verbatim into\n"
+    "    the `-` line; ③ for an unmatchable long line, rebuild via *** Delete + *** Add. Do NOT\n"
+    "    switch to Node/fs/require/PowerShell (they DO NOT EXIST here, always THROW) and do NOT\n"
+    "    edit via sed/awk. 'Node / 直接改 is more reliable' is WRONG (no Node).\n"
     "tools.apply_patch takes ONE argument: the RAW PATCH TEXT (a plain string), NOT JSON.\n"
-    "PATCH FORMAT:\n"
-    "1. The ONLY lines without a +/-/space prefix are the 4 commands: `*** Begin Patch`,\n"
-    "   `*** End Patch`, `*** Add File: <path>`, `*** Update File: <path>`. No other line may\n"
-    "   start with `***`. NEVER put a bare `**`, `***`, or markdown `**bold**` inside a hunk —\n"
-    "   every body line MUST start with `+` (add) | `-` (remove) | ` ` (context, one space).\n"
-    "2. Create a file: *** Begin Patch\\n*** Add File: hello.txt\\n+line one\\n+line two\\n*** End Patch\n"
-    "3. *** Begin Patch / *** End Patch are commands (no prefix). *** Update File: <path> for existing files.\n"
+    "PATCH FORMAT (file paths must be RELATIVE, never absolute):\n"
+    "1. Each Update File hunk MUST start with a `@@` line — 'invalid hunk: expected @@' means you\n"
+    "   forgot it. `@@` may carry an anchor to disambiguate, e.g. `@@ def greet():`. Lines with NO\n"
+    "   prefix are ONLY: `*** Begin/End Patch`, `*** Add/Update/Delete File: <path>`, and `@@`.\n"
+    "   Every other line MUST start with `+`|`-`|` ` (space). NEVER put bare `**`/`***`/`**bold**`\n"
+    "   in a hunk.\n"
+    "2. Create: *** Begin Patch\\n*** Add File: hello.txt\\n+line one\\n+line two\\n*** End Patch\n"
+    "3. Update: *** Begin Patch\\n*** Update File: src/app.py\\n@@ def main():\\n print('hi')\\n-old\\n+new\\n*** End Patch\n"
     "4. Do NOT wrap the patch in markdown code blocks (```).\n"
 )
 
@@ -645,6 +651,45 @@ def _inject_tool_rules(body):
                 func["description"] = (func.get("description") or "") + _EXEC_FILE_EDIT_RULES
                 modified = True
     return body
+
+
+def _log_exec_io(reqid, body):
+    """扫描请求 input 里的 exec 工具 I/O，记录 apply_patch 等的执行结果（排查 exec/apply_patch 失败）。
+    exec 的 custom_tool_call(input=JS) 与 custom_tool_call_output(output=沙箱执行结果) 按 call_id 配对。
+    请求入口调用一次，relay/converted/messages 全覆盖；非 Responses（无 input 数组）直接返回。"""
+    if not isinstance(body, dict):
+        return
+    inp = body.get("input")
+    if not isinstance(inp, list):
+        return
+    calls = {}  # call_id -> (name, input_text)
+    for it in inp:
+        if isinstance(it, dict) and it.get("type") == "custom_tool_call":
+            calls[it.get("call_id")] = (it.get("name", ""), it.get("input", ""))
+    for it in inp:
+        if not (isinstance(it, dict) and it.get("type") == "custom_tool_call_output"):
+            continue
+        cid = it.get("call_id")
+        name, cin = calls.get(cid, ("", ""))
+        if name != "exec":
+            continue
+        cin_s = cin if isinstance(cin, str) else json.dumps(cin, ensure_ascii=False)
+        out = it.get("output", "")
+        out_s = out if isinstance(out, str) else json.dumps(out, ensure_ascii=False)
+        has_ap = "apply_patch" in cin_s
+        low = out_s.lower()
+        flag = next((kw for kw in ("no match", "line too long", "invalid hunk", "verification",
+                                   "failed", "error", "throw", "sandbox", "exception") if kw in low), "")
+        if not (has_ap or flag):
+            continue  # 只记 apply_patch 调用 或 失败的 exec，减少噪音
+        snippet = ""
+        if flag:
+            i = low.find(flag)
+            snippet = out_s[max(0, i - 30):i + 120].replace("\n", " ")
+        log.info("[#%d] [exec-io] %sout_len=%d%s%s",
+                 reqid, "apply_patch " if has_ap else "", len(out_s),
+                 " ✗ " + flag if flag else " ✓",
+                 " …" + snippet if snippet else "")
 
 
 
@@ -969,6 +1014,7 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(raw)
             is_stream = body.get("stream", False)
             self._debug_req_body = body
+            _log_exec_io(self._req_id, body)
 
         # 3) 日志 + 计算 payload 大小
         raw_len = len(raw) if method == "POST" else 0
@@ -2244,7 +2290,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.87 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.88 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
