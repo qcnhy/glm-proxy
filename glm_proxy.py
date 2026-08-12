@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.89 — codex-relay + Python 路由层
+GLM API 代理 v2.9.90 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -563,7 +563,9 @@ _EXEC_FILE_EDIT_RULES = (
     "    subprocess / `python -c`), heredocs (cat > f <<EOF), perl -i. This INCLUDES running them\n"
     "    via tools.shell_command — shell_command is READ-ONLY (ls / cat / head / grep / php -l)\n"
     "    ONLY, NEVER for writing. Writing a script to edit a file is EVASION. The ONLY edit call\n"
-    "    is `await tools.apply_patch(...)`.\n"
+    "    is `await tools.apply_patch(...)`. NOTE: creating a script file (.py/.sh/.js/.pl/ANY) via\n"
+    "    apply_patch then running it (tools.shell_command) to edit ANOTHER file is the SAME\n"
+    "    evasion — a script must never write/edit files; only apply_patch edits.\n"
     "  • Run a shell command (non-editing) → await tools.shell_command({ command: \"ls -la\" })\n"
     "  • Read a file → await tools.shell_command({ command: \"cat -n path\" })\n"
     ">>> apply_patch 'no match' / 'line too long' / 'invalid hunk' = your patch is malformed or\n"
@@ -572,7 +574,9 @@ _EXEC_FILE_EDIT_RULES = (
     "    start with its OWN `@@` line — TWO `*** Update File:` lines ⇒ TWO `@@` lines (the top\n"
     "    cause of 'invalid hunk: expected @@' is a missing @@ on the 2nd block); ② read\n"
     "    EXACT bytes with `await tools.shell_command({command:\"cat -n path\"})`, copy verbatim into\n"
-    "    the `-` line; ③ for an unmatchable long line, rebuild via *** Delete + *** Add. Do NOT\n"
+    "    the `-` line. For YAML / Python (indent-sensitive files), the `+new` AND context lines\n"
+    "    MUST copy the file's EXACT leading spaces — count them from `cat -n` output, never guess\n"
+    "    (one wrong space breaks YAML). ③ for an unmatchable long line, rebuild via *** Delete + *** Add. Do NOT\n"
     "    switch to Node/fs/require/PowerShell (they DO NOT EXIST here, always THROW) and do NOT\n"
     "    edit via sed/awk. 'python / Node / 直接改 is more reliable' is WRONG (no Node; python\n"
     "    editing is FORBIDDEN — apply_patch is the only edit call).\n"
@@ -693,6 +697,10 @@ def _log_exec_io(reqid, body):
             flag = ""
         low_in = cin_s.lower()
         has_ap = "apply_patch" in low_in
+        # 二段式绕法：apply_patch 创建脚本(.py/.sh/.js/.pl)且内容含写文件操作（逃避 apply_patch 唯一编辑）
+        two_step = has_ap and "*** Add File:" in cin_s and \
+                   any(e in cin_s for e in (".py", ".sh", ".js", ".pl")) and \
+                   any(w in low_in for w in ("open(", "write(", ".write(", "subprocess", "write_text", "<<"))
         # 检测 apply_patch 以外的编辑方式：python/subprocess/heredoc 写文件（模型逃避 apply_patch）
         py_edit = (not has_ap) and any(p in low_in for p in ("python", "subprocess", "pathlib")) and \
                   any(w in low_in for w in ("write", "open(", "writelines", "dump", "<<", "> "))
@@ -702,15 +710,22 @@ def _log_exec_io(reqid, body):
         if flag:
             i = low_out.find(flag)
             out_snip = " …" + out_s[max(0, i - 20):i + 100].replace("\n", " ")
-        # apply_patch 失败 → 记 input 的 patch 摘要看 @@ 在不在；python 逃避 → 记代码片段
+        # apply_patch 失败 → 记 input 的 patch 摘要看 @@ 在不在；python 逃避 / 二段式 → 记代码片段
         in_snip = ""
         if has_ap and flag:
             j = cin_s.find("***")
             seg = cin_s[j:j + 160] if j >= 0 else cin_s[:160]
             in_snip = " in:" + seg.replace("\n", "|").replace("\r", "")
+        elif py_edit or two_step:
+            in_snip = " in:" + cin_s[:180].replace("\n", "|").replace("\r", "")
+        if two_step:
+            tag = "script-via-apply_patch? "
+        elif has_ap:
+            tag = "apply_patch "
         elif py_edit:
-            in_snip = " in:" + cin_s[:160].replace("\n", "|").replace("\r", "")
-        tag = "apply_patch " if has_ap else ("python-edit? " if py_edit else "")
+            tag = "python-edit? "
+        else:
+            tag = ""
         log.info("[#%d] [exec-io] %sout_len=%d%s%s%s",
                  reqid, tag, len(out_s),
                  " ✗ " + flag if flag else " ✓",
@@ -2315,7 +2330,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.89 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.90 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
