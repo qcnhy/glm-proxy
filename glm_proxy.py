@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.90 — codex-relay + Python 路由层
+GLM API 代理 v2.9.92 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -93,14 +93,15 @@ UPSTREAMS = _cfg.get("upstreams", [])
 
 STATIC_MODELS = json.dumps({
     "object": "list",
-    "data": list({up["model"]: {"id": up["model"], "object": "model",
+    "data": list({up["model"]: {"id": up["model"], "slug": up["model"], "object": "model",
                                 "owned_by": up.get("owned_by", "zhipu"),
                                 "context_window": up.get("max_context_tokens", 128000),
                                 "max_context_window": up.get("max_context_tokens", 128000)}
                   for up in UPSTREAMS}.values()),
     # v2.9.87: Codex models_manager 期望 "models" 字段（非标准 OpenAI "data"），
     # 缺失会每 3 分钟报 "failed to decode models response: missing field models"
-    "models": list({up["model"]: {"id": up["model"], "object": "model",
+    # v2.9.92: Codex 新版还要每个 model 对象含 "slug" 字段，缺失报 "missing field `slug`"
+    "models": list({up["model"]: {"id": up["model"], "slug": up["model"], "object": "model",
                                  "owned_by": up.get("owned_by", "zhipu"),
                                  "context_window": up.get("max_context_tokens", 128000),
                                  "max_context_window": up.get("max_context_tokens", 128000)}
@@ -635,6 +636,124 @@ def _extract_additional_tools(body):
         if added:
             log.info("    [additional_tools] extracted %d → top-level tools: %s",
                      len(added), ", ".join(added))
+            # 诊断：展开 namespace 子工具名（exec 是否藏在 namespace 内）
+            for t in extra:
+                if isinstance(t, dict) and t.get("type") == "namespace":
+                    subs = [s.get("name", "?") for s in (t.get("tools") or []) if isinstance(s, dict)]
+                    if subs:
+                        log.info("    [additional_tools] namespace %s subs: %s", t.get("name"), ", ".join(subs))
+    return body
+
+
+def _flatten_agent_messages(body):
+    """规整 Codex 多智能体（sub-agent）消息为标准类型，避免 relay/converted 路径产出未知内容类型。
+
+    Codex 桌面版多智能体功能在 input 数组里发：
+    - type=agent_message：父 agent 给子 agent 的协作消息（NEW_TASK 等，含 author/recipient）
+    - content block type=encrypted_content：携带任务 payload 文本（encrypted_content 字段）
+    codex-relay 不认识 agent_message，会把它的 content 块（含 encrypted_content）原样透传，
+    GLM/智谱 Anthropic 端点只认 text/image/tool_use/tool_result → 1214「content[N].type 类型错误」。
+    _convert_responses_to_messages（converted 路径）对 agent_message 无分支会直接丢弃 → 任务 payload 丢失。
+
+    这里：agent_message → message(role=user，子 agent 收到的任务即用户指令)；
+          encrypted_content 块 → input_text（取其 encrypted_content 字段文本）。
+    relay + converted 两路径共享，规整后都产出标准类型。幂等。"""
+    if not isinstance(body, dict):
+        return body
+    inp = body.get("input")
+    if not isinstance(inp, list):
+        return body
+
+    def _flat_blocks(content):
+        """encrypted_content → input_text；其余块原样保留。返回新列表；无改动返回 None。"""
+        if not isinstance(content, list):
+            return None
+        out, changed = [], False
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "encrypted_content":
+                out.append({"type": "input_text", "text": b.get("encrypted_content", "")})
+                changed = True
+            else:
+                out.append(b)
+        return out if changed else None
+
+    new_inp, changed = [], False
+    n_agent = n_enc = 0
+    for item in inp:
+        if not isinstance(item, dict):
+            new_inp.append(item)
+            continue
+        if item.get("type") == "agent_message":
+            changed = True
+            n_agent += 1
+            raw_c = item.get("content", [])
+            blocks = _flat_blocks(raw_c) or raw_c
+            n_enc += sum(1 for b in (raw_c or []) if isinstance(b, dict) and b.get("type") == "encrypted_content")
+            new_inp.append({"type": "message", "role": "user", "content": blocks})
+        else:
+            # 普通 message 的 content 也可能混入 encrypted_content 块
+            if item.get("type") == "message":
+                orig_c = item.get("content")
+                blocks = _flat_blocks(orig_c)
+                if blocks is not None:
+                    changed = True
+                    n_enc += sum(1 for b in (orig_c or []) if isinstance(b, dict) and b.get("type") == "encrypted_content")
+                    item = {**item, "content": blocks}
+            new_inp.append(item)
+    if changed:
+        body["input"] = new_inp
+        log.info("    [agent_msg] flattened %d agent_message→message, %d encrypted_content→input_text",
+                 n_agent, n_enc)
+    return body
+
+
+def _flatten_namespace_tools(body):
+    """展平 namespace 工具为顶层工具（{ns}-{sub} 命名），保留每个子工具原类型与 schema。
+
+    codex-relay 展平 namespace 时**只保留 function 子工具，丢弃 custom 子工具**——
+    Codex 多智能体 V2 把 exec（custom/FREEFORM）放进 namespace:functions 子工具，
+    导致 codex-relay 丢掉 exec：输出有 functions-wait/request_user_input，独缺 functions-exec。
+    模型工具列表无 exec → 主代理/子代理都无法执行命令/编辑文件（glm 还会反复纠结
+    "functions-wait 提到 exec cell 但我看不到 exec 工具"）。
+
+    这里在送 relay 前自行展平：每个子工具（含 custom 的 exec）提升为顶层工具，
+    命名 {ns}-{sub}（与 codex-relay 的 namespace 命名、Codex 调用 namespace 子工具的格式一致），
+    codex-relay 收到扁平工具集 → function 与 custom 都能正确处理，exec 不再被丢。
+    仅 relay 路径需要（converted 路径自己的 _convert_responses_to_messages 已保留全部子工具）。"""
+    if not isinstance(body, dict):
+        return body
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return body
+    flat, changed = [], False
+    for t in tools:
+        if not isinstance(t, dict) or t.get("type") != "namespace":
+            flat.append(t)
+            continue
+        changed = True
+        ns_name = t.get("name", "")
+        subs = t.get("tools") or []
+        names_out = []
+        for sub in subs:
+            if not isinstance(sub, dict):
+                continue
+            sub_name = sub.get("name", "")
+            new_t = dict(sub)
+            # custom/FREEFORM 子工具（如 exec）用【裸名】——Codex 对 custom 工具按精确名匹配，
+            # namespaced 名（functions-exec）会被拒 "unsupported custom tool call"；
+            # function 子工具保留 {ns}-{sub}（Codex namespace 约定，正常 round-trip）。
+            if sub.get("type") == "custom":
+                new_t["name"] = sub_name
+                names_out.append(sub_name)
+            else:
+                nm = "%s-%s" % (ns_name, sub_name) if ns_name else sub_name
+                new_t["name"] = nm
+                names_out.append(nm)
+            flat.append(new_t)
+        log.info("    [namespace] flattened %s → %d tools: %s",
+                 ns_name or "(unnamed)", len(subs), ", ".join(names_out))
+    if changed:
+        body["tools"] = flat
     return body
 
 
@@ -653,13 +772,14 @@ def _inject_tool_rules(body):
             continue
         name = tool.get("name", "")
         # Codex 新版 exec 工具（custom/function/嵌套均匹配）：注入 V8 沙箱约束 +
-        # tools.apply_patch()/shell_command() 用法。glm-5.2 会把 exec 当 shell/Node 用 → 必 THROW
-        if name == "exec" and "description" in tool:
+        # tools.apply_patch()/shell_command() 用法。glm-5.2 会把 exec 当 shell/Node 用 → 必 THROW。
+        # 展平 namespace 后名为 functions-exec（endwith("-exec") 兜底匹配）。
+        if (name == "exec" or name.endswith("-exec")) and "description" in tool:
             if _EXEC_FILE_EDIT_RULES.strip() not in (tool.get("description") or ""):
                 tool["description"] = (tool.get("description") or "") + _EXEC_FILE_EDIT_RULES
                 modified = True
         func = tool.get("function")
-        if isinstance(func, dict) and func.get("name") == "exec":
+        if isinstance(func, dict) and (func.get("name") == "exec" or (func.get("name") or "").endswith("-exec")):
             if _EXEC_FILE_EDIT_RULES.strip() not in (func.get("description") or ""):
                 func["description"] = (func.get("description") or "") + _EXEC_FILE_EDIT_RULES
                 modified = True
@@ -1227,6 +1347,9 @@ class Handler(BaseHTTPRequestHandler):
                         log.warning("    payload %dKB, stripping previous_response_id", pid_len // 1024)
                         del body["previous_response_id"]
                 _extract_additional_tools(body)  # Codex additional_tools(input 内) → 顶层 tools
+                _flatten_agent_messages(body)  # Codex 多智能体 agent_message/encrypted_content → message/input_text
+                if not is_responses_converted:
+                    _flatten_namespace_tools(body)  # relay 路径：展平 namespace 救回 codex-relay 丢弃的 custom 子工具(exec)
                 _inject_tool_rules(body)  # 注入 exec 沙箱规则（relay + converted 都覆盖）
                 # converted 路径转换后已是标准 Anthropic tool 格式（无 type），venus 等端点直接接受，无需 strip。
                 # messages 路径防御：若 tools 仍含 "type":"custom"（不应出现）则剔之。
@@ -2330,7 +2453,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.90 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.92 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
