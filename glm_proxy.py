@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.93 — codex-relay + Python 路由层
+GLM API 代理 v2.9.94 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -364,21 +364,12 @@ def _find_relay_binary():
     return None
 
 def _start_relays():
-    _RELAY_MIN = (0, 5, 5)
-    need_install = False
+    # 每次启动无条件做一次升级检查：已最新则 pip 无操作，有新版本则自动跟上
     try:
-        from importlib.metadata import version as _pkg_ver
-        installed = tuple(int(x) for x in _pkg_ver("codex-relay").split(".")[:3])
-        if installed < _RELAY_MIN:
-            need_install = True
-            log.info("codex-relay %s < %s, upgrading...",
-                     ".".join(map(str, installed)), ".".join(map(str, _RELAY_MIN)))
-    except Exception:
-        need_install = True
-        log.info("codex-relay not found, installing...")
-    if need_install:
         subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "codex-relay",
                                "--break-system-packages", "--quiet"])
+    except Exception as e:
+        log.warning("codex-relay upgrade check failed: %s (keep using installed)", e)
     binary = _find_relay_binary()
     if not binary:
         log.error("codex-relay binary not found! Run: pip install codex-relay")
@@ -2403,7 +2394,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.93 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.94 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
