@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.95 — codex-relay + Python 路由层
+GLM API 代理 v2.9.97 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -697,6 +697,7 @@ def _flatten_agent_messages(body):
                  n_agent, n_enc)
     return body
 
+
 def _fix_tool_result_roles(body):
     """Anthropic 端点严格校验 tool_result 块只能在 user 消息。
 
@@ -1390,8 +1391,17 @@ class Handler(BaseHTTPRequestHandler):
                         # 真空输出（无错误）→ 尝试下一个上游
                     elif is_responses:
                         # relay 路径：立即发头+keepalive（idle安全），早期 1305/过载退避重试
-                        events, has_output, stream_error = self._relay_stream_with_retry(
+                        events, has_output, stream_error, fallback = self._relay_stream_with_retry(
                             resp, up, url, up_headers, payload, method, _est_tokens(body))
+                        if fallback:
+                            # 未发头即失败（429限流/502不可达/DNS等），回退下一上游；
+                            # 记住错误供链尾 _send_last_error 呈现（否则全链失败时客户端只看到 None）
+                            fcode, ferr = fallback
+                            try:
+                                last_err = (int(fcode), json.dumps({"error": ferr}).encode())
+                            except (TypeError, ValueError):
+                                last_err = (502, b'{"error":"upstream failed before output"}')
+                            continue
                         if stream_error:
                             log.warning("[#%d]     !!! %s upstream error, forwarding to client: %s",
                                         self._req_id, up["name"], stream_error)
@@ -2121,7 +2131,8 @@ class Handler(BaseHTTPRequestHandler):
         """增量流式转发 codex-relay 的 Responses SSE（probe-before-commit，靠 codex-relay 自带 keepalive）。
         延迟提交 200：非内容块(response.created 等)握住不发，首次 _write 才提交 200+flush；
         overflow(超限信号/空completed)→返干净 400(as_responses)触发客户端压缩；其他错误与 messages 一致直接转发(429另封锁渠道)。
-        返回 (events, has_output, stream_error)。已发响应头即视为完成（不回退下一上游）。"""
+        返回 (events, has_output, stream_error, fallback)。fallback=(code, err) 表示未发头即失败（429/502/DNS等），
+        应回退下一上游（调用方记录 last_err 供链尾呈现）；已发响应头即视为完成（不回退，错误直接转发）。"""
         import threading
         upstream_name = up["name"]
         events = 0
@@ -2250,12 +2261,12 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception:
                         pass
                     self._send_overflow_400(up, est_input, as_responses=True)
-                    return
+                    return events, has_output, None, False
 
-                # === 早期 response.failed（非超限）：与 messages 一致，直接转发（不退避重试）===
+                # === 早期 response.failed（非超限）：未发头一律回退下一上游（429 先封锁渠道）；已发头才转发 ===
                 if early_err and not has_output and not stream_error:
                     code, err, out_bytes = early_err
-                    # 429 → 封锁渠道（直到重置）；其余错误直接转发 response.failed
+                    # 429/rate_limit → 封锁渠道（直到重置）
                     if isinstance(err, dict):
                         ec = str(err.get("code", ""))
                         if ec == "429" or err.get("type") == "rate_limit_error":
@@ -2264,6 +2275,16 @@ class Handler(BaseHTTPRequestHandler):
                             _block_channel_on_429(json.dumps(err).encode(), upstream_name, self._req_id)
                             log.info("[#%d]     [429] after block: %s", self._req_id,
                                      {k: datetime.fromtimestamp(v).strftime("%H:%M") for k, v in _channel_blocked_until.items() if v > time.time()})
+                    # probe-hold 阶段未提交 200 → 错误不转发给客户端，回退下一上游
+                    # （限流/502不可达/DNS失败等一律回退；全链失败由链尾把最后的错误发给客户端）
+                    if not committed[0]:
+                        log.warning("[#%d]     !!! %s failed before commit (code=%s), trying next upstream",
+                                    self._req_id, upstream_name, code)
+                        try:
+                            resp.close()
+                        except Exception:
+                            pass
+                        return events, has_output, None, (code, err)
                     log.warning("[#%d]     !!! %s forwarding response.failed: %s", self._req_id, upstream_name, err)
                     for hb in held:  # probe-hold：转发前 flush 握住的(含 response.created)，让客户端看到 created+failed
                         _write(hb)
@@ -2311,7 +2332,7 @@ class Handler(BaseHTTPRequestHandler):
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
             log.warning("[#%d]     <<< %s STREAM interrupted", self._req_id, upstream_name)
 
-        return events, True, stream_error  # 已发响应头，总是 done（不回退下一上游）
+        return events, True, stream_error, False  # 已发响应头，总是 done（不回退下一上游）
 
     @staticmethod
     def _process_sse_block(block, upstream_name=None):
@@ -2446,7 +2467,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.95 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.97 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
