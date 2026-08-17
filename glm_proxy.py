@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.92 — codex-relay + Python 路由层
+GLM API 代理 v2.9.93 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -707,56 +707,6 @@ def _flatten_agent_messages(body):
     return body
 
 
-def _flatten_namespace_tools(body):
-    """展平 namespace 工具为顶层工具（{ns}-{sub} 命名），保留每个子工具原类型与 schema。
-
-    codex-relay 展平 namespace 时**只保留 function 子工具，丢弃 custom 子工具**——
-    Codex 多智能体 V2 把 exec（custom/FREEFORM）放进 namespace:functions 子工具，
-    导致 codex-relay 丢掉 exec：输出有 functions-wait/request_user_input，独缺 functions-exec。
-    模型工具列表无 exec → 主代理/子代理都无法执行命令/编辑文件（glm 还会反复纠结
-    "functions-wait 提到 exec cell 但我看不到 exec 工具"）。
-
-    这里在送 relay 前自行展平：每个子工具（含 custom 的 exec）提升为顶层工具，
-    命名 {ns}-{sub}（与 codex-relay 的 namespace 命名、Codex 调用 namespace 子工具的格式一致），
-    codex-relay 收到扁平工具集 → function 与 custom 都能正确处理，exec 不再被丢。
-    仅 relay 路径需要（converted 路径自己的 _convert_responses_to_messages 已保留全部子工具）。"""
-    if not isinstance(body, dict):
-        return body
-    tools = body.get("tools")
-    if not isinstance(tools, list):
-        return body
-    flat, changed = [], False
-    for t in tools:
-        if not isinstance(t, dict) or t.get("type") != "namespace":
-            flat.append(t)
-            continue
-        changed = True
-        ns_name = t.get("name", "")
-        subs = t.get("tools") or []
-        names_out = []
-        for sub in subs:
-            if not isinstance(sub, dict):
-                continue
-            sub_name = sub.get("name", "")
-            new_t = dict(sub)
-            # custom/FREEFORM 子工具（如 exec）用【裸名】——Codex 对 custom 工具按精确名匹配，
-            # namespaced 名（functions-exec）会被拒 "unsupported custom tool call"；
-            # function 子工具保留 {ns}-{sub}（Codex namespace 约定，正常 round-trip）。
-            if sub.get("type") == "custom":
-                new_t["name"] = sub_name
-                names_out.append(sub_name)
-            else:
-                nm = "%s-%s" % (ns_name, sub_name) if ns_name else sub_name
-                new_t["name"] = nm
-                names_out.append(nm)
-            flat.append(new_t)
-        log.info("    [namespace] flattened %s → %d tools: %s",
-                 ns_name or "(unnamed)", len(subs), ", ".join(names_out))
-    if changed:
-        body["tools"] = flat
-    return body
-
-
 def _inject_tool_rules(body):
     """注入工具描述规则：Codex 新版 exec（JS 编排器）→ V8 沙箱约束 + tools.apply_patch()/shell_command() 用法。
     apply_patch 在新版已降为 exec 的嵌套工具（非独立工具），靠 exec 描述教模型调 tools.apply_patch()。
@@ -1348,8 +1298,8 @@ class Handler(BaseHTTPRequestHandler):
                         del body["previous_response_id"]
                 _extract_additional_tools(body)  # Codex additional_tools(input 内) → 顶层 tools
                 _flatten_agent_messages(body)  # Codex 多智能体 agent_message/encrypted_content → message/input_text
-                if not is_responses_converted:
-                    _flatten_namespace_tools(body)  # relay 路径：展平 namespace 救回 codex-relay 丢弃的 custom 子工具(exec)
+                # namespace 展平已移除（v2.9.93）：codex-relay 0.5.8 (#62) 原生处理 namespace，
+                # custom 子工具裸名/function 子工具 namespaced 编码由 relay 自己正确 round-trip。
                 _inject_tool_rules(body)  # 注入 exec 沙箱规则（relay + converted 都覆盖）
                 # converted 路径转换后已是标准 Anthropic tool 格式（无 type），venus 等端点直接接受，无需 strip。
                 # messages 路径防御：若 tools 仍含 "type":"custom"（不应出现）则剔之。
@@ -2453,7 +2403,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.92 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.93 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
