@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.97 — codex-relay + Python 路由层
+GLM API 代理 v2.9.98 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -1161,18 +1161,37 @@ class Handler(BaseHTTPRequestHandler):
         body = None
 
         if method == "POST":
+            client_ip = (self.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+                         or self.headers.get("X-Real-IP", "")
+                         or self.client_address[0])
             length = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(length)
-            body = json.loads(raw)
+            try:
+                body = json.loads(raw)
+            except json.JSONDecodeError as je:
+                # 客户端发的 JSON 非法或 Content-Length 与实际不符（截断/编码错乱）→
+                # 存证 + 干净 400（异常冒到外层会让客户端挂着收不到响应）
+                log.warning("[#%d] >>> [%s] POST %s BAD JSON: %s (declared_len=%d read=%d)",
+                            self._req_id, client_ip, self.path, je, length, len(raw))
+                log.warning("[#%d]     raw[:300]=%r", self._req_id, raw[:300])
+                try:
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    path = os.path.join(LOG_DIR, f"debug_badjson_{ts}.json")
+                    with open(path, "wb") as f:
+                        f.write(raw)
+                    log.warning("[#%d]     saved raw body to %s", self._req_id, path)
+                except Exception:
+                    pass
+                err = json.dumps({"error": {"message": f"request body is not valid JSON: {je}",
+                                            "type": "invalid_request_error"}}).encode()
+                self._send_raw(400, err, "application/json")
+                return
             is_stream = body.get("stream", False)
             self._debug_req_body = body
             _log_exec_io(self._req_id, body)
 
         # 3) 日志 + 计算 payload 大小
         raw_len = len(raw) if method == "POST" else 0
-        client_ip = (self.headers.get("X-Forwarded-For", "").split(",")[0].strip()
-                     or self.headers.get("X-Real-IP", "")
-                     or self.client_address[0])
         if is_responses:
             log.info("[#%d] >>> [%s] POST %s stream=%s tools=%d input=%d",
                      self._req_id, client_ip, self.path, is_stream, len(body.get("tools", [])),
@@ -2467,7 +2486,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.97 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.98 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
