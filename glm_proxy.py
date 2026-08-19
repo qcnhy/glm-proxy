@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.102 — codex-relay + Python 路由层
+GLM API 代理 v2.9.103 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -1324,6 +1324,12 @@ class Handler(BaseHTTPRequestHandler):
         for up in UPSTREAMS:
             if up.get("disabled"):
                 continue
+            # v2.9.103: 超大载荷跳过 responses_direct（如 cmoyan）——大上下文会话源站处理超
+            # Cloudflare 100s 上限必 524，白等约两分钟才回退。≥1MB 直接跳过走下一渠道。
+            if not force_upstream and up.get("responses_direct") and len(raw) >= 1024 * 1024:
+                log.info("[#%d]     [skip] %s: 载荷 %dKB ≥1MB，Cloudflare 必 524，跳过",
+                         self._req_id, up["name"], len(raw) // 1024)
+                continue
             # 数字 key 强制：只走对应渠道（跳过 worktime / 封锁限制）
             if force_upstream:
                 if up["name"] != force_upstream:
@@ -2632,7 +2638,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.102 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.103 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
