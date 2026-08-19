@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.98 — codex-relay + Python 路由层
+GLM API 代理 v2.9.99 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -1223,8 +1223,10 @@ class Handler(BaseHTTPRequestHandler):
         if isinstance(body, dict):
             req_model = body.get("model") or ""
             if req_model and not force_upstream:
-                # 检查是否有任何渠道的 model == req_model
-                if any(up.get("model") == req_model or up.get("messages_model") == req_model for up in UPSTREAMS):
+                # 检查是否有任何渠道的 model == req_model（responses_direct 渠道不参与钉选，只走默认回退）
+                if any(not up.get("responses_direct") and
+                       (up.get("model") == req_model or up.get("messages_model") == req_model)
+                       for up in UPSTREAMS):
                     model_pinned = True
 
         # 工作时间判定：工作日 9:00-18:00（用于 worktime_only 渠道）
@@ -1282,7 +1284,18 @@ class Handler(BaseHTTPRequestHandler):
 
             # 构建目标 URL 和请求头（每个上游只需一次）
             is_responses_converted = False
-            if is_responses and not use_completions and "anthropic_url" in up and HAS_CCPROXY:
+            if is_responses and up.get("responses_direct") and "openai_url" in up:
+                # Responses API 直通（GPT 原生 Responses 端点，无需 codex-relay 转换）
+                api_path = self.path
+                if api_path.startswith("/v1/"):
+                    api_path = api_path[3:]
+                url = up["openai_url"].rstrip("/") + api_path
+                up_headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {up['key']}",
+                    "Connection": "close",
+                }
+            elif is_responses and not use_completions and "anthropic_url" in up and HAS_CCPROXY:
                 # Responses API → Anthropic Messages 直连（ccproxy 路径）
                 url = up["anthropic_url"].rstrip("/")
                 mkey = up["key"]  # 统一用渠道 key（external-claude 拆分后单一 key）
@@ -1351,7 +1364,9 @@ class Handler(BaseHTTPRequestHandler):
             if body is not None:
                 # Messages 路径走 Anthropic 端点，用 messages_model（如 grok-4.5-claude）；
                 # relay/通用 OpenAI 路径用 model（OpenAI 名）。converted 路径下方再覆盖。
-                body["model"] = up.get("messages_model", up["model"]) if is_messages else up["model"]
+                # responses_direct 渠道透传客户端原始 model（GPT 原生名，上游按名路由）
+                if not up.get("responses_direct"):
+                    body["model"] = up.get("messages_model", up["model"]) if is_messages else up["model"]
                 if is_responses and body.get("previous_response_id"):
                     pid_len = len(json.dumps(body, ensure_ascii=False))
                     if pid_len > 200000:
@@ -1503,8 +1518,9 @@ class Handler(BaseHTTPRequestHandler):
                 last_err = (e.code, err_body)
                 log.error("[#%d]     !!! %s HTTP %d: %s", self._req_id, up["name"], e.code, err_body[:300].decode(errors="replace"))
                 # 任意路径 + HTTP 超限(ecloud/venus/internal 等 400 带超限文案) → 返干净 400 触发客户端压缩（不回退）
-                if (is_messages or is_responses) and _is_overflow_signal(err_body.decode("utf-8", errors="replace")):
-                    self._send_overflow_400(up, _est_tokens(body), as_responses=is_responses)
+                _ovtxt = err_body.decode("utf-8", errors="replace")
+                if (is_messages or is_responses) and _is_overflow_signal(_ovtxt):
+                    self._send_overflow_400(up, _est_tokens(body), as_responses=is_responses, upstream_text=_ovtxt)
                     return
                 # 429 rate_limit → 解析重置时间，封锁 official+external（HTTP 错误，所有路径都经过此处）
                 if e.code == 429:
@@ -1708,7 +1724,7 @@ class Handler(BaseHTTPRequestHandler):
                                     held = []
                                     _write(out); size += len(out)
                                     flushed = True
-                                elif _is_overflow_signal(block.decode("utf-8", errors="replace")) or b'"message_stop"' in block:
+                                elif _is_overflow_signal(_btxt := block.decode("utf-8", errors="replace")) or b'"message_stop"' in block:
                                     # 上游超限信号(model_context_window_exceeded / context_length_exceeded /
                                     # "prompt is too long" 等)或空完整收尾(出内容前 message_stop) → 返干净 400
                                     # 触发客户端 auto-compact（探测期未提交 200，可直接 _send_raw(400)）
@@ -1717,7 +1733,7 @@ class Handler(BaseHTTPRequestHandler):
                                         resp.close()
                                     except Exception:
                                         pass
-                                    self._send_overflow_400(up, est_input)
+                                    self._send_overflow_400(up, est_input, upstream_text=_btxt)
                                     return
                                 elif is_error_block:
                                     # 429 → 封锁渠道（与 relay 一致）
@@ -2279,7 +2295,8 @@ class Handler(BaseHTTPRequestHandler):
                         resp.close()
                     except Exception:
                         pass
-                    self._send_overflow_400(up, est_input, as_responses=True)
+                    self._send_overflow_400(up, est_input, as_responses=True,
+                                            upstream_text=json.dumps(early_err[1], ensure_ascii=False) if early_err else "")
                     return events, has_output, None, False
 
                 # === 早期 response.failed（非超限）：未发头一律回退下一上游（429 先封锁渠道）；已发头才转发 ===
@@ -2408,13 +2425,20 @@ class Handler(BaseHTTPRequestHandler):
             except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
                 log.warning("client disconnected before error response")
 
-    def _send_overflow_400(self, up, est_tokens=0, as_responses=False):
+    def _send_overflow_400(self, up, est_tokens=0, as_responses=False, upstream_text=""):
         """超限：向客户端返干净 HTTP 400（触发其 auto-compact）。
         不做 est 预判——调用方已通过上游实际响应(_is_overflow_signal 命中)确认是真超限。
         as_responses=True → OpenAI Responses 错误形态（relay/converted，Codex）；
-        否则 Anthropic 形态（messages，Claude Code，H1 实锤：此形态触发 auto-compact）。"""
+        否则 Anthropic 形态（messages，Claude Code，H1 实锤：此形态触发 auto-compact）。
+        upstream_text：上游原始报错——从中提取真实上限数字（est 低估/配置 max 虚高时避免矛盾文案）"""
+        import re as _re
         max_ctx = up.get("max_context_tokens", 200000)
-        msg = (f"prompt is too long: ~{int(est_tokens)} tokens > {max_ctx} maximum context window"
+        shown_max = max_ctx
+        if upstream_text:
+            m = _re.search(r"maximum context length is (\d+)|context length of (\d+)", upstream_text)
+            if m:
+                shown_max = int(m.group(1) or m.group(2))
+        msg = (f"prompt is too long: ~{int(est_tokens)} tokens > {shown_max} maximum context window"
                if est_tokens else "context length exceeded, please reduce conversation history")
         if as_responses:
             err = json.dumps({"error": {"message": msg, "type": "invalid_request_error",
@@ -2486,7 +2510,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.98 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.99 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
