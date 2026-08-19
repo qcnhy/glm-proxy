@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.106 — codex-relay + Python 路由层
+GLM API 代理 v2.9.107 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -1522,7 +1522,7 @@ class Handler(BaseHTTPRequestHandler):
                     if is_responses_converted:
                         # Responses→Messages 转换路径：增量流式 + 早期错误退避重试 + 错误转发
                         _custom_ff = {t.get("name") for t in body.get("tools", []) if isinstance(t, dict) and t.get("type") == "custom"}
-                        cres = self._converted_stream_with_retry(resp, up, url, up_headers, payload, method, custom_freeform_tools=_custom_ff)
+                        cres = self._converted_stream_with_retry(resp, up, url, up_headers, payload, method, custom_freeform_tools=_custom_ff, est_input=_est_tokens(body))
                         if cres.get("done"):
                             return
                         # 真空输出（无错误）→ 尝试下一个上游
@@ -1923,7 +1923,7 @@ class Handler(BaseHTTPRequestHandler):
             stop_ka.set()
 
     # ── Responses→Messages 转换流式处理（旧：整段缓冲，留作兜底）──
-    def _converted_stream_with_retry(self, first_resp, up, url, up_headers, payload, method, custom_freeform_tools=None):
+    def _converted_stream_with_retry(self, first_resp, up, url, up_headers, payload, method, custom_freeform_tools=None, est_input=0):
         """converted 路径（probe-before-commit）：同步翻译 Anthropic→Responses。
         延迟提交 200：首条内容前缓冲，见内容才提交+flush；overflow(超限 stop_reason / 空收尾 / error 体)
         → 返干净 400(as_responses)触发客户端压缩；其他早期错误转发 response.failed。"""
@@ -2003,6 +2003,10 @@ class Handler(BaseHTTPRequestHandler):
             # Responses usage 必须含 total_tokens（Codex 严格解析，缺失会 "failed to parse ResponseCompleted"）
             u = dict(usage[0])
             inp = u.get("input_tokens", 0) or 0
+            # v2.9.107: 上游网关可能只报"截断后实际处理的量"（如 lerwee 420k→15k），
+            # 客户端据此计数永远到不了压缩线 → 会话无限膨胀。取 max(上游, est) 报真实规模。
+            if est_input and inp < int(est_input):
+                inp = int(est_input)
             out = u.get("output_tokens", 0) or 0
             u["input_tokens"] = inp
             u["output_tokens"] = out
@@ -2660,7 +2664,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.106 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.107 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
