@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.104 — codex-relay + Python 路由层
+GLM API 代理 v2.9.105 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -73,6 +73,16 @@ def _block_channel_on_429(err_body, upstream_name, req_id=0):
 
 # ── 配置 ──────────────────────────────────────────────
 _CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+# cmoyan 开关文件：存在 = 开（默认链前插 cmoyan，带 ≥1MB 跳过保护）；删除 = 关（不参与链）
+_SWITCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cmoyan.on")
+
+
+def _cmoyan_switch_on():
+    """touch cmoyan.on 开 / rm cmoyan.on 关，无需重启代理。"""
+    try:
+        return os.path.exists(_SWITCH_PATH)
+    except Exception:
+        return False
 
 def _load_config():
     """从 config.json 加载配置（密钥等敏感信息）。不存在则用示例。"""
@@ -1320,9 +1330,11 @@ class Handler(BaseHTTPRequestHandler):
         # 动态 key 映射预览：0=专属渠道（如有），1=链内第一渠道...
         key_map = {"0": u["name"] for u in exclude_upstreams[:1]}
         key_map.update({str(i + 1): up["name"] for i, up in enumerate(chain_upstreams)})
-        log.info("[#%d] ROUTE: key=%s model=%s force=%s pinned=%s worktime=%s blocked=%s needs_comp=%s needs_msg=%s path=%s key_map=%s",
+        switch_on = _cmoyan_switch_on() and not force_upstream
+        log.info("[#%d] ROUTE: key=%s model=%s force=%s pinned=%s worktime=%s blocked=%s cmoyan_sw=%s needs_comp=%s needs_msg=%s path=%s key_map=%s",
                  self._req_id, client_key[:20] or "(empty)", req_model or "?",
                  force_upstream, model_pinned, is_worktime, blocked_active or "{}",
+                 "on" if switch_on else "off",
                  needs_completions, needs_messages, self.path, key_map)
         if has_images:
             log.info("    [image] 含图片 → 走 Messages 路径")
@@ -1330,8 +1342,9 @@ class Handler(BaseHTTPRequestHandler):
         for up in UPSTREAMS:
             if up.get("disabled"):
                 continue
-            # chain_exclude 渠道（如 cmoyan）不参与默认回退链，仅 key=0 专属直达
-            if up.get("chain_exclude") and up["name"] != force_upstream:
+            # chain_exclude 渠道（如 cmoyan）默认不参与回退链（仅 key=0 专属直达）；
+            # 开关文件 cmoyan.on 存在时放行进链（按 config 位次尝试，失败照常回退）
+            if up.get("chain_exclude") and up["name"] != force_upstream and not _cmoyan_switch_on():
                 continue
             # v2.9.103: 超大载荷跳过 responses_direct（如 cmoyan）——大上下文会话源站处理超
             # Cloudflare 100s 上限必 524，白等约两分钟才回退。≥1MB 直接跳过走下一渠道。
@@ -2647,7 +2660,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.104 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.105 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
