@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.99 — codex-relay + Python 路由层
+GLM API 代理 v2.9.100 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -21,6 +21,17 @@ from socketserver import ThreadingMixIn
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 from datetime import datetime
+
+# ── IPv4 优先（本机 IPv6 出站不通：AAAA 先试会卡 SYN-SENT 直到 300s 超时才回退 IPv4）──
+# urllib 无 Happy Eyeballs（curl 有），getaddrinfo 稳定排序把 IPv4 提前即可；
+# 域名只有 AAAA 时仍按原序尝试（行为不劣化）。曾致 official "4.5 分钟才回 429"、
+# cmoyan 直通"挂死 9 分钟"——实为 IPv6 SYN 卡满超时。
+_orig_getaddrinfo = socket.getaddrinfo
+def _ipv4_first_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    res = _orig_getaddrinfo(host, port, family, type, proto, flags)
+    res.sort(key=lambda ai: ai[0] != socket.AF_INET)  # 稳定排序：IPv4 提前，同族保持原序
+    return res
+socket.getaddrinfo = _ipv4_first_getaddrinfo
 
 # ── 渠道封锁标志（429 限额时封锁 external+official，直到重置时间）──
 _channel_blocked_until = {}  # {"external": timestamp, "official": timestamp}
@@ -1364,8 +1375,11 @@ class Handler(BaseHTTPRequestHandler):
             if body is not None:
                 # Messages 路径走 Anthropic 端点，用 messages_model（如 grok-4.5-claude）；
                 # relay/通用 OpenAI 路径用 model（OpenAI 名）。converted 路径下方再覆盖。
-                # responses_direct 渠道透传客户端原始 model（GPT 原生名，上游按名路由）
-                if not up.get("responses_direct"):
+                # responses_direct 渠道透传客户端原始 model（GPT 原生名，上游按名路由）；
+                # 用 req_model 而非 body["model"]——回退链前面的渠道可能已把 body["model"] 改写成自己的 model
+                if up.get("responses_direct"):
+                    body["model"] = req_model
+                else:
                     body["model"] = up.get("messages_model", up["model"]) if is_messages else up["model"]
                 if is_responses and body.get("previous_response_id"):
                     pid_len = len(json.dumps(body, ensure_ascii=False))
@@ -2178,8 +2192,24 @@ class Handler(BaseHTTPRequestHandler):
         raw_blocks = []
 
         committed = [False]
-        def _commit():
-            # probe-before-commit：延迟提交 200，首次 _write 才提交，便于超限(200流式)时改返干净 400
+        wlock = threading.Lock()
+        stop_ka = threading.Event()
+
+        def _keepalive():
+            while not stop_ka.wait(3):
+                try:
+                    with wlock:
+                        if committed[0]:
+                            self.wfile.write(b": keepalive\n\n")
+                            self.wfile.flush()
+                except Exception:
+                    break
+
+        def _commit_locked():
+            # 调用方须持 wlock。probe-before-commit：延迟提交 200，首次 _write 才提交，
+            # 便于超限(200流式)时改返干净 400。commit 后启动 keepalive——
+            # responses_direct 直通渠道无 codex-relay keepalive，GPT 大上下文首内容可达数分钟，
+            # 不发心跳客户端会 "Stream idle timeout" 断开（与 messages 路径 v2.9.80 同型问题）
             if committed[0]:
                 return
             self.send_response(200)
@@ -2191,14 +2221,33 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.close_connection = True
             committed[0] = True
+            threading.Thread(target=_keepalive, daemon=True).start()
+
+        def _commit():
+            with wlock:
+                _commit_locked()
 
         def _write(data):
-            _commit()  # 首次写入前才提交 200（探测期握住不发，超限可不提交直接 400）
-            self.wfile.write(data)
-            self.wfile.flush()
+            with wlock:
+                _commit_locked()  # 首次写入前才提交 200（探测期握住不发，超限可不提交直接 400）
+                self.wfile.write(data)
+                self.wfile.flush()
 
         def _emit(ed):
             _write((f"event: {ed.get('type', '')}\ndata: {json.dumps(ed, ensure_ascii=False)}\n\n").encode())
+
+        def _probe_watchdog():
+            # probe-hold 兜底（与 messages 路径一致）：PROBE_TIMEOUT 仍无首内容 → 强制 commit + keepalive
+            if stop_ka.wait(PROBE_TIMEOUT):
+                return
+            if not committed[0]:
+                log.info("[#%d] [relay] %s probe-hold %ds 无首内容，强制提交防 idle timeout",
+                         self._req_id, upstream_name, PROBE_TIMEOUT)
+                try:
+                    _commit()
+                except Exception:
+                    pass
+        threading.Thread(target=_probe_watchdog, daemon=True).start()
 
         resp = first_resp
         try:
@@ -2288,9 +2337,11 @@ class Handler(BaseHTTPRequestHandler):
 
                 # === 超限检测（靠上游实际响应）===：response.failed 带超限文案 或 空 completed(无 output)
                 # → 返干净 400（Responses 形态）触发客户端压缩；探测期未提交 200，可直接 _send_raw(400)
-                if (early_err and not has_output
-                        and _is_overflow_signal(json.dumps(early_err[1], ensure_ascii=False))) \
-                   or (held_completed is not None and not has_output):
+                if not committed[0] and (
+                        (early_err and not has_output
+                         and _is_overflow_signal(json.dumps(early_err[1], ensure_ascii=False)))
+                        or (held_completed is not None and not has_output)):
+                    # 仅探测期（未发 200 头）可改返 400；watchdog 已强制 commit 则走正常收尾，防二次 send_response
                     try:
                         resp.close()
                     except Exception:
@@ -2367,6 +2418,8 @@ class Handler(BaseHTTPRequestHandler):
                 log.info("    usage: input=%d output=%d total=%d", inp, out_, inp + out_)
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
             log.warning("[#%d]     <<< %s STREAM interrupted", self._req_id, upstream_name)
+        finally:
+            stop_ka.set()  # 停 keepalive / watchdog
 
         return events, True, stream_error, False  # 已发响应头，总是 done（不回退下一上游）
 
@@ -2510,7 +2563,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.99 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.100 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
