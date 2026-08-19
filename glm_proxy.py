@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.100 — codex-relay + Python 路由层
+GLM API 代理 v2.9.101 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -2390,6 +2390,7 @@ class Handler(BaseHTTPRequestHandler):
                     if est_input:
                         try:
                             u = held_completed.setdefault("response", {}).setdefault("usage", {})
+                            u.setdefault("output_tokens", 0)  # Codex required 字段，上游缺失时补
                             u["input_tokens"] = int(est_input)
                             u["total_tokens"] = int(est_input) + int(u.get("output_tokens", 0) or 0)
                             # 同步到 last_usage（日志用——否则 last_usage 是上游原始值=0）
@@ -2399,12 +2400,19 @@ class Handler(BaseHTTPRequestHandler):
                             pass
                     _emit(held_completed)
                 elif not stream_error:
-                    # 上游未发 response.completed（不完整流）→ 合成收尾，避免客户端"响应结束但一直转"
+                    # 上游未发 response.completed（不完整流，如 cmoyan 截断：仅 created+in_progress）→ 合成收尾，
+                    # 避免客户端"响应结束但一直转"。usage 三字段必须齐（Codex 解析 ResponseCompleted
+                    # required output_tokens，缺失报 "failed to parse ResponseCompleted" 断流——与 converted
+                    # 路径 total_tokens 教训同型）；input 用 est 兜底让客户端感知真实上下文
                     log.warning("[#%d]     !!! %s no response.completed, synthesizing (has_output=%s, events=%d)",
                                 self._req_id, upstream_name, has_output, events)
+                    _syn_in = int(last_usage.get("input_tokens", 0) or est_input or 0)
+                    _syn_out = int(last_usage.get("output_tokens", 0) or 0)
                     _emit({"type": "response.completed", "sequence_number": events + 1,
                            "response": {"id": "resp_syn", "object": "response",
-                                        "status": "completed", "output": [], "usage": last_usage or {}}})
+                                        "status": "completed", "output": [],
+                                        "usage": {"input_tokens": _syn_in, "output_tokens": _syn_out,
+                                                  "total_tokens": _syn_in + _syn_out}}})
                 break  # 完成，退出重试循环
 
             # 保存 exchange 用于排查
@@ -2563,7 +2571,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.100 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.101 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
