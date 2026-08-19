@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.105 — codex-relay + Python 路由层
+GLM API 代理 v2.9.106 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -1284,14 +1284,14 @@ class Handler(BaseHTTPRequestHandler):
         body_saved = False  # 调试body只保存一次（首次失败时）
 
         # 客户端 Authorization key 路由：
-        # - key="0" → 强制走 chain_exclude 渠道（如 cmoyan 专属直达，不参与默认链）
+        # - key="0" → 开关开（cmoyan.on 存在）时强制走 chain_exclude 渠道；开关关时落回默认链
         # - 纯数字 key=N → 强制走链内第 N 个渠道（1-based，跳过 chain_exclude，动态不写死渠道名）
         # - 其他 key → 默认按配置顺序回退（不含 chain_exclude 渠道）；受模型钉选 / 429 封锁影响
         client_key = self.headers.get("Authorization", "").replace("Bearer ", "").strip()
         force_upstream = None  # 强制渠道 name；None 表示默认回退链
         chain_upstreams = [u for u in UPSTREAMS if not u.get("chain_exclude")]
         exclude_upstreams = [u for u in UPSTREAMS if u.get("chain_exclude")]
-        if client_key == "0" and exclude_upstreams:
+        if client_key == "0" and exclude_upstreams and _cmoyan_switch_on():
             force_upstream = exclude_upstreams[0]["name"]
         elif client_key.isdigit():
             idx = int(client_key) - 1
@@ -2660,7 +2660,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.105 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.106 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
