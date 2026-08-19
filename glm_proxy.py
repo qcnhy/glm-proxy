@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.101 — codex-relay + Python 路由层
+GLM API 代理 v2.9.102 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -34,6 +34,7 @@ def _ipv4_first_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
 socket.getaddrinfo = _ipv4_first_getaddrinfo
 
 # ── 渠道封锁标志（429 限额时封锁 external+official，直到重置时间）──
+# 1313 公平使用限频不封锁，只回退下一上游
 _channel_blocked_until = {}  # {"external": timestamp, "official": timestamp}
 
 def _block_channel_on_429(err_body, upstream_name, req_id=0):
@@ -416,6 +417,55 @@ def _stop_relays():
 
 
 
+def _concat_tool_output(a, b):
+    """合并两条 tool 输出（保持首条形态：str+str→str，其余→块列表）。"""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    if isinstance(a, str) and isinstance(b, str):
+        # 空壳头以 "Output:\n" 结尾，正文直接续上；其余用换行分隔
+        return a if a.endswith("\n") else a + "\n" + b
+
+    def _blocks(x):
+        if isinstance(x, list):
+            return [y for y in x if isinstance(y, dict)]
+        if isinstance(x, str):
+            return [{"type": "input_text", "text": x}] if x else []
+        return []
+
+    return _blocks(a) + _blocks(b)
+
+
+def _merge_duplicate_tool_outputs(body):
+    """Codex 新版 exec 会把同一次调用的输出拆成多条 input 记录（先"Script completed...Output:\\n"
+    空壳头，正文 text()/notify() 载荷在后续条目，call_id 相同）。真实 Responses 后端能容忍重复
+    call_id，但 relay/converted 转换层每 call_id 只认一条 → 模型只看到空壳头（"工具输出全是空"）。
+    这里按出现顺序合并同 call_id 的输出，恢复"头+正文"单条形态（12:03 健康时期的 wire 格式）。
+    返回合并掉的条目数。"""
+    items = body.get("input")
+    if not isinstance(items, list):
+        return 0
+    merged = []
+    last_out_idx = {}  # call_id → 在 merged 中的下标
+    n_merged = 0
+    for it in items:
+        if isinstance(it, dict) and it.get("type") in ("custom_tool_call_output", "function_call_output"):
+            cid = it.get("call_id")
+            idx = last_out_idx.get(cid) if cid is not None else None
+            if idx is not None:
+                prev = merged[idx]
+                prev["output"] = _concat_tool_output(prev.get("output"), it.get("output"))
+                n_merged += 1
+                continue
+            if cid is not None:
+                last_out_idx[cid] = len(merged)
+        merged.append(it)
+    if n_merged:
+        body["input"] = merged
+    return n_merged
+
+
 def _request_has_images(body):
     """检测 Responses 请求是否包含图片（input_image）"""
     input_items = body.get("input", [])
@@ -528,6 +578,10 @@ def _append_tool_result(messages, output_item):
     # output 可能是 str 或 list(含 input_image)；转成 Anthropic 块，避免 base64 当文本
     if isinstance(raw_output, list):
         content = _to_anthropic_content(raw_output)
+        # 部分 Anthropic 兼容网关（如 external-claude/glm-5.2）丢弃"块列表"形式的 tool_result
+        # （模型完全看不到输出）→ 纯文本块压平成字符串；含图片块才保留列表
+        if all(b.get("type") == "text" for b in content):
+            content = "".join(b.get("text", "") for b in content)
     else:
         content = raw_output
     tool_result = {
@@ -1199,6 +1253,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
             is_stream = body.get("stream", False)
             self._debug_req_body = body
+            # v2.9.102: 合并同 call_id 的重复 tool 输出（Codex 新版拆两条：空壳头+正文）
+            if is_responses:
+                n_merged = _merge_duplicate_tool_outputs(body)
+                if n_merged:
+                    log.info("[#%d]     [merge-out] 合并 %d 条重复 call_id 的 tool 输出", self._req_id, n_merged)
             _log_exec_io(self._req_id, body)
 
         # 3) 日志 + 计算 payload 大小
@@ -1287,7 +1346,9 @@ class Handler(BaseHTTPRequestHandler):
             # 能力检查：渠道必须支持本次请求需要的端点类型
             if needs_completions and "openai_url" not in up:
                 continue
-            if needs_messages and "anthropic_url" not in up:
+            if needs_messages and "anthropic_url" not in up \
+                    and not (is_responses and up.get("responses_direct")):
+                # responses_direct 直通原生支持 Responses（含图片），无 anthropic_url 也放行
                 continue
             # 通用 OpenAI 路径（/v1/chat/completions 等）：必须有 openai_url
             if not is_responses and not is_messages and "openai_url" not in up:
@@ -2571,7 +2632,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.101 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.102 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
