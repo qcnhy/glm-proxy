@@ -7,3 +7,4 @@ config.json
 proxy.log
 cmoyan.on
 chatgpt_tokens.json
+chatgpt.on

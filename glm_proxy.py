@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.108 — codex-relay + Python 路由层
+GLM API 代理 v2.9.109 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -73,14 +73,16 @@ def _block_channel_on_429(err_body, upstream_name, req_id=0):
 
 # ── 配置 ──────────────────────────────────────────────
 _CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
-# cmoyan 开关文件：存在 = 开（默认链前插 cmoyan，带 ≥1MB 跳过保护）；删除 = 关（不参与链）
+# chain_exclude 渠道各自开关文件：<name>.on 存在 = 开（进默认链 + 专属 manual_key 直达）；删除 = 关（不参与链）
 _SWITCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cmoyan.on")
 
 
-def _cmoyan_switch_on():
-    """touch cmoyan.on 开 / rm cmoyan.on 关，无需重启代理。"""
+def _excl_switch_on(up):
+    """chain_exclude 渠道开关：touch <name>.on 开 / rm 关，无需重启代理。非 exclude 渠道恒 False。"""
+    if not up.get("chain_exclude"):
+        return False
     try:
-        return os.path.exists(_SWITCH_PATH)
+        return os.path.exists(os.path.join(os.path.dirname(_CONFIG_PATH), up["name"] + ".on"))
     except Exception:
         return False
 
@@ -1334,16 +1336,18 @@ class Handler(BaseHTTPRequestHandler):
         body_saved = False  # 调试body只保存一次（首次失败时）
 
         # 客户端 Authorization key 路由：
-        # - key="0" → 开关开（cmoyan.on 存在）时强制走 chain_exclude 渠道；开关关时落回默认链
+        # - key=专属号（config manual_key，如 cmoyan=0 / chatgpt=9）→ 该渠道开关开（<name>.on 存在）时强制直达；开关关时落回默认链
         # - 纯数字 key=N → 强制走链内第 N 个渠道（1-based，跳过 chain_exclude，动态不写死渠道名）
         # - 其他 key → 默认按配置顺序回退（不含 chain_exclude 渠道）；受模型钉选 / 429 封锁影响
         client_key = self.headers.get("Authorization", "").replace("Bearer ", "").strip()
         force_upstream = None  # 强制渠道 name；None 表示默认回退链
         chain_upstreams = [u for u in UPSTREAMS if not u.get("chain_exclude")]
         exclude_upstreams = [u for u in UPSTREAMS if u.get("chain_exclude")]
-        if client_key == "0" and exclude_upstreams and _cmoyan_switch_on():
-            force_upstream = exclude_upstreams[0]["name"]
-        elif client_key.isdigit():
+        for u in exclude_upstreams:
+            if client_key and client_key == str(u.get("manual_key", "")) and _excl_switch_on(u):
+                force_upstream = u["name"]
+                break
+        if not force_upstream and client_key.isdigit():
             idx = int(client_key) - 1
             if 0 <= idx < len(chain_upstreams):
                 force_upstream = chain_upstreams[idx]["name"]
@@ -1377,14 +1381,14 @@ class Handler(BaseHTTPRequestHandler):
         needs_completions = is_responses and use_completions
         needs_messages = is_messages or (is_responses and not use_completions)
         blocked_active = {k: datetime.fromtimestamp(v).strftime("%H:%M") for k, v in _channel_blocked_until.items() if v > time.time()}
-        # 动态 key 映射预览：0=专属渠道（如有），1=链内第一渠道...
-        key_map = {"0": u["name"] for u in exclude_upstreams[:1]}
+        # 动态 key 映射预览：manual_key=专属渠道（如有），1=链内第一渠道...
+        key_map = {str(u["manual_key"]): u["name"] for u in exclude_upstreams if u.get("manual_key")}
         key_map.update({str(i + 1): up["name"] for i, up in enumerate(chain_upstreams)})
-        switch_on = _cmoyan_switch_on() and not force_upstream
-        log.info("[#%d] ROUTE: key=%s model=%s force=%s pinned=%s worktime=%s blocked=%s cmoyan_sw=%s needs_comp=%s needs_msg=%s path=%s key_map=%s",
+        excl_sw = {u["name"]: ("on" if _excl_switch_on(u) else "off") for u in exclude_upstreams}
+        log.info("[#%d] ROUTE: key=%s model=%s force=%s pinned=%s worktime=%s blocked=%s excl_sw=%s needs_comp=%s needs_msg=%s path=%s key_map=%s",
                  self._req_id, client_key[:20] or "(empty)", req_model or "?",
                  force_upstream, model_pinned, is_worktime, blocked_active or "{}",
-                 "on" if switch_on else "off",
+                 excl_sw,
                  needs_completions, needs_messages, self.path, key_map)
         if has_images:
             log.info("    [image] 含图片 → 走 Messages 路径")
@@ -1392,9 +1396,9 @@ class Handler(BaseHTTPRequestHandler):
         for up in UPSTREAMS:
             if up.get("disabled"):
                 continue
-            # chain_exclude 渠道（如 cmoyan）默认不参与回退链（仅 key=0 专属直达）；
-            # 开关文件 cmoyan.on 存在时放行进链（按 config 位次尝试，失败照常回退）
-            if up.get("chain_exclude") and up["name"] != force_upstream and not _cmoyan_switch_on():
+            # chain_exclude 渠道（如 cmoyan/chatgpt）默认不参与回退链（仅各自 manual_key 专属直达）；
+            # 开关文件 <name>.on 存在时放行进链（按 config 位次尝试，失败照常回退）
+            if up.get("chain_exclude") and up["name"] != force_upstream and not _excl_switch_on(up):
                 continue
             # v2.9.103: 超大载荷跳过 cf_gate 渠道（如 cmoyan）——大上下文会话源站处理超
             # Cloudflare 100s 上限必 524，白等约两分钟才回退。≥1MB 直接跳过走下一渠道。
@@ -2740,7 +2744,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.108 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.109 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
