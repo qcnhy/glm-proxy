@@ -1,26 +1,19 @@
 {
- "_comment": "复制本文件为 config.json 并填入真实密钥。config.json 不会被提交到 git。",
-  "_comment_upstreams": "渠道按优先级排列。能力由 URL 字段决定：有 openai_url+relay_port=可服务 Responses(codex-relay→Completions)与通用 OpenAI 路径，有 anthropic_url=可服务 /v1/messages 直连。路由 flag: require_health(需健康检查), worktime_only(仅工作时间), disabled(禁用)。客户端发 key=3 强制走链内第 3 渠道。内网渠道放在最后作为兜底。",
+  "_comment": "复制本文件为 config.json 并填入真实密钥。config.json 不会被提交到 git。",
+  "_comment_upstreams": "渠道按优先级排列。能力由 URL 字段决定：有 openai_url+relay_port=可服务 Responses(codex-relay→Completions)与通用 OpenAI 路径，有 anthropic_url=可服务 /v1/messages 直连。路由 flag: require_health(需健康检查), disabled(禁用)。客户端发数字 key 强制选择链内渠道，内网渠道放在最后作为兜底。",
   "upstreams": [
     {
-      "_comment": "中转站 Completions 端点：用 OpenAI key，仅工作时间。",
-      "name": "external-openai",
-      "openai_url": "https://your-relay/v1",
-      "key": "YOUR_OPENAI_KEY",
-      "relay_port": 4445,
-      "interceptor_port": 14445,
-      "model": "glm-5.2",
-      "max_context_tokens": 1000000
-    },
-    {
-      "_comment": "中转站 Messages 端点：用 Claude key（与 OpenAI key 不同），仅工作时间。无需 relay，仅服务 /v1/messages（Claude Code 等），不参与 Responses 回退链。",
-      "name": "external-claude",
-      "anthropic_url": "https://your-relay/v1/messages",
-      "anthropic_auth": "bearer",
-      "key": "YOUR_CLAUDE_KEY",
-      "model": "glm-5.2",
-      "messages_model": "glm-5.2",
-      "max_context_tokens": 1000000
+      "_comment": "GPT 原生 Responses 固定渠道：使用独立数字 key，不加入 GLM 回退链。store_responses=false 时代理会删除所有纯 item_reference、rs_*/reasoning 和 previous_response_id；进入 GLM 回退链时执行相同清理。",
+      "name": "chatgpt",
+      "openai_url": "https://chatgpt.com/backend-api/codex",
+      "tokens_file": "chatgpt_tokens.json",
+      "key": "",
+      "model": "gpt-5.6-sol",
+      "responses_direct": true,
+      "chain_exclude": true,
+      "disabled": true,
+      "strip_max_output": true,
+      "store_responses": false
     },
     {
       "_comment": "智谱官方：原生两端点，一个 key 通吃。openai_url 用 coding 路径。",
@@ -31,8 +24,8 @@
       "key": "YOUR_ZHIPU_API_KEY",
       "relay_port": 4446,
       "interceptor_port": 14446,
-      "model": "glm-5.2",
-      "messages_model": "glm-5.2",
+      "model": "glm-5.3",
+      "messages_model": "glm-5.3",
       "max_context_tokens": 1000000
     },
     {
@@ -58,7 +51,7 @@
       "relay_port": 4444,
       "interceptor_port": 14444,
       "model": "qwen3.5-plus",
-      "max_context_tokens": 1000000
+      "max_context_tokens": 800000
     }
   ]
 }

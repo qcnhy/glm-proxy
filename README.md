@@ -1,6 +1,6 @@
 # GLM Proxy
 
-让 [Codex CLI](https://developers.openai.com/codex/cli/) 直接使用智谱 GLM 系列模型（glm-5 / glm-5.1 / glm-5.2）的本地代理。
+让 [Codex CLI](https://developers.openai.com/codex/cli/) 直接使用智谱 GLM 系列模型（glm-5 / glm-5.1 / glm-5.3）的本地代理。
 
 Codex CLI 原生只支持 OpenAI Responses API，而智谱 GLM 提供 Chat Completions 和 Anthropic Messages 两种端点。本代理通过 codex-relay 做 Responses ↔ Chat Completions 协议翻译，并处理 Codex 与 GLM 之间的工具格式差异（特别是 `apply_patch`）。
 
@@ -22,11 +22,25 @@ Codex CLI ──► GLM Proxy (:9999)
 | **GLM Proxy**（本仓库） | 主入口 `:9999`。多上游回退、密钥注入、限速、`apply_patch` 工具格式修复、流式错误拦截 |
 | **codex-relay** | Responses API ↔ Chat Completions 翻译（Responses 主路径）。启动时自动 pip 安装 |
 
+### 代码结构
+
+`glm_proxy.py` 只保留兼容启动入口，具体职责拆在 `glm_proxy_app/`：
+
+| 模块 | 职责 |
+|------|------|
+| `common.py` | 配置、日志、共享状态和 HTTP Server 基础设施 |
+| `relay.py` | 上游拦截器及 codex-relay 子进程生命周期 |
+| `transforms.py` | 请求、工具调用和 SSE 的无状态规范化 |
+| `server.py` | 客户端 HTTP Handler、上游路由和流式响应处理 |
+| `main.py` | 应用装配、启动和优雅退出 |
+
+模块依赖保持单向：`common → transforms/relay → server → main`。新增协议修复优先放在
+`transforms.py`，不要继续塞进 HTTP Handler。
+
 ## 功能
 
 - **协议翻译**：codex-relay 把 Codex 的 Responses API 请求转成 GLM 能理解的 Chat Completions 格式；`/v1/messages`（Claude Code 等）直连 Anthropic Messages 端点
 - **多上游回退**：配置多个上游（内网网关 / 中转站 / 智谱官方），按优先级和健康状态自动切换
-- **工作时间路由**：工作时间优先中转站，非工作时间走官方
 - **`apply_patch` 支持**：GLM 不原生支持 Codex 的 FREEFORM 工具，代理做双向转换
   - 请求侧：`custom`/`grammar` 工具定义 → GLM 可调用的 function 格式
   - 响应侧：GLM 的 `function_call` → Codex 的 `custom_tool_call`（含完整流式 delta 事件）
@@ -60,8 +74,8 @@ cp config.example.json config.json
       "key": "...",                            // API 密钥
       "relay_port": 4446,                      // codex-relay 端口
       "interceptor_port": 14446,               // 拦截器端口
-      "model": "glm-5.2",                      // Chat Completions 模型名
-      "messages_model": "glm-5.2",             // Messages 端点模型名（不填则回退到 model）
+      "model": "glm-5.3",                      // Chat Completions 模型名
+      "messages_model": "glm-5.3",             // Messages 端点模型名（不填则回退到 model）
       "max_context_tokens": 202745             // 上下文窗口
     }
   ]
@@ -84,6 +98,8 @@ cp config.example.json config.json
 ### GPT 原生 Responses 直通
 
 GPT 渠道放在 `upstreams` 最前面，配置 `responses_direct: true` 和 `chain_exclude: true`。这些渠道不参与默认回退链，也不接受 `/v1/messages` 或 Chat Completions；只能用数字 key 手动直达。
+
+Responses 服务端 item ID 只存在于生成它的上游。当前 GPT 渠道使用 `store_responses: false`：代理会在请求 GPT 前删除所有纯 `item_reference`、`rs_*`/`reasoning` 状态和 `previous_response_id`；当请求进入 GLM 回退链时执行相同清理，同时保留带完整内容的普通消息、函数调用和工具输出。
 
 多个 GPT 渠道中应只启用一个：将要用的渠道设为 `"disabled": false`，其余设为 `true`，然后重启代理。启用的链外直通渠道使用 key 0；如果全部 disabled，key 0 保持空缺。普通链内渠道始终从 key 1 开始编号，不受 GPT 启停影响。
 
@@ -123,15 +139,21 @@ http://<代理机器IP>:9999
 curl http://127.0.0.1:9999/v1/models
 ```
 
+运行本地回归测试：
+
+```bash
+python3 -m unittest discover -v
+```
+
 ## 上游路由规则
 
 未指定上游时，按以下规则自动选择：
 
-1. **内网网关（internal）**：健康检查通过才使用
-2. **中转站（external）**：工作时间优先；非工作时间也可用（临时放开）
-3. **官方（official）**：工作时间跳过（除非中转站不可用），非工作时间使用
+自动链不区分工作时间，始终按配置顺序回退：
 
-客户端可通过请求头指定上游（如 `X-Upstream: official`）直接走指定上游。
+1. **官方（official）**
+2. **Venus DeepSeek（venus-deepseek）**
+3. **内网千问（internal）**
 
 ## 日志
 

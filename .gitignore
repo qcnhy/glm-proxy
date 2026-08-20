@@ -3,6 +3,7 @@ __pycache__/
 logs/
 debug_req_*.json
 config.json
+config.json.bak.*
 .venv/
 proxy.log
 chatgpt_tokens.json
