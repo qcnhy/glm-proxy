@@ -2,7 +2,7 @@
 import json
 import re
 
-from .common import dbg
+from .common import REQUEST_TIMEOUT, dbg
 
 
 
@@ -107,6 +107,7 @@ def _route_mode(up, is_responses, is_messages):
 
 def _stream_timeout_error(has_output, first_output_timeout):
     """将 Responses 读超时分类为可回退的首输出超时或不可续写的中途截断。"""
+    limit = first_output_timeout or REQUEST_TIMEOUT
     if has_output:
         return {
             "code": "incomplete_stream",
@@ -114,7 +115,7 @@ def _stream_timeout_error(has_output, first_output_timeout):
         }
     return {
         "code": "first_output_timeout",
-        "message": "upstream produced no deliverable output within %ss" % first_output_timeout,
+        "message": "upstream produced no deliverable output within %ss" % limit,
     }
 
 

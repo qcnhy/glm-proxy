@@ -42,6 +42,10 @@ class StreamTimeoutTests(unittest.TestCase):
         err = _stream_timeout_error(True, 45)
         self.assertEqual("incomplete_stream", err["code"])
 
+    def test_timeout_message_falls_back_to_request_timeout(self):
+        err = _stream_timeout_error(False, None)
+        self.assertIn("300s", err["message"])
+
 
 class RequestNormalizationTests(unittest.TestCase):
     def test_exec_rules_are_business_logic_and_idempotent(self):
