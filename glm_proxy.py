@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.107 — codex-relay + Python 路由层
+GLM API 代理 v2.9.108 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -83,6 +83,56 @@ def _cmoyan_switch_on():
         return os.path.exists(_SWITCH_PATH)
     except Exception:
         return False
+
+
+_CHATGPT_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+
+
+def _cg_fresh_access(up):
+    """ChatGPT 订阅渠道：从 tokens 文件取 access_token，exp<6h 自动刷新并写回。
+    返回 (access_token, account_id)；失败返回 (None, None)。"""
+    tf = up.get("tokens_file")
+    if not tf:
+        return None, None
+    path = os.path.join(os.path.dirname(_CONFIG_PATH), tf)
+    try:
+        d = json.load(open(path, encoding="utf-8"))
+        tok = d.get("tokens", d)
+        acc = tok.get("access_token") or ""
+        exp = 0
+        try:
+            import base64 as _b64
+            mid = acc.split(".")[1]
+            exp = json.loads(_b64.urlsafe_b64decode(mid + "=" * (-len(mid) % 4))).get("exp", 0)
+        except Exception:
+            pass
+        rt = tok.get("refresh_token")
+        if (not acc or (exp and exp - time.time() < 6 * 3600)) and rt:
+            rbody = json.dumps({"grant_type": "refresh_token", "refresh_token": rt,
+                                "client_id": d.get("client_id", _CHATGPT_CLIENT_ID),
+                                "scope": "openid profile email offline_access"}).encode()
+            rreq = Request("https://auth.openai.com/oauth/token", data=rbody,
+                           headers={"Content-Type": "application/json",
+                                    "User-Agent": "codex_cli_rs/0.45.0"})
+            try:
+                with urlopen(rreq, timeout=30) as r:
+                    nd = json.loads(r.read())
+                tok["access_token"] = nd["access_token"]
+                if nd.get("id_token"):
+                    tok["id_token"] = nd["id_token"]
+                if nd.get("refresh_token"):
+                    tok["refresh_token"] = nd["refresh_token"]
+                d["tokens"] = tok
+                d["last_refresh"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+                json.dump(d, open(path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+                log.info("[chatgpt] access_token 已自动刷新")
+                acc = tok["access_token"]
+            except Exception as re_:
+                log.warning("[chatgpt] token 刷新失败（用旧token继续）: %s", str(re_)[:100])
+        return acc, tok.get("account_id") or ""
+    except Exception as e:
+        log.warning("[chatgpt] tokens 文件读取失败: %s", str(e)[:100])
+        return None, None
 
 def _load_config():
     """从 config.json 加载配置（密钥等敏感信息）。不存在则用示例。"""
@@ -1346,9 +1396,11 @@ class Handler(BaseHTTPRequestHandler):
             # 开关文件 cmoyan.on 存在时放行进链（按 config 位次尝试，失败照常回退）
             if up.get("chain_exclude") and up["name"] != force_upstream and not _cmoyan_switch_on():
                 continue
-            # v2.9.103: 超大载荷跳过 responses_direct（如 cmoyan）——大上下文会话源站处理超
+            # v2.9.103: 超大载荷跳过 cf_gate 渠道（如 cmoyan）——大上下文会话源站处理超
             # Cloudflare 100s 上限必 524，白等约两分钟才回退。≥1MB 直接跳过走下一渠道。
-            if not force_upstream and up.get("responses_direct") and len(raw) >= 1024 * 1024:
+            # v2.9.108: 改按 cf_gate 标志判定——chatgpt 官方 backend 早发 response.created
+            # 不触发百秒闸，不受此限。
+            if not force_upstream and up.get("cf_gate") and len(raw) >= 1024 * 1024:
                 log.info("[#%d]     [skip] %s: 载荷 %dKB ≥1MB，Cloudflare 必 524，跳过",
                          self._req_id, up["name"], len(raw) // 1024)
                 continue
@@ -1392,9 +1444,18 @@ class Handler(BaseHTTPRequestHandler):
                 url = up["openai_url"].rstrip("/") + api_path
                 up_headers = {
                     "Content-Type": "application/json",
-                    "Authorization": f"Bearer {up['key']}",
+                    "Authorization": f"Bearer {up.get('key', '')}",
                     "Connection": "close",
                 }
+                if up.get("tokens_file"):
+                    # ChatGPT 订阅 OAuth：fresh access_token + 账号头 + beta 头（实测必需组合）
+                    _acc, _acct = _cg_fresh_access(up)
+                    if _acc:
+                        up_headers["Authorization"] = f"Bearer {_acc}"
+                        if _acct:
+                            up_headers["chatgpt-account-id"] = _acct
+                        up_headers["OpenAI-Beta"] = "responses=experimental"
+                        up_headers["originator"] = "codex_cli_rs"
             elif is_responses and not use_completions and "anthropic_url" in up and HAS_CCPROXY:
                 # Responses API → Anthropic Messages 直连（ccproxy 路径）
                 url = up["anthropic_url"].rstrip("/")
@@ -1505,12 +1566,27 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     if is_messages:
                         _fix_tool_result_roles(body)
+                    # chatgpt 官方 backend 两个硬要求：拒 max_output_tokens、必须显式 store:false
+                    _scg = up.get("strip_max_output")
+                    _mox = body.pop("max_output_tokens", None) if _scg else None
+                    _store_bak = body.get("store", "__absent__") if _scg else "__skip__"
+                    if _scg:
+                        body["store"] = False
                     payload = json.dumps(body).encode()
+                    if _mox is not None:
+                        body["max_output_tokens"] = _mox  # 恢复（回退下一上游时原样）
+                    if _store_bak == "__absent__":
+                        body.pop("store", None)
+                    elif _store_bak != "__skip__":
+                        body["store"] = _store_bak
                 if "Content-Type" not in up_headers and payload is not None:
                     up_headers["Content-Type"] = "application/json"
                 if _tools_bak is not None:
                     body["tools"] = _tools_bak  # 恢复 tools（回退下一上游时原样）
-            up_headers["User-Agent"] = _UPSTREAM_UA  # 防 Cloudflare 1010
+            if up.get("tokens_file"):
+                up_headers["User-Agent"] = "codex_cli_rs/0.45.0"  # ChatGPT backend 认 codex UA（实测组合）
+            else:
+                up_headers["User-Agent"] = _UPSTREAM_UA  # 防 Cloudflare 1010
 
             log.info("[#%d]     -> %s", self._req_id, up["name"])
 
@@ -2664,7 +2740,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.107 :%d", LISTEN[1])
+    log.info("GLM Proxy v2.9.108 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
