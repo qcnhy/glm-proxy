@@ -14,6 +14,7 @@
 - External OpenAI/Claude channels and all worktime routing were removed. The fixed automatic chain is official -> venus-deepseek -> internal for both Responses and Messages.
 - Responses never convert to Anthropic Messages: GLM Responses always use codex-relay -> Chat Completions, while `anthropic_url` only serves direct `/v1/messages` clients. Image stripping is intentionally deferred until a real upstream incompatibility is observed.
 - GPT direct Responses use a 45-second first-deliverable-output timeout. Before text or a valid tool call, timeout enters the normal GLM fallback chain; after deliverable output begins, the read timeout returns to 300 seconds and any later timeout becomes `response.failed` without cross-model continuation.
+- `stream disconnected before completion` (mid-stream) = GLM official upstream itself drops the SSE connection after partial output; codex-relay translates it to `response.failed(stream_incomplete)` and the proxy forwards it. By design there is no cross-model retry after output. Rare (once per evening as of 2026-08-20); if frequency rises, plan is same-channel silent retry when almost no deltas were emitted, plus per-channel drop-rate demotion similar to the 429 block.
 
 ## Verification
 
