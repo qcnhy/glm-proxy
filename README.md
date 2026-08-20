@@ -79,13 +79,15 @@ cp config.example.json config.json
 | `anthropic_url` | 否 | 配置则可服务 `/v1/messages` 直连请求（Claude Code 等） |
 | `anthropic_auth` | 否 | `x-api-key`（智谱官方）或 `bearer`（中转站） |
 | `messages_model` | 否 | Messages 端点模型名，不填回退到 `model` |
-| `max_context_tokens` | 是 | 上下文窗口，用于触发 max_tokens 上限保护 |
+| `max_context_tokens` | GLM 渠道必填 | 上下文窗口，上报 `/v1/models` 供 Codex 判断压缩时机；`responses_direct`（GPT 直通）渠道无需配置（Codex 原生认识 GPT 模型窗口） |
 
 ### GPT 原生 Responses 直通
 
 GPT 渠道放在 `upstreams` 最前面，配置 `responses_direct: true` 和 `chain_exclude: true`。这些渠道不参与默认回退链，也不接受 `/v1/messages` 或 Chat Completions；只能用数字 key 手动直达。
 
 多个 GPT 渠道中应只启用一个：将要用的渠道设为 `"disabled": false`，其余设为 `true`，然后重启代理。启用的链外直通渠道使用 key 0；如果全部 disabled，key 0 保持空缺。普通链内渠道始终从 key 1 开始编号，不受 GPT 启停影响。
+
+GPT 模型不出现在 `/v1/models` 列表中（Codex 对 GPT 模型名使用原生窗口知识），也不参与本地上下文超限启发式——GPT 超限会返回结构化错误，由错误处理层直接转发。
 
 Responses 不按是否带 `input_image` 分叉；图片和文本统一走 codex-relay 路径处理。如果上游明确返回图片不兼容错误，再由错误处理层执行后续降级。
 

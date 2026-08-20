@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v3.0.0 — codex-relay + Python 路由层
+GLM API 代理 v3.0.1 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -146,13 +146,16 @@ LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 
 UPSTREAMS = _cfg.get("upstreams", [])
 
+# v3.0.1: responses_direct（GPT 直通）渠道不进列表——GPT 模型窗口 Codex 原生认识，
+# 代理替它报 context_window 反而会用默认值覆盖成错误窗口（chatgpt 渠道无该字段→128000）。
+_CHAIN_UPS = [up for up in UPSTREAMS if not up.get("responses_direct")]
 STATIC_MODELS = json.dumps({
     "object": "list",
     "data": list({up["model"]: {"id": up["model"], "slug": up["model"], "object": "model",
                                 "owned_by": up.get("owned_by", "zhipu"),
                                 "context_window": up.get("max_context_tokens", 128000),
                                 "max_context_window": up.get("max_context_tokens", 128000)}
-                  for up in UPSTREAMS}.values()),
+                  for up in _CHAIN_UPS}.values()),
     # v2.9.87: Codex models_manager 期望 "models" 字段（非标准 OpenAI "data"），
     # 缺失会每 3 分钟报 "failed to decode models response: missing field models"
     # v2.9.92: Codex 新版还要每个 model 对象含 "slug" 字段，缺失报 "missing field `slug`"
@@ -160,7 +163,7 @@ STATIC_MODELS = json.dumps({
                                  "owned_by": up.get("owned_by", "zhipu"),
                                  "context_window": up.get("max_context_tokens", 128000),
                                  "max_context_window": up.get("max_context_tokens", 128000)}
-                   for up in UPSTREAMS}.values()),
+                   for up in _CHAIN_UPS}.values()),
 }, ensure_ascii=False).encode()
 
 # ── 日志 ──────────────────────────────────────────────
@@ -1966,6 +1969,10 @@ class Handler(BaseHTTPRequestHandler):
         供缺口1(500/502) 与 缺口3(流式 context_exceeded) 复用。只在上游「确实处理不了」时
         才拦截返 400 触发客户端压缩重试——不做飞行前预判拦截（用户要求：先让请求发出去试）。
         返回 True=已发400(调用方应return)；False=未超限不拦截(调用方继续回退下一个上游)。"""
+        # responses_direct（GPT 直通）不走 est 启发式：GPT 超限会返回结构化 400（带真实上限），
+        # 由 _is_overflow_signal 路径处理；est>0.9*兜底值(200K) 的猜测对 GPT 只会误伤。
+        if up.get("responses_direct"):
+            return False
         max_ctx = up.get("max_context_tokens", 200000)
         est_tokens = _est_tokens(body)  # 剔除 base64 图片，避免虚高
         if est_tokens <= max_ctx * 0.9:
@@ -2019,7 +2026,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v3.0.0 :%d", LISTEN[1])
+    log.info("GLM Proxy v3.0.1 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:
