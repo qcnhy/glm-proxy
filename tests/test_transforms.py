@@ -2,6 +2,7 @@ import unittest
 
 from glm_proxy_app.transforms import (
     _extract_additional_tools,
+    _inject_tool_rules,
     _merge_duplicate_tool_outputs,
     _route_mode,
     _strip_gpt_state,
@@ -24,8 +25,29 @@ class RouteModeTests(unittest.TestCase):
         self.assertEqual("messages", _route_mode(upstream, False, True))
         self.assertEqual("openai", _route_mode(upstream, False, False))
 
+    def test_responses_never_fall_back_to_anthropic_messages(self):
+        messages_only = {"anthropic_url": "https://example.test/v1/messages"}
+        self.assertIsNone(_route_mode(messages_only, True, False))
+        self.assertEqual("messages", _route_mode(messages_only, False, True))
+
 
 class RequestNormalizationTests(unittest.TestCase):
+    def test_exec_rules_are_business_logic_and_idempotent(self):
+        body = {"tools": [{"type": "custom", "name": "exec", "description": "run js"}]}
+        _inject_tool_rules(body)
+        first = body["tools"][0]["description"]
+        self.assertIn("PURE V8 JavaScript", first)
+        self.assertIn("tools.apply_patch", first)
+        _inject_tool_rules(body)
+        self.assertEqual(first, body["tools"][0]["description"])
+
+    def test_nested_function_exec_receives_rules(self):
+        body = {"tools": [{"type": "function", "function": {
+            "name": "functions-exec", "description": "run js"
+        }}]}
+        _inject_tool_rules(body)
+        self.assertIn("tools.apply_patch", body["tools"][0]["function"]["description"])
+
     def test_gpt_state_is_removed_without_dropping_replayable_history(self):
         body = {
             "previous_response_id": "resp_previous",

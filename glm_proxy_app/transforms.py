@@ -1,10 +1,8 @@
 """请求、工具调用与 SSE 数据的无状态规范化函数。"""
-import base64
 import json
 import re
-import time
 
-from .common import DEBUG, LOG_DIR, dbg, log
+from .common import dbg
 
 
 
@@ -326,7 +324,7 @@ def _inject_tool_rules(body):
     """注入工具描述规则：Codex 新版 exec（JS 编排器）→ V8 沙箱约束 + tools.apply_patch()/shell_command() 用法。
     apply_patch 在新版已降为 exec 的嵌套工具（非独立工具），靠 exec 描述教模型调 tools.apply_patch()。
     relay 路径覆盖。"""
-    if not DEBUG or not isinstance(body, dict):
+    if not isinstance(body, dict):
         return body
     tools = body.get("tools") or body.get("input", [])
     if not isinstance(tools, list):
@@ -349,75 +347,6 @@ def _inject_tool_rules(body):
                 func["description"] = (func.get("description") or "") + _EXEC_FILE_EDIT_RULES
                 modified = True
     return body
-
-
-def _log_exec_io_removed(reqid, body):
-    """扫描请求 input 里的 exec 工具 I/O，记录 apply_patch 等的执行结果（排查 exec/apply_patch 失败）。
-    exec 的 custom_tool_call(input=JS) 与 custom_tool_call_output(output=沙箱执行结果) 按 call_id 配对。
-    请求入口调用一次，relay/messages 全覆盖；非 Responses（无 input 数组）直接返回。"""
-    return
-    inp = body.get("input")
-    if not isinstance(inp, list):
-        return
-    calls = {}  # call_id -> (name, input_text)
-    for it in inp:
-        if isinstance(it, dict) and it.get("type") == "custom_tool_call":
-            calls[it.get("call_id")] = (it.get("name", ""), it.get("input", ""))
-    for it in inp:
-        if not (isinstance(it, dict) and it.get("type") == "custom_tool_call_output"):
-            continue
-        cid = it.get("call_id")
-        name, cin = calls.get(cid, ("", ""))
-        if name != "exec":
-            continue
-        cin_s = cin if isinstance(cin, str) else json.dumps(cin, ensure_ascii=False)
-        out = it.get("output", "")
-        out_s = out if isinstance(out, str) else json.dumps(out, ensure_ascii=False)
-        low_out = out_s.lower()
-        flag = next((kw for kw in ("no match", "line too long", "invalid hunk", "verification",
-                                   "failed", "error", "throw", "sandbox", "exception") if kw in low_out), "")
-        # php -l 等成功输出含 "error" 字样（"No syntax errors detected"），排除误报
-        if flag and "no syntax errors detected" in low_out:
-            flag = ""
-        low_in = cin_s.lower()
-        has_ap = "apply_patch" in low_in
-        # 二段式绕法：apply_patch 创建脚本(.py/.sh/.js/.pl)且内容含写文件操作（逃避 apply_patch 唯一编辑）
-        two_step = has_ap and "*** Add File:" in cin_s and \
-                   any(e in cin_s for e in (".py", ".sh", ".js", ".pl")) and \
-                   any(w in low_in for w in ("open(", "write(", ".write(", "subprocess", "write_text", "<<"))
-        # 检测 apply_patch 以外的编辑方式：python/subprocess/heredoc 写文件（模型逃避 apply_patch）
-        py_edit = (not has_ap) and any(p in low_in for p in ("python", "subprocess", "pathlib")) and \
-                  any(w in low_in for w in ("write", "open(", "writelines", "dump", "<<", "> "))
-        if not (has_ap or py_edit or flag):
-            continue
-        out_snip = ""
-        if flag:
-            i = low_out.find(flag)
-            out_snip = " …" + out_s[max(0, i - 20):i + 100].replace("\n", " ")
-        # apply_patch 失败 → 记 input 的 patch 摘要看 @@ 在不在；python 逃避 / 二段式 → 记代码片段
-        in_snip = ""
-        if has_ap and flag:
-            j = cin_s.find("***")
-            seg = cin_s[j:j + 160] if j >= 0 else cin_s[:160]
-            in_snip = " in:" + seg.replace("\n", "|").replace("\r", "")
-        elif py_edit or two_step:
-            in_snip = " in:" + cin_s[:180].replace("\n", "|").replace("\r", "")
-        if two_step:
-            tag = "script-via-apply_patch? "
-        elif has_ap:
-            tag = "apply_patch "
-        elif py_edit:
-            tag = "python-edit? "
-        else:
-            tag = ""
-        dbg("[#%d] [exec-io] %sout_len=%d%s%s%s",
-                 reqid, tag, len(out_s),
-                 " ✗ " + flag if flag else " ✓",
-                 out_snip, in_snip)
-
-
-
-
 
 # ── token 估算 ──────────────────────────────────────
 
