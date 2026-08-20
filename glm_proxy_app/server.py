@@ -304,7 +304,8 @@ class Handler(BaseHTTPRequestHandler):
                 # responses_direct 渠道透传客户端原始 model（GPT 原生名，上游按名路由）；
                 # 用 req_model 而非 body["model"]——回退链前面的渠道可能已把 body["model"] 改写成自己的 model
                 if up.get("responses_direct"):
-                    body["model"] = req_model
+                    # 客户端未指定 model 时兜底用渠道配置值，不透传空字符串
+                    body["model"] = req_model or up["model"]
                 else:
                     body["model"] = up.get("messages_model", up["model"]) if is_messages else up["model"]
                 if is_responses and body.get("previous_response_id"):
