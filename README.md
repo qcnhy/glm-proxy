@@ -2,31 +2,29 @@
 
 让 [Codex CLI](https://developers.openai.com/codex/cli/) 直接使用智谱 GLM 系列模型（glm-5 / glm-5.1 / glm-5.2）的本地代理。
 
-Codex CLI 原生只支持 OpenAI Responses API，而智谱 GLM 提供 Chat Completions 和 Anthropic Messages 两种端点。本代理在中间做协议翻译，并处理 Codex 与 GLM 之间的工具格式差异（特别是 `apply_patch`）。
+Codex CLI 原生只支持 OpenAI Responses API，而智谱 GLM 提供 Chat Completions 和 Anthropic Messages 两种端点。本代理通过 codex-relay 做 Responses ↔ Chat Completions 协议翻译，并处理 Codex 与 GLM 之间的工具格式差异（特别是 `apply_patch`）。
 
 ## 架构
 
 ```
 Codex CLI ──► GLM Proxy (:9999)
-                 │
-                 ├─► [主路径] Responses→Messages 转换 ──► GLM Anthropic Messages 端点
-                 │            (ccproxy-api)
-                 │
-                 └─► [备用路径] codex-relay ──► GLM Chat Completions 端点
+                │
+                 ├─► codex-relay ──► GLM Chat Completions 端点
                               (Responses→Chat Completions)
+                 │
+                 └─► key=0 ──► GPT 原生 Responses 直通（支持图片）
 ```
 
-### 三个核心组件
+### 核心组件
 
 | 组件 | 作用 |
 |------|------|
 | **GLM Proxy**（本仓库） | 主入口 `:9999`。多上游回退、密钥注入、限速、`apply_patch` 工具格式修复、流式错误拦截 |
-| **ccproxy-api** | Responses API ↔ Anthropic Messages 格式互转（主路径）。启动时自动 pip 安装 |
-| **codex-relay** | Responses API ↔ Chat Completions 翻译（备用路径）。启动时自动 pip 安装 |
+| **codex-relay** | Responses API ↔ Chat Completions 翻译（Responses 主路径）。启动时自动 pip 安装 |
 
 ## 功能
 
-- **协议翻译**：Codex 的 Responses API 请求转成 GLM 能理解的 Anthropic Messages 格式
+- **协议翻译**：codex-relay 把 Codex 的 Responses API 请求转成 GLM 能理解的 Chat Completions 格式；`/v1/messages`（Claude Code 等）直连 Anthropic Messages 端点
 - **多上游回退**：配置多个上游（内网网关 / 中转站 / 智谱官方），按优先级和健康状态自动切换
 - **工作时间路由**：工作时间优先中转站，非工作时间走官方
 - **`apply_patch` 支持**：GLM 不原生支持 Codex 的 FREEFORM 工具，代理做双向转换
@@ -56,8 +54,8 @@ cp config.example.json config.json
   "upstreams": [
     {
       "name": "official",                      // 上游名称
-      "openai_url": "...",                     // Chat Completions 端点（备用路径）
-      "anthropic_url": "...",                  // Anthropic Messages 端点（主路径）
+      "openai_url": "...",                     // Chat Completions 端点（Responses 走 codex-relay 到这里）
+      "anthropic_url": "...",                  // Anthropic Messages 端点（/v1/messages 直连）
       "anthropic_auth": "x-api-key",           // 认证方式：x-api-key / bearer
       "key": "...",                            // API 密钥
       "relay_port": 4446,                      // codex-relay 端口
@@ -78,17 +76,25 @@ cp config.example.json config.json
 | `key` | 是 | API 密钥 |
 | `model` | 是 | Chat Completions 路径用的模型名 |
 | `relay_port` / `interceptor_port` | 是 | codex-relay 子进程端口，各上游不能重复 |
-| `anthropic_url` | 否 | 配置则走 Messages 直连主路径（推荐） |
+| `anthropic_url` | 否 | 配置则可服务 `/v1/messages` 直连请求（Claude Code 等） |
 | `anthropic_auth` | 否 | `x-api-key`（智谱官方）或 `bearer`（中转站） |
 | `messages_model` | 否 | Messages 端点模型名，不填回退到 `model` |
 | `max_context_tokens` | 是 | 上下文窗口，用于触发 max_tokens 上限保护 |
+
+### GPT 原生 Responses 直通
+
+GPT 渠道放在 `upstreams` 最前面，配置 `responses_direct: true` 和 `chain_exclude: true`。这些渠道不参与默认回退链，也不接受 `/v1/messages` 或 Chat Completions；只能用数字 key 手动直达。
+
+多个 GPT 渠道中应只启用一个：将要用的渠道设为 `"disabled": false`，其余设为 `true`，然后重启代理。启用的链外直通渠道使用 key 0；如果全部 disabled，key 0 保持空缺。普通链内渠道始终从 key 1 开始编号，不受 GPT 启停影响。
+
+Responses 不按是否带 `input_image` 分叉；图片和文本统一走 codex-relay 路径处理。如果上游明确返回图片不兼容错误，再由错误处理层执行后续降级。
 
 ## 使用
 
 ### 1. 安装依赖
 
 ```bash
-pip install ccproxy-api codex-relay
+pip install codex-relay
 ```
 
 （代理启动时会自动检查并安装）

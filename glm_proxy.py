@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v2.9.109 — codex-relay + Python 路由层
+GLM API 代理 v3.0.0 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -73,20 +73,6 @@ def _block_channel_on_429(err_body, upstream_name, req_id=0):
 
 # ── 配置 ──────────────────────────────────────────────
 _CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
-# chain_exclude 渠道各自开关文件：<name>.on 存在 = 开（进默认链 + 专属 manual_key 直达）；删除 = 关（不参与链）
-_SWITCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cmoyan.on")
-
-
-def _excl_switch_on(up):
-    """chain_exclude 渠道开关：touch <name>.on 开 / rm 关，无需重启代理。非 exclude 渠道恒 False。"""
-    if not up.get("chain_exclude"):
-        return False
-    try:
-        return os.path.exists(os.path.join(os.path.dirname(_CONFIG_PATH), up["name"] + ".on"))
-    except Exception:
-        return False
-
-
 _CHATGPT_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 
 
@@ -148,7 +134,7 @@ _cfg = _load_config()
 
 LISTEN = ("0.0.0.0", 9999)
 REQUEST_TIMEOUT = 300
-# probe-before-commit 兜底：messages/converted 路径上游首内容前 hold 住响应头（便于检测超限改返 400），
+# probe-before-commit 兜底：messages 路径上游首内容前 hold 住响应头（便于检测超限改返 400），
 # 但探测期客户端收不到任何字节。超过此秒数仍无首内容（上游首 token 慢/深度推理）→ 强制 commit + keepalive，
 # 防客户端流式空闲超时（"Stream idle timeout - no chunks received"，约 60s）。15s 远小于该阈值，
 # 且超限/空收尾信号通常几秒内返回，足够探测到。
@@ -157,11 +143,6 @@ PROBE_TIMEOUT = 15
 # 统一伪装浏览器 UA，对其他 upstream 无副作用。
 _UPSTREAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
-
-# Responses API 路由路径（config.json 的 responses_use_completions 控制）：
-#   True  → codex-relay（Responses→Chat Completions，主路径）
-#   False → ccproxy-api（Responses→Anthropic Messages，备用路径）
-RESPONSES_USE_COMPLETIONS = _cfg.get("responses_use_completions", True)
 
 UPSTREAMS = _cfg.get("upstreams", [])
 
@@ -383,29 +364,6 @@ def _start_interceptors():
         interceptor_servers.append(server)
         log.info("interceptor :%d → %s", up["interceptor_port"], up["openai_url"])
 
-# ── ccproxy-api 自动安装 ────────────────────────────
-def _ensure_ccproxy():
-    """确保 ccproxy-api 已安装（Responses↔Messages 格式转换依赖）"""
-    try:
-        from importlib.metadata import version as _pkg_ver
-        _pkg_ver("ccproxy-api")
-        log.info("ccproxy-api %s OK", _pkg_ver("ccproxy-api"))
-    except Exception:
-        log.info("ccproxy-api not found, installing...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-U",
-                               "ccproxy-api", "--break-system-packages", "--quiet"])
-
-_ensure_ccproxy()
-
-# ccproxy-api 转换模块（Responses ↔ Messages 格式互转）
-try:
-    from ccproxy.llms.formatters.anthropic_to_openai.streams import AnthropicToOpenAIResponsesStreamAdapter
-    from ccproxy.llms.formatters.anthropic_to_openai.responses import convert__anthropic_message_to_openai_responses__response
-    from ccproxy.llms.models.anthropic import MessageResponse
-    HAS_CCPROXY = True
-except ImportError:
-    HAS_CCPROXY = False
-
 # ── codex-relay 子进程管理 ────────────────────────────
 relay_procs = []
 
@@ -502,7 +460,7 @@ def _concat_tool_output(a, b):
 def _merge_duplicate_tool_outputs(body):
     """Codex 新版 exec 会把同一次调用的输出拆成多条 input 记录（先"Script completed...Output:\\n"
     空壳头，正文 text()/notify() 载荷在后续条目，call_id 相同）。真实 Responses 后端能容忍重复
-    call_id，但 relay/converted 转换层每 call_id 只认一条 → 模型只看到空壳头（"工具输出全是空"）。
+    call_id，但 relay 转换层每 call_id 只认一条 → 模型只看到空壳头（"工具输出全是空"）。
     这里按出现顺序合并同 call_id 的输出，恢复"头+正文"单条形态（12:03 健康时期的 wire 格式）。
     返回合并掉的条目数。"""
     items = body.get("input")
@@ -528,136 +486,24 @@ def _merge_duplicate_tool_outputs(body):
     return n_merged
 
 
-def _request_has_images(body):
-    """检测 Responses 请求是否包含图片（input_image）"""
-    input_items = body.get("input", [])
-    if not isinstance(input_items, list):
-        return False
-    for item in input_items:
-        if not isinstance(item, dict):
-            continue
-        for field in ("content", "output"):
-            content = item.get(field)
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "input_image":
-                        return True
-    return False
+def _route_mode(up, is_responses, is_messages):
+    """根据请求需求和渠道能力选择统一路由模式；None 表示不兼容。
 
-
-def _to_anthropic_content(content):
-    """将 Responses API 的 content（str/list）转成 Anthropic Messages 的 content 块列表。
-    关键：input_image(data:image/...;base64,XXX) → Anthropic image 块，
-    否则 GLM 会把 base64 当文本数 token（一张图变几十万 token）。"""
-    if isinstance(content, str):
-        return [{"type": "text", "text": content}] if content else []
-    if not isinstance(content, list):
-        return [{"type": "text", "text": str(content)}] if content else []
-    blocks = []
-    for item in content:
-        if not isinstance(item, dict):
-            blocks.append({"type": "text", "text": str(item)})
-            continue
-        t = item.get("type", "")
-        if t in ("input_text", "output_text", "text"):
-            txt = item.get("text", "")
-            if txt:
-                blocks.append({"type": "text", "text": txt})
-        elif t == "input_image":
-            url = item.get("image_url", "") or item.get("url", "")
-            if url.startswith("data:"):
-                header, _, data = url.partition(",")
-                media = "image/png"
-                for m in ("image/jpeg", "image/jpg", "image/gif", "image/webp"):
-                    if m in header:
-                        media = m
-                        break
-                if data:
-                    blocks.append({"type": "image",
-                                   "source": {"type": "base64", "media_type": media, "data": data}})
-            elif url:
-                blocks.append({"type": "image", "source": {"type": "url", "url": url}})
-    return blocks
-
-
-# ── Responses API → Messages API 请求转换 ──────────────────────────
-
-def _safe_parse_json(s):
-    """安全解析 JSON 字符串，失败返回 {}"""
-    if isinstance(s, dict):
-        return s
-    if not isinstance(s, str):
-        return {}
-    try:
-        r = json.loads(s)
-        # Responses API 的 arguments 有时是 list，取第一个 dict
-        if isinstance(r, list) and r and isinstance(r[0], dict):
-            return r[0]
-        return r if isinstance(r, dict) else {}
-    except (json.JSONDecodeError, ValueError):
-        return {}
-
-
-def _extract_text_from_content(content):
-    """从 Responses API 的 content 数组提取纯文本"""
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return str(content) if content else ""
-    parts = []
-    for part in content:
-        if isinstance(part, dict) and part.get("type") in ("input_text", "output_text", "text"):
-            t = part.get("text", "")
-            if t:
-                parts.append(t)
-    return " ".join(parts)
-
-
-def _append_tool_use(messages, call_item):
-    """将 function_call 输入项追加为 assistant 消息中的 tool_use 块"""
-    tool_block = {
-        "type": "tool_use",
-        "id": call_item.get("call_id", f"call_{len(messages)}"),
-        "name": call_item.get("name", ""),
-        "input": _safe_parse_json(call_item.get("arguments", "{}")),
-    }
-    # 如果最后一条是 assistant 且 content 是 list，追加
-    if messages and messages[-1].get("role") == "assistant":
-        c = messages[-1].get("content")
-        if isinstance(c, list):
-            c.append(tool_block)
-            return
-        elif isinstance(c, str) and c:
-            messages[-1]["content"] = [{"type": "text", "text": c}, tool_block]
-            return
-    # 否则新建 assistant 消息
-    messages.append({"role": "assistant", "content": [tool_block]})
-
-
-def _append_tool_result(messages, output_item):
-    """将 function_call_output 追加为 user 消息中的 tool_result 块"""
-    raw_output = output_item.get("output", "")
-    # output 可能是 str 或 list(含 input_image)；转成 Anthropic 块，避免 base64 当文本
-    if isinstance(raw_output, list):
-        content = _to_anthropic_content(raw_output)
-        # 部分 Anthropic 兼容网关（如 external-claude/glm-5.2）丢弃"块列表"形式的 tool_result
-        # （模型完全看不到输出）→ 纯文本块压平成字符串；含图片块才保留列表
-        if all(b.get("type") == "text" for b in content):
-            content = "".join(b.get("text", "") for b in content)
-    else:
-        content = raw_output
-    tool_result = {
-        "type": "tool_result",
-        "tool_use_id": output_item.get("call_id", ""),
-        "content": content,
-    }
-    # 如果最后一条是 user 且 content 是 list，追加
-    if messages and messages[-1].get("role") == "user":
-        c = messages[-1].get("content")
-        if isinstance(c, list):
-            c.append(tool_result)
-            return
-    messages.append({"role": "user", "content": [tool_result]})
+    路由只依赖能力字段，不依赖渠道名称或配置位置。
+    """
+    if is_responses:
+        if up.get("responses_direct") and up.get("openai_url"):
+            return "responses_direct"
+        # Responses 统一走 codex-relay（Responses→Chat Completions）
+        if up.get("openai_url") and up.get("relay_port"):
+            return "responses_relay"
+        return None
+    if is_messages:
+        return "messages" if up.get("anthropic_url") else None
+    # responses_direct 声明的是单端点能力，不隐式扩展为通用 OpenAI 能力。
+    if up.get("openai_url") and not up.get("responses_direct"):
+        return "openai"
+    return None
 
 
 # apply_patch 独立工具规则已移除：Codex 新版不再声明 apply_patch 为独立工具，
@@ -716,12 +562,12 @@ _EXEC_FILE_EDIT_RULES = (
 def _extract_additional_tools(body):
     """Codex 新版把工具声明放在 input 数组的 additional_tools item
     （{type:"additional_tools", role:"developer", tools:[...]}），而非顶层 tools。
-    本代理三条路径（relay/converted/messages）和 codex-relay 都只认顶层 tools，
+    本代理各路径（relay/messages）和 codex-relay 都只认顶层 tools，
     不处理 additional_tools → 工具定义全丢 → 模型看不到工具、无法 tool_call、
     输出一句意图就结束。
 
     这里在转发前把 additional_tools 的工具提取合并到顶层 body["tools"]（按 name 去重），
-    并从 input 移除该 item（避免被 codex-relay/converted 当 developer 消息污染上下文）。
+    并从 input 移除该 item（避免被 codex-relay 当 developer 消息污染上下文）。
     幂等：已提取后再次调用 input 里无 additional_tools，直接 no-op。"""
     if not isinstance(body, dict):
         return body
@@ -764,18 +610,17 @@ def _extract_additional_tools(body):
 
 
 def _flatten_agent_messages(body):
-    """规整 Codex 多智能体（sub-agent）消息为标准类型，避免 relay/converted 路径产出未知内容类型。
+    """规整 Codex 多智能体（sub-agent）消息为标准类型，避免 relay 路径产出未知内容类型。
 
     Codex 桌面版多智能体功能在 input 数组里发：
     - type=agent_message：父 agent 给子 agent 的协作消息（NEW_TASK 等，含 author/recipient）
     - content block type=encrypted_content：携带任务 payload 文本（encrypted_content 字段）
     codex-relay 不认识 agent_message，会把它的 content 块（含 encrypted_content）原样透传，
     GLM/智谱 Anthropic 端点只认 text/image/tool_use/tool_result → 1214「content[N].type 类型错误」。
-    _convert_responses_to_messages（converted 路径）对 agent_message 无分支会直接丢弃 → 任务 payload 丢失。
 
     这里：agent_message → message(role=user，子 agent 收到的任务即用户指令)；
           encrypted_content 块 → input_text（取其 encrypted_content 字段文本）。
-    relay + converted 两路径共享，规整后都产出标准类型。幂等。"""
+    relay 路径规整后产出标准类型。幂等。"""
     if not isinstance(body, dict):
         return body
     inp = body.get("input")
@@ -879,7 +724,7 @@ def _fix_tool_result_roles(body):
 def _inject_tool_rules(body):
     """注入工具描述规则：Codex 新版 exec（JS 编排器）→ V8 沙箱约束 + tools.apply_patch()/shell_command() 用法。
     apply_patch 在新版已降为 exec 的嵌套工具（非独立工具），靠 exec 描述教模型调 tools.apply_patch()。
-    relay + converted 路径都覆盖。"""
+    relay 路径覆盖。"""
     if not isinstance(body, dict):
         return body
     tools = body.get("tools") or body.get("input", [])
@@ -908,7 +753,7 @@ def _inject_tool_rules(body):
 def _log_exec_io(reqid, body):
     """扫描请求 input 里的 exec 工具 I/O，记录 apply_patch 等的执行结果（排查 exec/apply_patch 失败）。
     exec 的 custom_tool_call(input=JS) 与 custom_tool_call_output(output=沙箱执行结果) 按 call_id 配对。
-    请求入口调用一次，relay/converted/messages 全覆盖；非 Responses（无 input 数组）直接返回。"""
+    请求入口调用一次，relay/messages 全覆盖；非 Responses（无 input 数组）直接返回。"""
     if not isinstance(body, dict):
         return
     inp = body.get("input")
@@ -974,151 +819,11 @@ def _log_exec_io(reqid, body):
 
 
 
-def _convert_responses_to_messages(body):
-    """将 OpenAI Responses API 请求转换为 Anthropic Messages API 请求。
-    ccproxy-api 的转换器不处理 function_call/function_call_output/custom_tool_call，
-    所以这里自己实现完整的转换（用于 Messages 路径）。"""
-    messages = []
-    system_parts = []
-
-    # 提取 system prompt
-    instructions = body.get("instructions")
-    if isinstance(instructions, str) and instructions:
-        system_parts.append(instructions)
-
-    # 转换 input 数组
-    input_items = body.get("input", [])
-    if isinstance(input_items, str):
-        messages.append({"role": "user", "content": input_items})
-    elif isinstance(input_items, list):
-        for item in input_items:
-            if not isinstance(item, dict):
-                continue
-            item_type = item.get("type", "")
-            if item_type == "message":
-                role = item.get("role", "user")
-                content = item.get("content", [])
-                text = _extract_text_from_content(content)
-                if role in ("system", "developer"):
-                    if text:
-                        system_parts.append(text)
-                elif role == "user":
-                    # 保留图片：转成 Anthropic image 块（无图时退化为纯文本）
-                    blocks = _to_anthropic_content(content)
-                    messages.append({"role": role, "content": blocks if blocks else text})
-                elif role == "assistant":
-                    messages.append({"role": role, "content": text})
-            elif item_type == "function_call":
-                _append_tool_use(messages, item)
-            elif item_type == "function_call_output":
-                _append_tool_result(messages, item)
-            elif item_type == "custom_tool_call":
-                # custom_tool_call → function_call（exec 等 FREEFORM 工具历史回放）
-                # input 是 FREEFORM 文本（如 exec 的 JS 代码），包成 {"input": "..."} 给 _append_tool_use
-                raw_input = item.get("input", "")
-                arguments = json.dumps({"input": raw_input}, ensure_ascii=False) if isinstance(raw_input, str) else raw_input
-                _append_tool_use(messages, {**item, "type": "function_call",
-                                            "arguments": arguments})
-            elif item_type == "custom_tool_call_output":
-                # custom_tool_call_output → function_call_output
-                _append_tool_result(messages, item)
-
-    # 构建输出
-    result = {"model": body.get("model", "glm-5")}
-    if system_parts:
-        result["system"] = "\n\n".join(system_parts)
-    result["messages"] = messages
-
-    # 转换 tools → Anthropic Messages 标准格式（name + description + input_schema，**不带 type**）
-    # 关键：绝不能加 "type":"custom"——venus-deepseek 等 anthropic 端点会报 unknown variant 'custom'，
-    # 且若为此 strip 掉工具，模型在缺工具定义时会用原生 DSML 格式输出伪 tool_call 污染正文。
-    # 标准 tool 格式（无 type）所有 anthropic 兼容端点通用，实测 venus deepseek-v4-pro 正常 tool_use。
-    tools_out = []
-    for tool in body.get("tools", []):
-        if not isinstance(tool, dict):
-            continue
-        t = tool.get("type", "")
-        if t == "function":
-            fn_name = tool.get("name", "")
-            t_out = {
-                "name": fn_name,
-                "input_schema": tool.get("parameters", tool.get("input_schema", {})),
-            }
-            if tool.get("description"):
-                t_out["description"] = tool["description"]
-            tools_out.append(t_out)
-        elif t == "custom":
-            # custom/FREEFORM 工具（如 Codex exec JS 编排器）→ 标准 tool 格式
-            # input_schema 用单一 string 字段 "input" 接收 FREEFORM 文本（exec 的 JS 代码等）；
-            # 合成时从 input 字段提取还原为 custom_tool_call（见 _converted_stream_with_retry）
-            desc = tool.get("description", "")
-            tools_out.append({
-                "name": tool.get("name", ""),
-                "description": desc,
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "input": {"type": "string", "description": desc},
-                    },
-                    "required": ["input"],
-                },
-            })
-        elif t == "namespace":
-            # 展平 namespace 子工具。连接符用 '-'（非 '.'）：
-            # ① OpenAI function name 校验 ^[a-zA-Z0-9_-]+$ 不允许点号（venus/deepseek 会 400）；
-            # ② Codex 调用 namespace 子工具的 name 实测为 "{ns}-{sub}"（如 codex_app-read_thread_terminal）。
-            ns_name = tool.get("name", "")
-            for sub in tool.get("tools", []):
-                sub_name = sub.get("name", "")
-                t_out = {
-                    "name": f"{ns_name}-{sub_name}" if ns_name else sub_name,
-                    "input_schema": sub.get("parameters", sub.get("input_schema", {})),
-                }
-                if sub.get("description"):
-                    t_out["description"] = sub["description"]
-                tools_out.append(t_out)
-        elif t.startswith("web_search_"):
-            # DeepSeek 原生支持 web_search_20250305 / web_search_20260209，直通（保留其 type）
-            tools_out.append(tool)
-        # 其他未知类型（如 tool_search）跳过，不发往不支持的上游
-    if tools_out:
-        result["tools"] = tools_out
-
-    # 字段映射
-    max_tokens = body.get("max_output_tokens")
-    result["max_tokens"] = max_tokens if max_tokens else 16384
-    if body.get("stream"):
-        result["stream"] = True
-    if body.get("temperature") is not None:
-        result["temperature"] = body["temperature"]
-
-    return result
-
-
-def _convert_messages_error_to_responses(err_body):
-    """将 Anthropic Messages API 错误格式转为 Responses API 错误格式"""
-    try:
-        r = json.loads(err_body)
-        if r.get("type") == "error" and "error" in r:
-            e = r["error"]
-            return json.dumps({
-                "error": {
-                    "message": e.get("message", "unknown error"),
-                    "type": e.get("type", "api_error"),
-                    "code": str(e.get("type", "")),
-                }
-            }).encode()
-    except Exception:
-        pass
-    return err_body
-
-
-
 # ── token 估算 ──────────────────────────────────────
 
 def _est_tokens(body):
     """估算请求 token 数：剔除 base64 图片数据（图片按分辨率约 1-3K token，不按 base64 字节长度算）。
-    避免 converted 路径图片请求的 base64 把字节估算撑到虚高（~840K/张）导致误判上下文超限、
+    避免图片请求的 base64 把字节估算撑到虚高（~840K/张）导致误判上下文超限、
     挡住 failover。"""
     import re
     try:
@@ -1176,7 +881,7 @@ def _normalize_sse_block(block_bytes):
     标准允许冒号后空格可选，但 ① 本代理多处解析用 startswith("event: ")/("data: ") 硬要求空格
     （含 _patch_msg_usage / _process_sse_block / messages 探测逻辑）；② 客户端(Claude Code)的 SSE
     解析器对无空格格式不一定兼容。故在 messages 路径分块后统一规范化一次：下游所有解析与转发给
-    客户端的字节都用标准格式。converted 路径重建式输出、relay 路径读 codex-relay 重建输出，均不受影响。"""
+    客户端的字节都用标准格式。relay 路径读 codex-relay 重建输出，不受影响。"""
     try:
         lines = block_bytes.split(b"\n")
         for i, ln in enumerate(lines):
@@ -1336,24 +1041,25 @@ class Handler(BaseHTTPRequestHandler):
         body_saved = False  # 调试body只保存一次（首次失败时）
 
         # 客户端 Authorization key 路由：
-        # - key=专属号（config manual_key，如 cmoyan=0 / chatgpt=9）→ 该渠道开关开（<name>.on 存在）时强制直达；开关关时落回默认链
-        # - 纯数字 key=N → 强制走链内第 N 个渠道（1-based，跳过 chain_exclude，动态不写死渠道名）
+        # - key=0 → 第一个未 disabled 的 chain_exclude 直通渠道；没有时保持空缺
+        # - key=N (N>=1) → 第 N 个未 disabled 的普通链内渠道（1-based）
         # - 其他 key → 默认按配置顺序回退（不含 chain_exclude 渠道）；受模型钉选 / 429 封锁影响
         client_key = self.headers.get("Authorization", "").replace("Bearer ", "").strip()
         force_upstream = None  # 强制渠道 name；None 表示默认回退链
-        chain_upstreams = [u for u in UPSTREAMS if not u.get("chain_exclude")]
+        chain_upstreams = [u for u in UPSTREAMS if not u.get("chain_exclude") and not u.get("disabled")]
         exclude_upstreams = [u for u in UPSTREAMS if u.get("chain_exclude")]
-        for u in exclude_upstreams:
-            if client_key and client_key == str(u.get("manual_key", "")) and _excl_switch_on(u):
-                force_upstream = u["name"]
-                break
-        if not force_upstream and client_key.isdigit():
+        enabled_excludes = [u for u in exclude_upstreams if not u.get("disabled")]
+        if client_key == "0" and enabled_excludes:
+            force_upstream = enabled_excludes[0]["name"]
+        elif client_key.isdigit() and int(client_key) >= 1:
             idx = int(client_key) - 1
-            if 0 <= idx < len(chain_upstreams):
+            if idx < len(chain_upstreams):
                 force_upstream = chain_upstreams[idx]["name"]
             else:
                 log.warning("[#%d] key=%s out of range (1..%d), fallback to default chain",
                             self._req_id, client_key, len(chain_upstreams))
+        elif client_key == "0":
+            log.warning("[#%d] key=0 has no enabled direct upstream, fallback to default chain", self._req_id)
 
         # GET/无 body 时也要初始化，避免 ROUTE 日志 NameError
         req_model = ""
@@ -1373,32 +1079,23 @@ class Handler(BaseHTTPRequestHandler):
         weekday = datetime.now().weekday()  # 0=Mon, 6=Sun
         is_worktime = weekday < 5 and 9 <= hour < 18
 
-        # 检测图片：有图片强制走 Messages（Completions 不支持图片，Messages 支持）
-        has_images = is_responses and isinstance(body, dict) and _request_has_images(body)
-        use_completions = RESPONSES_USE_COMPLETIONS and not has_images
-
-        # 调试日志：路由决策完整信息（必须在 use_completions 定义之后）
-        needs_completions = is_responses and use_completions
-        needs_messages = is_messages or (is_responses and not use_completions)
+        # Responses 不按内容类型分叉；图片与文本走同一条协议路径。
         blocked_active = {k: datetime.fromtimestamp(v).strftime("%H:%M") for k, v in _channel_blocked_until.items() if v > time.time()}
-        # 动态 key 映射预览：manual_key=专属渠道（如有），1=链内第一渠道...
-        key_map = {str(u["manual_key"]): u["name"] for u in exclude_upstreams if u.get("manual_key")}
-        key_map.update({str(i + 1): up["name"] for i, up in enumerate(chain_upstreams)})
-        excl_sw = {u["name"]: ("on" if _excl_switch_on(u) else "off") for u in exclude_upstreams}
-        log.info("[#%d] ROUTE: key=%s model=%s force=%s pinned=%s worktime=%s blocked=%s excl_sw=%s needs_comp=%s needs_msg=%s path=%s key_map=%s",
+        # key 0 为链外直通保留；普通链无论 key 0 是否存在都始终从 1 编号。
+        key_map = {str(i + 1): up["name"] for i, up in enumerate(chain_upstreams)}
+        if enabled_excludes:
+            key_map["0"] = enabled_excludes[0]["name"]
+        excl_state = {u["name"]: ("disabled" if u.get("disabled") else "manual") for u in exclude_upstreams}
+        log.info("[#%d] ROUTE: key=%s model=%s force=%s pinned=%s worktime=%s blocked=%s excl=%s path=%s key_map=%s",
                  self._req_id, client_key[:20] or "(empty)", req_model or "?",
                  force_upstream, model_pinned, is_worktime, blocked_active or "{}",
-                 excl_sw,
-                 needs_completions, needs_messages, self.path, key_map)
-        if has_images:
-            log.info("    [image] 含图片 → 走 Messages 路径")
-
+                 excl_state,
+                 self.path, key_map)
         for up in UPSTREAMS:
             if up.get("disabled"):
                 continue
-            # chain_exclude 渠道（如 cmoyan/chatgpt）默认不参与回退链（仅各自 manual_key 专属直达）；
-            # 开关文件 <name>.on 存在时放行进链（按 config 位次尝试，失败照常回退）
-            if up.get("chain_exclude") and up["name"] != force_upstream and not _excl_switch_on(up):
+            # chain_exclude 渠道永不参与自动回退链，仅数字 key 可手动直达。
+            if up.get("chain_exclude") and up["name"] != force_upstream:
                 continue
             # v2.9.103: 超大载荷跳过 cf_gate 渠道（如 cmoyan）——大上下文会话源站处理超
             # Cloudflare 100s 上限必 524，白等约两分钟才回退。≥1MB 直接跳过走下一渠道。
@@ -1427,21 +1124,13 @@ class Handler(BaseHTTPRequestHandler):
                              self._req_id, up["name"],
                              datetime.fromtimestamp(_channel_blocked_until[block_key]).strftime("%H:%M"))
                     continue
-            # 能力检查：渠道必须支持本次请求需要的端点类型
-            if needs_completions and "openai_url" not in up:
-                continue
-            if needs_messages and "anthropic_url" not in up \
-                    and not (is_responses and up.get("responses_direct")):
-                # responses_direct 直通原生支持 Responses（含图片），无 anthropic_url 也放行
-                continue
-            # 通用 OpenAI 路径（/v1/chat/completions 等）：必须有 openai_url
-            if not is_responses and not is_messages and "openai_url" not in up:
+            route_mode = _route_mode(up, is_responses, is_messages)
+            if route_mode is None:
                 continue
 
             # 构建目标 URL 和请求头（每个上游只需一次）
-            is_responses_converted = False
-            if is_responses and up.get("responses_direct") and "openai_url" in up:
-                # Responses API 直通（GPT 原生 Responses 端点，无需 codex-relay 转换）
+            if route_mode == "responses_direct":
+                # 原生 Responses 端点直通
                 api_path = self.path
                 if api_path.startswith("/v1/"):
                     api_path = api_path[3:]
@@ -1460,29 +1149,14 @@ class Handler(BaseHTTPRequestHandler):
                             up_headers["chatgpt-account-id"] = _acct
                         up_headers["OpenAI-Beta"] = "responses=experimental"
                         up_headers["originator"] = "codex_cli_rs"
-            elif is_responses and not use_completions and "anthropic_url" in up and HAS_CCPROXY:
-                # Responses API → Anthropic Messages 直连（ccproxy 路径）
-                url = up["anthropic_url"].rstrip("/")
-                mkey = up["key"]  # 统一用渠道 key（external-claude 拆分后单一 key）
-                auth = up.get("anthropic_auth", "x-api-key")
-                if auth == "bearer":
-                    auth_header = {"Authorization": f"Bearer {mkey}"}
-                else:
-                    auth_header = {"x-api-key": mkey, "anthropic-version": "2023-06-01"}
-                up_headers = {
-                    "Content-Type": "application/json",
-                    "Connection": "close",
-                    **auth_header,
-                }
-                is_responses_converted = True
-            elif is_responses:
+            elif route_mode == "responses_relay":
                 # Responses API → codex-relay（Chat Completions 路径，OpenAI 原生）
                 url = f"http://127.0.0.1:{up['relay_port']}{self.path}"
                 up_headers = {
                     "Content-Type": "application/json",
                     "Authorization": self.headers.get("Authorization", ""),
                 }
-            elif is_messages and "anthropic_url" in up:
+            elif route_mode == "messages":
                 # Messages API → Anthropic 端点
                 url = up["anthropic_url"].rstrip("/")
                 mkey = up["key"]  # 统一用渠道 key（external-claude 拆分后单一 key）
@@ -1496,10 +1170,8 @@ class Handler(BaseHTTPRequestHandler):
                     "Connection": "close",
                     **auth_header,
                 }
-            else:
+            else:  # route_mode == "openai"
                 # 通用 OpenAI 路径（/v1/chat/completions 等）
-                if "openai_url" not in up:
-                    continue
                 api_path = self.path
                 if api_path.startswith("/v1/"):
                     api_path = api_path[3:]
@@ -1528,7 +1200,7 @@ class Handler(BaseHTTPRequestHandler):
             payload = None
             if body is not None:
                 # Messages 路径走 Anthropic 端点，用 messages_model（如 grok-4.5-claude）；
-                # relay/通用 OpenAI 路径用 model（OpenAI 名）。converted 路径下方再覆盖。
+                # relay/通用 OpenAI 路径用 model（OpenAI 名）。
                 # responses_direct 渠道透传客户端原始 model（GPT 原生名，上游按名路由）；
                 # 用 req_model 而非 body["model"]——回退链前面的渠道可能已把 body["model"] 改写成自己的 model
                 if up.get("responses_direct"):
@@ -1544,11 +1216,10 @@ class Handler(BaseHTTPRequestHandler):
                 _flatten_agent_messages(body)  # Codex 多智能体 agent_message/encrypted_content → message/input_text
                 # namespace 展平已移除（v2.9.93）：codex-relay 0.5.8 (#62) 原生处理 namespace，
                 # custom 子工具裸名/function 子工具 namespaced 编码由 relay 自己正确 round-trip。
-                _inject_tool_rules(body)  # 注入 exec 沙箱规则（relay + converted 都覆盖）
-                # converted 路径转换后已是标准 Anthropic tool 格式（无 type），venus 等端点直接接受，无需 strip。
+                _inject_tool_rules(body)  # 注入 exec 沙箱规则（relay 路径覆盖）
                 # messages 路径防御：若 tools 仍含 "type":"custom"（不应出现）则剔之。
                 _tools_bak = None
-                if up.get("strip_custom_tools") and not is_responses_converted:
+                if up.get("strip_custom_tools"):
                     _tools_list = body.get("tools")
                     if isinstance(_tools_list, list) and _tools_list:
                         _tools_bak = body["tools"]
@@ -1557,32 +1228,21 @@ class Handler(BaseHTTPRequestHandler):
                         if len(body["tools"]) != _before:
                             log.info("    [strip] %s: %d → %d tools (stripped custom)", up["name"], _before, len(body["tools"]))
 
-                if is_responses_converted:
-                    converted = _convert_responses_to_messages(body)
-                    converted["model"] = up.get("messages_model", up["model"])
-                    payload = json.dumps(converted).encode()
-                    log.info("    [converted] %d msgs, %d tools, %dKB, max_tokens=%d (client max_output=%s)",
-                             len(converted.get("messages", [])),
-                             len(converted.get("tools", [])),
-                             len(payload) // 1024,
-                             converted.get("max_tokens", 0),
-                             body.get("max_output_tokens"))
-                else:
-                    if is_messages:
-                        _fix_tool_result_roles(body)
-                    # chatgpt 官方 backend 两个硬要求：拒 max_output_tokens、必须显式 store:false
-                    _scg = up.get("strip_max_output")
-                    _mox = body.pop("max_output_tokens", None) if _scg else None
-                    _store_bak = body.get("store", "__absent__") if _scg else "__skip__"
-                    if _scg:
-                        body["store"] = False
-                    payload = json.dumps(body).encode()
-                    if _mox is not None:
-                        body["max_output_tokens"] = _mox  # 恢复（回退下一上游时原样）
-                    if _store_bak == "__absent__":
-                        body.pop("store", None)
-                    elif _store_bak != "__skip__":
-                        body["store"] = _store_bak
+                if is_messages:
+                    _fix_tool_result_roles(body)
+                # chatgpt 官方 backend 两个硬要求：拒 max_output_tokens、必须显式 store:false
+                _scg = up.get("strip_max_output")
+                _mox = body.pop("max_output_tokens", None) if _scg else None
+                _store_bak = body.get("store", "__absent__") if _scg else "__skip__"
+                if _scg:
+                    body["store"] = False
+                payload = json.dumps(body).encode()
+                if _mox is not None:
+                    body["max_output_tokens"] = _mox  # 恢复（回退下一上游时原样）
+                if _store_bak == "__absent__":
+                    body.pop("store", None)
+                elif _store_bak != "__skip__":
+                    body["store"] = _store_bak
                 if "Content-Type" not in up_headers and payload is not None:
                     up_headers["Content-Type"] = "application/json"
                 if _tools_bak is not None:
@@ -1599,14 +1259,7 @@ class Handler(BaseHTTPRequestHandler):
                 resp = urlopen(req, timeout=REQUEST_TIMEOUT)
 
                 if is_stream:
-                    if is_responses_converted:
-                        # Responses→Messages 转换路径：增量流式 + 早期错误退避重试 + 错误转发
-                        _custom_ff = {t.get("name") for t in body.get("tools", []) if isinstance(t, dict) and t.get("type") == "custom"}
-                        cres = self._converted_stream_with_retry(resp, up, url, up_headers, payload, method, custom_freeform_tools=_custom_ff, est_input=_est_tokens(body))
-                        if cres.get("done"):
-                            return
-                        # 真空输出（无错误）→ 尝试下一个上游
-                    elif is_responses:
+                    if is_responses:
                         # relay 路径：立即发头+keepalive（idle安全），早期 1305/过载退避重试
                         events, has_output, stream_error, fallback = self._relay_stream_with_retry(
                             resp, up, url, up_headers, payload, method, _est_tokens(body))
@@ -1632,40 +1285,8 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         self._pipe_stream(resp, up["name"])
                         return
-                    # 空输出：不截断，尝试下一个上游
-                    if not body_saved:
-                        self._save_debug_body(body)
-                        body_saved = True
-                    log.warning("[#%d]     !!! %s empty output, trying next upstream", self._req_id, up["name"])
-                    continue
                 else:
                     result = resp.read()
-                    # Responses→Messages 转换路径：非流式响应转换
-                    if is_responses_converted:
-                        try:
-                            anthropic_resp = json.loads(result)
-                            # 检查是否是 Anthropic 错误响应
-                            if anthropic_resp.get("type") == "error":
-                                result = _convert_messages_error_to_responses(result)
-                                self._send_raw(resp.status, result, "application/json")
-                                return
-                            # 用 ccproxy 转换
-                            msg_resp = MessageResponse(**anthropic_resp)
-                            openai_resp = convert__anthropic_message_to_openai_responses__response(msg_resp)
-                            result = json.dumps(openai_resp.model_dump(exclude_none=True, mode='json'),
-                                                ensure_ascii=False).encode()
-                            output = openai_resp.output if hasattr(openai_resp, 'output') else []
-                            if not output:
-                                if not body_saved:
-                                    self._save_debug_body(body)
-                                    body_saved = True
-                                log.warning("[#%d]     !!! %s empty output, trying next upstream", self._req_id, up["name"])
-                                continue
-                            log.info("[#%d]     <<< %s [converted] OK (%dms)", self._req_id, up["name"], self._ms())
-                        except Exception as ce:
-                            log.error("[#%d]     !!! [converted] response error: %s", self._req_id, ce)
-                        self._send_raw(200, result, "application/json")
-                        return
                     # 检测空输出
                     empty = False
                     try:
@@ -2002,352 +1623,6 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             stop_ka.set()
 
-    # ── Responses→Messages 转换流式处理（旧：整段缓冲，留作兜底）──
-    def _converted_stream_with_retry(self, first_resp, up, url, up_headers, payload, method, custom_freeform_tools=None, est_input=0):
-        """converted 路径（probe-before-commit）：同步翻译 Anthropic→Responses。
-        延迟提交 200：首条内容前缓冲，见内容才提交+flush；overflow(超限 stop_reason / 空收尾 / error 体)
-        → 返干净 400(as_responses)触发客户端压缩；其他早期错误转发 response.failed。"""
-        import threading
-        upstream_name = up["name"]
-        custom_ff = custom_freeform_tools or set()  # FREEFORM/custom 工具名集合（如 exec），合成 custom_tool_call 用
-        wlock = threading.Lock()
-        stop_ka = threading.Event()
-        committed = [False]
-        held = []  # probe-hold：首条内容前缓冲，便于超限(200流式)时改返干净 400
-        def _write(data):
-            with wlock:
-                self.wfile.write(data); self.wfile.flush()
-        def _keepalive():
-            while not stop_ka.wait(5):
-                try:
-                    _write(b": keepalive\n\n")
-                except Exception:
-                    break
-        def _commit():
-            # probe-before-commit：延迟提交 200，首条内容才提交（+启动 keepalive）
-            with wlock:
-                if committed[0]:
-                    return
-                self.send_response(200)
-                for h in ["Content-Type", "Cache-Control"]:
-                    v = first_resp.headers.get(h)
-                    if v:
-                        self.send_header(h, v)
-                self.send_header("Connection", "close")
-                self.end_headers()
-                self.close_connection = True
-                committed[0] = True
-            threading.Thread(target=_keepalive, daemon=True).start()
-        def _probe_watchdog():
-            # probe-hold 兜底：超过 PROBE_TIMEOUT 仍无首内容（上游首 token 慢/深度推理）→ 强制 commit
-            # + keepalive，防客户端流式空闲超时("Stream idle timeout - no chunks received")。
-            if stop_ka.wait(PROBE_TIMEOUT):
-                return
-            if not committed[0]:
-                log.info("[#%d] [converted] %s probe-hold %ds 无首内容，强制提交防 idle timeout",
-                         self._req_id, upstream_name, PROBE_TIMEOUT)
-                try:
-                    _commit()
-                except Exception:
-                    pass
-        threading.Thread(target=_probe_watchdog, daemon=True).start()
-        def _emit(ed):
-            t = ed.get("type", "")
-            _is_content = t.endswith(".delta") and ("output_text" in t or "reasoning_summary_text" in t
-                        or "function_call_arguments" in t or "custom_tool_call_input" in t)
-            if _is_content and not committed[0]:
-                _commit()  # 首条内容 → 提交 200 + flush 缓冲
-                for hb in held:
-                    _write(hb)
-                held.clear()
-            data = (f"event: {t}\ndata: {json.dumps(ed, ensure_ascii=False)}\n\n").encode()
-            if committed[0]:
-                _write(data)
-            else:
-                held.append(data)
-
-        seq = [0]
-        def nseq():
-            seq[0] += 1
-            return seq[0]
-        rid = [None]
-        model = [None]
-        created_at = [int(time.time())]
-        usage = [{}]
-        blocks = {}        # anthropic content_block index -> 状态 dict
-        output_items = []  # response.completed 的 output 数组
-        created_sent = [False]
-        has_output = [False]
-
-        def _resp_obj(status):
-            # Responses usage 必须含 total_tokens（Codex 严格解析，缺失会 "failed to parse ResponseCompleted"）
-            u = dict(usage[0])
-            inp = u.get("input_tokens", 0) or 0
-            # v2.9.107: 上游网关可能只报"截断后实际处理的量"（如 lerwee 420k→15k），
-            # 客户端据此计数永远到不了压缩线 → 会话无限膨胀。取 max(上游, est) 报真实规模。
-            if est_input and inp < int(est_input):
-                inp = int(est_input)
-            out = u.get("output_tokens", 0) or 0
-            u["input_tokens"] = inp
-            u["output_tokens"] = out
-            u["total_tokens"] = inp + out
-            return {"id": rid[0] or "resp_syn", "object": "response", "created_at": created_at[0],
-                    "status": status, "model": model[0] or "glm-5.2", "output": output_items, "usage": u}
-
-        def _emit_created():
-            if created_sent[0]:
-                return
-            ro = _resp_obj("in_progress")
-            _emit({"sequence_number": nseq(), "type": "response.created", "response": ro})
-            _emit({"sequence_number": nseq(), "type": "response.in_progress", "response": ro})
-            created_sent[0] = True
-
-        def _on_event(et, d):
-            # 返回 "done" / ("error",code,msg) / None
-            if et == "message_start":
-                msg = d.get("message", {}) or {}
-                rid[0] = msg.get("id")
-                model[0] = msg.get("model")
-                u = msg.get("usage", {}) or {}
-                if u:
-                    usage[0].update(u)
-                _emit_created()
-            elif et == "content_block_start":
-                _emit_created()
-                idx = d.get("index", 0)
-                cb = d.get("content_block", {}) or {}
-                btype = cb.get("type")
-                oi = idx
-                if btype == "text":
-                    iid = "msg_" + (rid[0] or "x")
-                    blocks[idx] = {"type": "text", "iid": iid, "oi": oi, "text": ""}
-                    _emit({"sequence_number": nseq(), "type": "response.output_item.added", "output_index": oi,
-                           "item": {"id": iid, "type": "message", "status": "in_progress", "role": "assistant", "content": []}})
-                    _emit({"sequence_number": nseq(), "type": "response.content_part.added", "item_id": iid,
-                           "output_index": oi, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}})
-                elif btype == "thinking":
-                    iid = "rs_" + (rid[0] or "x")
-                    blocks[idx] = {"type": "thinking", "iid": iid, "oi": oi, "text": ""}
-                    _emit({"sequence_number": nseq(), "type": "response.output_item.added", "output_index": oi,
-                           "item": {"id": iid, "type": "reasoning", "status": "in_progress", "summary": []}})
-                    _emit({"sequence_number": nseq(), "type": "response.reasoning_summary_part.added", "item_id": iid,
-                           "output_index": oi, "summary_index": 0, "part": {"type": "summary_text", "text": ""}})
-                elif btype == "tool_use":
-                    call_id = cb.get("id", "call_x")
-                    name = cb.get("name", "")
-                    iid = "fc_" + call_id
-                    blocks[idx] = {"type": "tool_use", "iid": iid, "oi": oi, "call_id": call_id, "name": name, "args": ""}
-                    # custom/FREEFORM 工具（如 exec）缓冲到 stop 时合成 custom_tool_call，此处不发 function_call 事件
-                    if name not in custom_ff:
-                        _emit({"sequence_number": nseq(), "type": "response.output_item.added", "output_index": oi,
-                               "item": {"id": iid, "type": "function_call", "status": "in_progress", "call_id": call_id, "name": name}})
-            elif et == "content_block_delta":
-                idx = d.get("index", 0)
-                b = blocks.get(idx)
-                if not b:
-                    return None
-                delta = d.get("delta", {}) or {}
-                dt = delta.get("type")
-                if dt == "text_delta":
-                    t = delta.get("text", "")
-                    b["text"] += t
-                    _emit({"sequence_number": nseq(), "type": "response.output_text.delta", "item_id": b["iid"],
-                           "output_index": b["oi"], "content_index": 0, "delta": t})
-                    has_output[0] = True; stop_ka.set()
-                elif dt == "thinking_delta":
-                    t = delta.get("thinking", "")
-                    b["text"] += t
-                    _emit({"sequence_number": nseq(), "type": "response.reasoning_summary_text.delta", "item_id": b["iid"],
-                           "output_index": b["oi"], "summary_index": 0, "delta": t})
-                    has_output[0] = True; stop_ka.set()
-                elif dt == "input_json_delta":
-                    t = delta.get("partial_json", "")
-                    b["args"] += t
-                    # custom/FREEFORM 工具的 args 缓冲（不发 delta，stop 时一次性合成 custom_tool_call）
-                    if b.get("name") not in custom_ff:
-                        _emit({"sequence_number": nseq(), "type": "response.function_call_arguments.delta", "item_id": b["iid"],
-                               "output_index": b["oi"], "delta": t})
-                        has_output[0] = True; stop_ka.set()
-            elif et == "content_block_stop":
-                idx = d.get("index", 0)
-                b = blocks.get(idx)
-                if not b:
-                    return None
-                if b["type"] == "text":
-                    _emit({"sequence_number": nseq(), "type": "response.output_text.done", "item_id": b["iid"],
-                           "output_index": b["oi"], "content_index": 0, "text": b["text"]})
-                    _emit({"sequence_number": nseq(), "type": "response.content_part.done", "item_id": b["iid"],
-                           "output_index": b["oi"], "content_index": 0, "part": {"type": "output_text", "text": b["text"], "annotations": []}})
-                    item = {"id": b["iid"], "type": "message", "status": "completed", "role": "assistant",
-                            "content": [{"type": "output_text", "text": b["text"], "annotations": []}]}
-                    _emit({"sequence_number": nseq(), "type": "response.output_item.done", "output_index": b["oi"], "item": item})
-                    output_items.append(item)
-                elif b["type"] == "thinking":
-                    _emit({"sequence_number": nseq(), "type": "response.reasoning_summary_part.done", "item_id": b["iid"],
-                           "output_index": b["oi"], "summary_index": 0, "part": {"type": "summary_text", "text": b["text"]}})
-                    item = {"id": b["iid"], "type": "reasoning", "status": "completed",
-                            "summary": [{"type": "summary_text", "text": b["text"]}]}
-                    _emit({"sequence_number": nseq(), "type": "response.output_item.done", "output_index": b["oi"], "item": item})
-                    output_items.append(item)
-                elif b["type"] == "tool_use":
-                    # 调试日志：看 GLM 实际生成的 tool_use
-                    log.warning("[#%d] [converted] TOOL_USE: name=%s args_len=%d args_raw=%s",
-                                getattr(self, '_req_id', 0), b.get("name",""), len(b.get("args","")), repr(b.get("args","")[:300]))
-                    if b.get("name") in custom_ff:
-                        # custom/FREEFORM 工具（如 exec）：从 input 字段提取 FREEFORM 文本（JS 代码等），
-                        # 合成 custom_tool_call。不包 *** Begin/End Patch（那是 apply_patch 专用格式）
-                        raw_args = b["args"]
-                        try:
-                            parsed = json.loads(raw_args)
-                            ff_text = parsed.get("input", raw_args) if isinstance(parsed, dict) else raw_args
-                        except Exception:
-                            ff_text = raw_args
-                        ctc_id = "ctc_" + b["call_id"]
-                        # v2.9.87: 用 nseq() 替代局部 s 计数器，确保 seq[0] 持续递增
-                        # （旧代码 s 递增不同步 seq[0] → response.completed sequence_number 倒退 → exec 输出通道中断）
-                        _emit({"sequence_number": nseq(), "type": "response.output_item.added", "output_index": b["oi"],
-                               "item": {"id": ctc_id, "type": "custom_tool_call", "status": "in_progress", "call_id": b["call_id"], "name": b["name"]}})
-                        for ck in [ff_text[i:i+20] for i in range(0, len(ff_text), 20)]:
-                            _emit({"sequence_number": nseq(), "type": "response.custom_tool_call_input.delta",
-                                   "delta": ck, "item_id": ctc_id, "output_index": b["oi"]})
-                        _emit({"sequence_number": nseq(), "type": "response.custom_tool_call_input.done",
-                               "input": ff_text, "item_id": ctc_id, "output_index": b["oi"]})
-                        item = {"id": ctc_id, "type": "custom_tool_call", "status": "completed",
-                                "call_id": b["call_id"], "name": b["name"], "input": ff_text}
-                        _emit({"sequence_number": nseq(), "type": "response.output_item.done", "output_index": b["oi"], "item": item})
-                        output_items.append(item)
-                        has_output[0] = True
-                    else:
-                        _emit({"sequence_number": nseq(), "type": "response.function_call_arguments.done",
-                               "item_id": b["iid"], "output_index": b["oi"], "arguments": b["args"]})
-                        item = {"id": b["iid"], "type": "function_call", "status": "completed",
-                                "call_id": b["call_id"], "name": b["name"], "arguments": b["args"]}
-                        _emit({"sequence_number": nseq(), "type": "response.output_item.done", "output_index": b["oi"], "item": item})
-                        output_items.append(item)
-            elif et == "message_delta":
-                u = d.get("usage", {}) or {}
-                if u:
-                    usage[0].update(u)
-                stop = (d.get("delta", {}) or {}).get("stop_reason", "")
-                if stop and _is_overflow_signal(stop):
-                    return ("overflow", None, stop)  # 超限 stop_reason（如 model_context_window_exceeded）
-            elif et == "message_stop":
-                if not has_output[0]:
-                    return ("overflow", None, "empty completion")  # 出内容前收尾 = 超限
-                _emit_created()
-                _emit({"sequence_number": nseq(), "type": "response.completed", "response": _resp_obj("completed")})
-                return "done"
-            elif et == "error":
-                err = d.get("error", d)
-                code = err.get("code") if isinstance(err, dict) else None
-                msg = (err.get("message", "") if isinstance(err, dict) else str(err))
-                _etxt = msg if isinstance(msg, str) else json.dumps(msg, ensure_ascii=False)
-                if _is_overflow_signal(_etxt):
-                    return ("overflow", code, msg)
-                return ("error", code, msg)
-            return None
-
-        # 内层函数：读上游 SSE，翻译成 Responses 事件，返回 (done, early_err)
-        def _run_once(resp):
-            nonlocal done, early_err, overflow
-            try:
-                buf = b""
-                while not done and early_err is None and not overflow:
-                    chunk = resp.read(4096)
-                    if not chunk:
-                        break
-                    buf += chunk
-                    while b"\n\n" in buf or b"\r\n\r\n" in buf:
-                        if b"\r\n\r\n" in buf:
-                            block, buf = buf.split(b"\r\n\r\n", 1)
-                        else:
-                            block, buf = buf.split(b"\n\n", 1)
-                        block = block.replace(b"\r\n", b"\n")
-                        et, dj = None, None
-                        for line in block.decode("utf-8", errors="replace").split("\n"):
-                            if line.startswith("event:"):
-                                et = line[6:].strip()  # 兼容千问 "event:xxx"(无空格) 与标准 "event: xxx"
-                            elif line.startswith("data:"):
-                                try:
-                                    dj = json.loads(line[5:].strip())
-                                except Exception:
-                                    pass
-                        if not et or not dj:
-                            continue
-                        r = _on_event(et, dj)
-                        if r == "done":
-                            done = True
-                            break
-                        if isinstance(r, tuple) and r[0] == "overflow":
-                            overflow = True
-                            break
-                        if isinstance(r, tuple) and r[0] == "error":
-                            if not has_output[0]:
-                                early_err = (r[1], r[2])
-                            else:
-                                _emit({"sequence_number": nseq(), "type": "response.failed",
-                                       "response": {"error": {"message": (r[2] or "upstream error"), "code": r[1], "type": "upstream_error"}}})
-                                done = True
-                            break
-                # 上游 EOF 但未发 message_stop：合成完成（overflow 时不合成，交外层返 400）
-                if not done and early_err is None and not overflow:
-                    log.warning("[#%d] [converted] %s upstream EOF without message_stop, synthesizing completed",
-                                self._req_id, upstream_name)
-                    _emit_created()
-                    # 空收尾(out=0)时从未发 content delta → 未 _commit，held 里的 created/completed
-                    # 缓冲发不出去，客户端会挂死。强制提交 + flush held。
-                    if not committed[0]:
-                        _commit()
-                        for hb in held:
-                            _write(hb)
-                        held.clear()
-                    _emit({"sequence_number": nseq(), "type": "response.completed", "response": _resp_obj("completed")})
-                    done = True
-                if done:
-                    log.info("[#%d]     <<< %s [converted] STREAM OK (sync, %dms, out=%d)",
-                             self._req_id, upstream_name, self._ms(), len(output_items))
-            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
-                log.warning("[#%d]     <<< %s [converted] STREAM interrupted", self._req_id, upstream_name)
-
-        # 首次运行
-        resp = first_resp
-        done = False
-        early_err = None
-        overflow = False
-        _run_once(resp)
-
-        # 超限（探测期未提交 200）→ 返干净 400 触发客户端压缩
-        if overflow:
-            stop_ka.set()
-            try:
-                resp.close()
-            except Exception:
-                pass
-            self._send_overflow_400(up, 0, as_responses=True)
-            return {"done": True}
-
-        # 早期错误：与 messages/relay 一致，429 封锁后直接转发 response.failed（不退避重试）
-        if not done and early_err:
-            code, msg = early_err[0], early_err[1]
-            # 错误体含超限关键词 → 同样返 400（兜底：_on_event 未归为 overflow 的情况）
-            _etxt = msg if isinstance(msg, str) else json.dumps(msg, ensure_ascii=False)
-            if _is_overflow_signal(_etxt):
-                stop_ka.set()
-                try:
-                    resp.close()
-                except Exception:
-                    pass
-                self._send_overflow_400(up, 0, as_responses=True)
-                return {"done": True}
-            if str(code) == "429" or (isinstance(msg, dict) and msg.get("type") == "rate_limit_error") or "429" in str(msg)[:200]:
-                _block_channel_on_429(json.dumps({"error": {"code": code, "message": msg}}).encode(), upstream_name, self._req_id)
-            _emit({"sequence_number": 0, "type": "response.failed",
-                   "response": {"error": {"message": early_err[1] or "upstream error", "code": early_err[0], "type": "upstream_error"}}})
-
-        stop_ka.set()
-        return {"done": True}
-
-
     # ── 流式转发 ─────────────────────────────────────
     def _relay_stream_with_retry(self, first_resp, up, url, up_headers, payload, method, est_input=0):
         """增量流式转发 codex-relay 的 Responses SSE（probe-before-commit，靠 codex-relay 自带 keepalive）。
@@ -2575,8 +1850,8 @@ class Handler(BaseHTTPRequestHandler):
                 elif not stream_error:
                     # 上游未发 response.completed（不完整流，如 cmoyan 截断：仅 created+in_progress）→ 合成收尾，
                     # 避免客户端"响应结束但一直转"。usage 三字段必须齐（Codex 解析 ResponseCompleted
-                    # required output_tokens，缺失报 "failed to parse ResponseCompleted" 断流——与 converted
-                    # 路径 total_tokens 教训同型）；input 用 est 兜底让客户端感知真实上下文
+                    # required output_tokens，缺失报 "failed to parse ResponseCompleted" 断流）；
+                    # input 用 est 兜底让客户端感知真实上下文
                     log.warning("[#%d]     !!! %s no response.completed, synthesizing (has_output=%s, events=%d)",
                                 self._req_id, upstream_name, has_output, events)
                     _syn_in = int(last_usage.get("input_tokens", 0) or est_input or 0)
@@ -2662,7 +1937,7 @@ class Handler(BaseHTTPRequestHandler):
     def _send_overflow_400(self, up, est_tokens=0, as_responses=False, upstream_text=""):
         """超限：向客户端返干净 HTTP 400（触发其 auto-compact）。
         不做 est 预判——调用方已通过上游实际响应(_is_overflow_signal 命中)确认是真超限。
-        as_responses=True → OpenAI Responses 错误形态（relay/converted，Codex）；
+        as_responses=True → OpenAI Responses 错误形态（relay，Codex）；
         否则 Anthropic 形态（messages，Claude Code，H1 实锤：此形态触发 auto-compact）。
         upstream_text：上游原始报错——从中提取真实上限数字（est 低估/配置 max 虚高时避免矛盾文案）"""
         import re as _re
@@ -2744,7 +2019,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("GLM Proxy v2.9.109 :%d", LISTEN[1])
+    log.info("GLM Proxy v3.0.0 :%d", LISTEN[1])
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
         if "relay_port" in up:

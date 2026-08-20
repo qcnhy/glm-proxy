@@ -1,8 +1,6 @@
 {
-  "_comment": "复制本文件为 config.json 并填入真实密钥。config.json 不会被提交到 git。",
-  "responses_use_completions": true,
-  "_comment_responses": "Responses API 路由：true=Completions 端点 (主，codex-relay), false=Messages 端点 (备，ccproxy-api)",
-  "_comment_upstreams": "渠道按优先级排列。能力由 URL 字段决定：有 openai_url=支持 Completions, 有 anthropic_url=支持 Messages。路由 flag: require_health(需健康检查), worktime_only(仅工作时间), disabled(禁用)。客户端发 key=3 强制走 official。内网渠道放在最后作为兜底。",
+ "_comment": "复制本文件为 config.json 并填入真实密钥。config.json 不会被提交到 git。",
+  "_comment_upstreams": "渠道按优先级排列。能力由 URL 字段决定：有 openai_url+relay_port=可服务 Responses(codex-relay→Completions)与通用 OpenAI 路径，有 anthropic_url=可服务 /v1/messages 直连。路由 flag: require_health(需健康检查), worktime_only(仅工作时间), disabled(禁用)。客户端发 key=3 强制走链内第 3 渠道。内网渠道放在最后作为兜底。",
   "upstreams": [
     {
       "_comment": "中转站 Completions 端点：用 OpenAI key，仅工作时间。",
@@ -15,7 +13,7 @@
       "max_context_tokens": 1000000
     },
     {
-      "_comment": "中转站 Messages 端点：用 Claude key（与 OpenAI key 不同），仅工作时间。无需 relay（Messages 直连）。",
+      "_comment": "中转站 Messages 端点：用 Claude key（与 OpenAI key 不同），仅工作时间。无需 relay，仅服务 /v1/messages（Claude Code 等），不参与 Responses 回退链。",
       "name": "external-claude",
       "anthropic_url": "https://your-relay/v1/messages",
       "anthropic_auth": "bearer",
