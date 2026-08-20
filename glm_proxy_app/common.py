@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v4.4.3 — codex-relay + Python 路由层
+GLM API 代理 v4.4.4 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -131,6 +131,9 @@ _cfg = _load_config()
 
 LISTEN = ("0.0.0.0", 9999)
 REQUEST_TIMEOUT = 300
+# GPT 原生 Responses 偶发接受请求后不返回任何有效 SSE。Codex 不把 SSE comment
+# 心跳视为 completion 进度，因此必须在客户端 idle watchdog 前主动回退。
+GPT_FIRST_OUTPUT_TIMEOUT = 45
 # probe-before-commit 兜底：messages 路径上游首内容前 hold 住响应头（便于检测超限改返 400），
 # 但探测期客户端收不到任何字节。超过此秒数仍无首内容（上游首 token 慢/深度推理）→ 强制 commit + keepalive，
 # 防客户端流式空闲超时（"Stream idle timeout - no chunks received"，约 60s）。15s 远小于该阈值，

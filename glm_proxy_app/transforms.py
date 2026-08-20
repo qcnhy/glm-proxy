@@ -105,6 +105,19 @@ def _route_mode(up, is_responses, is_messages):
     return None
 
 
+def _stream_timeout_error(has_output, first_output_timeout):
+    """将 Responses 读超时分类为可回退的首输出超时或不可续写的中途截断。"""
+    if has_output:
+        return {
+            "code": "incomplete_stream",
+            "message": "upstream stream timed out after output",
+        }
+    return {
+        "code": "first_output_timeout",
+        "message": "upstream produced no deliverable output within %ss" % first_output_timeout,
+    }
+
+
 # apply_patch 独立工具规则已移除：Codex 新版不再声明 apply_patch 为独立工具，
 # 改用 exec（JS 编排器）架构，apply_patch 降为 exec 的嵌套工具（tools.apply_patch()）。
 # 教模型用法的规则在下方 _EXEC_FILE_EDIT_RULES（注入到 exec 描述）。

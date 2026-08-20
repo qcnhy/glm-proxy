@@ -2,7 +2,7 @@
 
 ## Current architecture
 
-- Version: 4.4.3.
+- Version: 4.4.4.
 - `glm_proxy.py` is a compatibility entry point only.
 - `glm_proxy_app/common.py` owns configuration, logging, shared state, and the threaded server type.
 - `glm_proxy_app/relay.py` owns interceptor servers and codex-relay child processes.
@@ -13,6 +13,7 @@
 - GPT direct channels use `store_responses: false`. Before a stateless GPT request or GLM fallback, strip every pure `item_reference` regardless of ID prefix, plus `rs_*`/reasoning items and `previous_response_id`; preserve full messages and tool traffic.
 - External OpenAI/Claude channels and all worktime routing were removed. The fixed automatic chain is official -> venus-deepseek -> internal for both Responses and Messages.
 - Responses never convert to Anthropic Messages: GLM Responses always use codex-relay -> Chat Completions, while `anthropic_url` only serves direct `/v1/messages` clients. Image stripping is intentionally deferred until a real upstream incompatibility is observed.
+- GPT direct Responses use a 45-second first-deliverable-output timeout. Before text or a valid tool call, timeout enters the normal GLM fallback chain; after deliverable output begins, the read timeout returns to 300 seconds and any later timeout becomes `response.failed` without cross-model continuation.
 
 ## Verification
 

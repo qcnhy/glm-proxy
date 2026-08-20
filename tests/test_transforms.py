@@ -5,6 +5,7 @@ from glm_proxy_app.transforms import (
     _inject_tool_rules,
     _merge_duplicate_tool_outputs,
     _route_mode,
+    _stream_timeout_error,
     _strip_gpt_state,
 )
 
@@ -29,6 +30,17 @@ class RouteModeTests(unittest.TestCase):
         messages_only = {"anthropic_url": "https://example.test/v1/messages"}
         self.assertIsNone(_route_mode(messages_only, True, False))
         self.assertEqual("messages", _route_mode(messages_only, False, True))
+
+
+class StreamTimeoutTests(unittest.TestCase):
+    def test_timeout_before_output_is_fallback_eligible(self):
+        err = _stream_timeout_error(False, 45)
+        self.assertEqual("first_output_timeout", err["code"])
+        self.assertIn("45s", err["message"])
+
+    def test_timeout_after_output_is_incomplete_not_fallback(self):
+        err = _stream_timeout_error(True, 45)
+        self.assertEqual("incomplete_stream", err["code"])
 
 
 class RequestNormalizationTests(unittest.TestCase):

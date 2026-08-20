@@ -2,6 +2,7 @@
 import itertools
 import json
 import os
+import socket
 import threading
 import time
 import traceback
@@ -11,7 +12,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from .common import (
-    LOG_DIR, PROBE_TIMEOUT, REQUEST_TIMEOUT, STATIC_MODELS, UPSTREAMS,
+    GPT_FIRST_OUTPUT_TIMEOUT, LOG_DIR, PROBE_TIMEOUT, REQUEST_TIMEOUT, STATIC_MODELS, UPSTREAMS,
     DEBUG, _UPSTREAM_UA, _block_channel_on_429, _cg_fresh_access, dbg,
     _channel_blocked_until, _req_counter, log,
 )
@@ -19,7 +20,7 @@ from .transforms import (
     _est_tokens, _extract_additional_tools, _fix_tool_result_roles,
     _flatten_agent_messages, _inject_tool_rules, _is_overflow_signal,
     _merge_duplicate_tool_outputs, _normalize_sse_block,
-    _patch_msg_usage, _route_mode, _strip_gpt_state,
+    _patch_msg_usage, _route_mode, _stream_timeout_error, _strip_gpt_state,
 )
 
 class Handler(BaseHTTPRequestHandler):
@@ -380,7 +381,12 @@ class Handler(BaseHTTPRequestHandler):
 
             try:
                 req = Request(url, data=payload, headers=up_headers, method=method)
-                resp = urlopen(req, timeout=REQUEST_TIMEOUT)
+                first_output_deadline = (time.monotonic() + GPT_FIRST_OUTPUT_TIMEOUT
+                                         if route_mode == "responses_direct" and is_stream else None)
+                connect_timeout = (GPT_FIRST_OUTPUT_TIMEOUT
+                                   if route_mode == "responses_direct" and is_stream
+                                   else REQUEST_TIMEOUT)
+                resp = urlopen(req, timeout=connect_timeout)
                 if _connect_ka_stop is not None:
                     _connect_ka_stop.set()
 
@@ -389,7 +395,10 @@ class Handler(BaseHTTPRequestHandler):
                         # relay 路径：立即发头+keepalive（idle安全），早期 1305/过载退避重试
                         events, has_output, stream_error, fallback = self._relay_stream_with_retry(
                             resp, up, url, up_headers, payload, method, _est_tokens(body),
-                            precommitted=route_sse_committed)
+                            precommitted=route_sse_committed,
+                            first_output_timeout=(GPT_FIRST_OUTPUT_TIMEOUT
+                                                  if route_mode == "responses_direct" else None),
+                            first_output_deadline=first_output_deadline)
                         if fallback:
                             # 未发头即失败（429限流/502不可达/DNS等），回退下一上游；
                             # 记住错误供链尾 _send_last_error 呈现（否则全链失败时客户端只看到 None）
@@ -796,7 +805,8 @@ class Handler(BaseHTTPRequestHandler):
 
     # ── 流式转发 ─────────────────────────────────────
     def _relay_stream_with_retry(self, first_resp, up, url, up_headers, payload, method,
-                                 est_input=0, precommitted=False):
+                                 est_input=0, precommitted=False, first_output_timeout=None,
+                                 first_output_deadline=None):
         """增量流式转发 codex-relay 的 Responses SSE（probe-before-commit，靠 codex-relay 自带 keepalive）。
         延迟提交 200：非内容块(response.created 等)握住不发，首次 _write 才提交 200+flush；
         overflow(超限信号/空completed)→返干净 400(as_responses)触发客户端压缩；其他错误与 messages 一致直接转发(429另封锁渠道)。
@@ -815,6 +825,23 @@ class Handler(BaseHTTPRequestHandler):
         committed = [precommitted]
         wlock = threading.Lock()
         stop_ka = threading.Event()
+
+        def _set_read_timeout(seconds):
+            """urllib 没有公开的流中途 timeout setter；兼容其常见 socket 包装层。"""
+            candidates = (
+                getattr(getattr(getattr(first_resp, "fp", None), "raw", None), "_sock", None),
+                getattr(getattr(first_resp, "fp", None), "_sock", None),
+            )
+            for sock_obj in candidates:
+                if sock_obj is not None and hasattr(sock_obj, "settimeout"):
+                    sock_obj.settimeout(seconds)
+                    return True
+            return False
+
+        if first_output_timeout:
+            remaining = ((first_output_deadline - time.monotonic())
+                         if first_output_deadline else first_output_timeout)
+            _set_read_timeout(max(0.001, remaining))
 
         def _keepalive():
             while not stop_ka.wait(3):
@@ -883,6 +910,12 @@ class Handler(BaseHTTPRequestHandler):
                 held = []  # probe-hold：握住 response.created 等非内容块，见首条内容才 flush
                 done = False
                 while not done:
+                    if first_output_timeout and not has_output:
+                        remaining = ((first_output_deadline - time.monotonic())
+                                     if first_output_deadline else first_output_timeout)
+                        if remaining <= 0:
+                            raise TimeoutError("GPT first deliverable output deadline exceeded")
+                        _set_read_timeout(remaining)
                     chunk = resp.read(4096)
                     if not chunk:
                         done = True
@@ -940,6 +973,9 @@ class Handler(BaseHTTPRequestHandler):
                         if _is_content:
                             if not has_output:
                                 has_output = True
+                                # GPT 已开始产生可交付输出，后续允许正常长生成，不再受首输出 45s 限制。
+                                if first_output_timeout:
+                                    _set_read_timeout(REQUEST_TIMEOUT)
                                 for hb in held:
                                     _write(hb)
                                 held = []
@@ -1070,6 +1106,19 @@ class Handler(BaseHTTPRequestHandler):
                 inp = last_usage.get("input_tokens", 0)
                 out_ = last_usage.get("output_tokens", 0)
                 dbg("    usage: input=%d output=%d total=%d", inp, out_, inp + out_)
+        except (TimeoutError, socket.timeout) as e:
+            timeout_err = _stream_timeout_error(has_output, first_output_timeout)
+            log.warning("[#%d]     <<< %s STREAM TIMEOUT (has_output=%s, %d events, %dms)",
+                        self._req_id, upstream_name, has_output, events, self._ms())
+            if not has_output:
+                return events, False, None, (timeout_err["code"], timeout_err)
+            try:
+                _emit({"type": "response.failed", "sequence_number": events + 1,
+                       "response": {"id": "resp_timeout", "object": "response",
+                                    "status": "failed", "error": timeout_err}})
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                pass
+            stream_error = timeout_err
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
             log.warning("[#%d]     <<< %s STREAM interrupted", self._req_id, upstream_name)
         finally:
