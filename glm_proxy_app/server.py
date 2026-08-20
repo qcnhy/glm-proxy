@@ -130,6 +130,7 @@ class Handler(BaseHTTPRequestHandler):
         # 4) 遍历上游，自动回退（不截断——客户端会自动压缩，错误都是实际错误）
         last_err = None
         body_saved = False  # 调试body只保存一次（首次失败时）
+        route_sse_committed = False  # GPT 已先发心跳时，后续 GLM 复用同一 SSE，不重复发 HTTP 头
 
         # 客户端 Authorization key 路由：
         # - key=0 → 第一个未 disabled 的 chain_exclude 直通渠道；没有时保持空缺
@@ -137,6 +138,7 @@ class Handler(BaseHTTPRequestHandler):
         # - 其他 key → 默认按配置顺序回退（不含 chain_exclude 渠道）；受模型钉选 / 429 封锁影响
         client_key = self.headers.get("Authorization", "").replace("Bearer ", "").strip()
         force_upstream = None  # 强制渠道 name；None 表示默认回退链
+        # 普通 key 按当前启用渠道动态编号；禁用渠道后，后续渠道顺序前移。
         chain_upstreams = [u for u in UPSTREAMS if not u.get("chain_exclude") and not u.get("disabled")]
         exclude_upstreams = [u for u in UPSTREAMS if u.get("chain_exclude")]
         enabled_excludes = [u for u in exclude_upstreams if not u.get("disabled")]
@@ -173,7 +175,7 @@ class Handler(BaseHTTPRequestHandler):
             req_model = body.get("model") or ""
             if req_model and not force_upstream:
                 # 检查是否有任何渠道的 model == req_model（responses_direct 渠道不参与钉选，只走默认回退）
-                if any(not up.get("responses_direct") and
+                if any(not up.get("disabled") and not up.get("responses_direct") and
                        (up.get("model") == req_model or up.get("messages_model") == req_model)
                        for up in UPSTREAMS):
                     model_pinned = True
@@ -352,15 +354,42 @@ class Handler(BaseHTTPRequestHandler):
 
             log.info("[#%d]     -> %s", self._req_id, up["name"])
 
+            # GPT 直通为 key=0 独占渠道：连接上游等待响应头期间先向客户端提交 SSE
+            # 并发送心跳，避免长首包触发 Codex idle timeout。
+            _connect_ka_stop = None
+            if is_stream and is_responses and route_mode == "responses_direct":
+                _connect_ka_stop = threading.Event()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.close_connection = True
+                self.wfile.write(b": connected\n\n")
+                self.wfile.flush()
+                route_sse_committed = True
+
+                def _connect_keepalive():
+                    while not _connect_ka_stop.wait(3):
+                        try:
+                            self.wfile.write(b": keepalive\n\n")
+                            self.wfile.flush()
+                        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                            break
+                threading.Thread(target=_connect_keepalive, daemon=True).start()
+
             try:
                 req = Request(url, data=payload, headers=up_headers, method=method)
                 resp = urlopen(req, timeout=REQUEST_TIMEOUT)
+                if _connect_ka_stop is not None:
+                    _connect_ka_stop.set()
 
                 if is_stream:
                     if is_responses:
                         # relay 路径：立即发头+keepalive（idle安全），早期 1305/过载退避重试
                         events, has_output, stream_error, fallback = self._relay_stream_with_retry(
-                            resp, up, url, up_headers, payload, method, _est_tokens(body))
+                            resp, up, url, up_headers, payload, method, _est_tokens(body),
+                            precommitted=route_sse_committed)
                         if fallback:
                             # 未发头即失败（429限流/502不可达/DNS等），回退下一上游；
                             # 记住错误供链尾 _send_last_error 呈现（否则全链失败时客户端只看到 None）
@@ -369,6 +398,12 @@ class Handler(BaseHTTPRequestHandler):
                                 last_err = (int(fcode), json.dumps({"error": ferr}).encode())
                             except (TypeError, ValueError):
                                 last_err = (502, b'{"error":"upstream failed before output"}')
+                            if route_mode == "responses_direct":
+                                # 链外 GPT 失败后解除强制选择；后续与普通链使用同一回退规则。
+                                force_upstream = None
+                                _strip_gpt_state(body)
+                            log.warning("[#%d]     !!! %s failed before output, trying next upstream",
+                                        self._req_id, up["name"])
                             continue
                         if stream_error:
                             log.warning("[#%d]     !!! %s upstream error, forwarding to client: %s",
@@ -417,6 +452,14 @@ class Handler(BaseHTTPRequestHandler):
                     return
             except HTTPError as e:
                 err_body = e.read()
+                if _connect_ka_stop is not None:
+                    _connect_ka_stop.set()
+                    last_err = (e.code, err_body)
+                    force_upstream = None
+                    _strip_gpt_state(body)
+                    log.warning("[#%d]     !!! %s HTTP %d before output, fallback to GLM chain",
+                                self._req_id, up["name"], e.code)
+                    continue
                 last_err = (e.code, err_body)
                 log.error("[#%d]     !!! %s HTTP %d: %s", self._req_id, up["name"], e.code, err_body[:300].decode(errors="replace"))
                 # 任意路径 + HTTP 超限(ecloud/venus/internal 等 400 带超限文案) → 返干净 400 触发客户端压缩（不回退）
@@ -436,10 +479,26 @@ class Handler(BaseHTTPRequestHandler):
                         return
                 continue  # 尝试下一个上游（不截断重试）
             except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as e:
+                if _connect_ka_stop is not None:
+                    _connect_ka_stop.set()
+                    last_err = e
+                    force_upstream = None
+                    _strip_gpt_state(body)
+                    log.warning("[#%d]     !!! %s connection reset before output, fallback to GLM chain: %s",
+                                self._req_id, up["name"], e)
+                    continue
                 log.error("[#%d]     !!! %s connection reset: %s", self._req_id, up["name"], e)
                 last_err = e
                 continue
             except Exception as e:
+                if _connect_ka_stop is not None:
+                    _connect_ka_stop.set()
+                    last_err = e
+                    force_upstream = None
+                    _strip_gpt_state(body)
+                    log.warning("[#%d]     !!! %s error before output, fallback to GLM chain: %s",
+                                self._req_id, up["name"], e)
+                    continue
                 last_err = e
                 log.error("[#%d]     !!! %s error: %s", self._req_id, up["name"], e)
                 continue
@@ -447,6 +506,19 @@ class Handler(BaseHTTPRequestHandler):
         # 所有上游都失败
         if body and (is_responses or is_messages) and not body_saved:
             self._save_debug_body(body)
+        if route_sse_committed:
+            if isinstance(last_err, tuple):
+                code, raw_err = last_err
+                try:
+                    err_obj = json.loads(raw_err).get("error")
+                except Exception:
+                    err_obj = {"code": str(code), "message": raw_err.decode("utf-8", errors="replace")}
+            else:
+                err_obj = {"code": "all_upstreams_failed", "message": str(last_err or "all upstreams failed")}
+            failed = {"type": "response.failed", "response": {"status": "failed", "error": err_obj}}
+            self.wfile.write(("event: response.failed\ndata: " + json.dumps(failed, ensure_ascii=False) + "\n\n").encode())
+            self.wfile.flush()
+            return
         self._send_last_error(last_err)
 
     # ── 流式透传（非 Responses 路径）──
@@ -686,12 +758,12 @@ class Handler(BaseHTTPRequestHandler):
 
                 # === 判定本次 resp ===
                 if flushed:
-                    if not saw_message_stop:  # 不完整 → 合成收尾
-                        log.warning("[#%d] [messages] %s incomplete (no message_stop), synthesizing close",
+                    if not saw_message_stop:  # 不完整 → 明确报错，不能伪装正常 end_turn
+                        log.warning("[#%d] [messages] %s incomplete (no message_stop), forwarding stream error",
                                     self._req_id, upstream_name)
                         for idx in open_indices:
                             _write(("event: content_block_stop\ndata: {\"type\": \"content_block_stop\", \"index\": " + str(idx) + "}\n\n").encode())
-                        _write(b'event: message_delta\ndata: {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 0}}\n\nevent: message_stop\ndata: {"type": "message_stop"}\n\n')
+                        _write(b'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"upstream stream ended before message_stop"}}\n\n')
                     size_str = (str(size // 1024) + "KB") if size >= 1024 else (str(size) + "B")
                     if last_usage:
                         log.info("[#%d]     <<< %s STREAM OK (%s, %dms) usage: input=%d output=%d total=%d",
@@ -702,42 +774,45 @@ class Handler(BaseHTTPRequestHandler):
                         log.info("[#%d]     <<< %s STREAM OK (%s, %dms)",
                                  self._req_id, upstream_name, size_str, self._ms())
                     return
-                # 非内容（上游早断/不完整/空但无超限信号；超限已在探测期返 400）→ 提交 200 + 转发已握住的块 + 合成收尾
+                # 非内容（上游早断/不完整/空但无超限信号；超限已在探测期返 400）→ 明确报错
                 _commit()
                 for hb in held:
                     _write(hb)
                 if held and not saw_message_stop:
-                    _write(b'event: message_delta\ndata: {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 0}}\n\nevent: message_stop\ndata: {"type": "message_stop"}\n\n')
-                log.info("[#%d]     <<< %s STREAM non-content (%dms) — 提交200+合成收尾",
-                         self._req_id, upstream_name, self._ms())
+                    _write(b'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"upstream stream ended before message_stop"}}\n\n')
+                log.warning("[#%d]     <<< %s STREAM non-content/incomplete (%dms)",
+                            self._req_id, upstream_name, self._ms())
                 return
         except Exception as e:
-            log.error("[#%d] [messages] %s revive exception: %s — synthesizing close",
+            log.error("[#%d] [messages] %s stream exception: %s",
                       self._req_id, upstream_name, e)
             try:
-                _write(b'event: message_delta\ndata: {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 0}}\n\nevent: message_stop\ndata: {"type": "message_stop"}\n\n')
+                _commit()
+                _write(b'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"upstream stream interrupted"}}\n\n')
             except Exception:
                 pass
         finally:
             stop_ka.set()
 
     # ── 流式转发 ─────────────────────────────────────
-    def _relay_stream_with_retry(self, first_resp, up, url, up_headers, payload, method, est_input=0):
+    def _relay_stream_with_retry(self, first_resp, up, url, up_headers, payload, method,
+                                 est_input=0, precommitted=False):
         """增量流式转发 codex-relay 的 Responses SSE（probe-before-commit，靠 codex-relay 自带 keepalive）。
         延迟提交 200：非内容块(response.created 等)握住不发，首次 _write 才提交 200+flush；
         overflow(超限信号/空completed)→返干净 400(as_responses)触发客户端压缩；其他错误与 messages 一致直接转发(429另封锁渠道)。
-        返回 (events, has_output, stream_error, fallback)。fallback=(code, err) 表示未发头即失败（429/502/DNS等），
-        应回退下一上游（调用方记录 last_err 供链尾呈现）；已发响应头即视为完成（不回退，错误直接转发）。"""
+        返回 (events, has_output, stream_error, fallback)。fallback=(code, err) 表示尚无可交付输出，
+        无论 SSE 是否已提交都应尝试下一渠道；已有正文/合法工具调用后失败才在当前流内结束。"""
         import threading
         upstream_name = up["name"]
         events = 0
         last_usage = {}
         has_output = False
         stream_error = None
+        stream_incomplete = False
         held_completed = None
         raw_blocks = []
 
-        committed = [False]
+        committed = [precommitted]
         wlock = threading.Lock()
         stop_ka = threading.Event()
 
@@ -750,6 +825,9 @@ class Handler(BaseHTTPRequestHandler):
                             self.wfile.flush()
                 except Exception:
                     break
+
+        if precommitted:
+            threading.Thread(target=_keepalive, daemon=True).start()
 
         def _commit_locked():
             # 调用方须持 wlock。probe-before-commit：延迟提交 200，首次 _write 才提交，
@@ -901,6 +979,16 @@ class Handler(BaseHTTPRequestHandler):
                                             upstream_text=json.dumps(early_err[1], ensure_ascii=False) if early_err else "")
                     return events, has_output, None, False
 
+                # 已预提交 SSE（GPT 心跳/探测 watchdog）时无法改返 HTTP 400；空 completed
+                # 仍属于“无可交付输出”，统一交给外层回退下一渠道。
+                if committed[0] and held_completed is not None and not has_output:
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+                    return events, False, None, ("empty_output", {
+                        "code": "empty_output", "message": "upstream completed without output"})
+
                 # === 早期 response.failed（非超限）：未发头一律回退下一上游（429 先封锁渠道）；已发头才转发 ===
                 if early_err and not has_output and not stream_error:
                     code, err, out_bytes = early_err
@@ -913,24 +1001,37 @@ class Handler(BaseHTTPRequestHandler):
                             _block_channel_on_429(json.dumps(err).encode(), upstream_name, self._req_id)
                             dbg("[#%d]     [429] after block: %s", self._req_id,
                                 {k: datetime.fromtimestamp(v).strftime("%H:%M") for k, v in _channel_blocked_until.items() if v > time.time()})
-                    # probe-hold 阶段未提交 200 → 错误不转发给客户端，回退下一上游
-                    # （限流/502不可达/DNS失败等一律回退；全链失败由链尾把最后的错误发给客户端）
-                    if not committed[0]:
-                        log.warning("[#%d]     !!! %s failed before commit (code=%s), trying next upstream",
-                                    self._req_id, upstream_name, code)
+                    # 统一规则：是否已提交 SSE 不影响回退；只要尚无正文/合法工具调用，
+                    # 就丢弃该渠道握住的 created/reasoning/error，交由外层尝试下一渠道。
+                    log.warning("[#%d]     !!! %s failed before output (code=%s), trying next upstream",
+                                self._req_id, upstream_name, code)
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+                    return events, has_output, None, (code, err)
+
+                # 上游 EOF 但没有 response.completed：无输出时允许统一回退；已有输出时
+                # 不能跨模型续写，也不能伪造 completed，明确告诉客户端本次响应不完整。
+                if held_completed is None and not stream_error:
+                    incomplete_err = {
+                        "code": "incomplete_stream",
+                        "message": "upstream stream ended before response.completed",
+                    }
+                    if not has_output:
+                        log.warning("[#%d]     !!! %s stream ended before response.completed without output, trying next upstream",
+                                    self._req_id, upstream_name)
                         try:
                             resp.close()
                         except Exception:
                             pass
-                        return events, has_output, None, (code, err)
-                    log.warning("[#%d]     !!! %s forwarding response.failed: %s", self._req_id, upstream_name, err)
-                    for hb in held:  # probe-hold：转发前 flush 握住的(含 response.created)，让客户端看到 created+failed
-                        _write(hb)
-                    held = []
-                    _write(out_bytes)
-                    stream_error = err
+                        return events, False, None, ("incomplete_stream", incomplete_err)
+                    stream_incomplete = True
+                    stream_error = incomplete_err
+                    log.warning("[#%d]     !!! %s stream ended before response.completed after output",
+                                self._req_id, upstream_name)
 
-                # 正常完成或已真实输出（含中途错误已转发）→ emit response.completed 收尾
+                # 正常完成或已真实输出后的失败：先 flush 还握住的块，保证事件结构合法。
                 # 先 flush 还握住的块(若 has_output 期间已 flush 则 held 为空)：保证 created+completed 结构合法
                 for hb in held:
                     _write(hb)
@@ -950,27 +1051,21 @@ class Handler(BaseHTTPRequestHandler):
                         except Exception:
                             pass
                     _emit(held_completed)
-                elif not stream_error:
-                    # 上游未发 response.completed（不完整流，如 cmoyan 截断：仅 created+in_progress）→ 合成收尾，
-                    # 避免客户端"响应结束但一直转"。usage 三字段必须齐（Codex 解析 ResponseCompleted
-                    # required output_tokens，缺失报 "failed to parse ResponseCompleted" 断流）；
-                    # input 用 est 兜底让客户端感知真实上下文
-                    log.warning("[#%d]     !!! %s no response.completed, synthesizing (has_output=%s, events=%d)",
-                                self._req_id, upstream_name, has_output, events)
-                    _syn_in = int(last_usage.get("input_tokens", 0) or est_input or 0)
-                    _syn_out = int(last_usage.get("output_tokens", 0) or 0)
-                    _emit({"type": "response.completed", "sequence_number": events + 1,
-                           "response": {"id": "resp_syn", "object": "response",
-                                        "status": "completed", "output": [],
-                                        "usage": {"input_tokens": _syn_in, "output_tokens": _syn_out,
-                                                  "total_tokens": _syn_in + _syn_out}}})
+                elif stream_incomplete:
+                    _emit({"type": "response.failed", "sequence_number": events + 1,
+                           "response": {"id": "resp_incomplete", "object": "response",
+                                        "status": "failed", "error": stream_error}})
                 break  # 完成，退出重试循环
 
             # 保存 exchange 用于排查
             resp_text = b"".join(raw_blocks).decode("utf-8", errors="replace")
             self._save_exchange(getattr(self, '_debug_req_body', {}), resp_text, upstream_name, "relay")
 
-            log.info("[#%d]     <<< %s STREAM OK (%d events, %dms)", self._req_id, upstream_name, events, self._ms())
+            if stream_error:
+                log.warning("[#%d]     <<< %s STREAM FAILED (%d events, %dms): %s",
+                            self._req_id, upstream_name, events, self._ms(), stream_error)
+            else:
+                log.info("[#%d]     <<< %s STREAM OK (%d events, %dms)", self._req_id, upstream_name, events, self._ms())
             if last_usage:
                 inp = last_usage.get("input_tokens", 0)
                 out_ = last_usage.get("output_tokens", 0)
@@ -980,7 +1075,7 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             stop_ka.set()  # 停 keepalive / watchdog
 
-        return events, True, stream_error, False  # 已发响应头，总是 done（不回退下一上游）
+        return events, True, stream_error, False  # 已有可交付输出，禁止跨模型回退
 
     @staticmethod
     def _process_sse_block(block, upstream_name=None):

@@ -2,7 +2,7 @@
 
 ## Current architecture
 
-- Version: 4.3.3.
+- Version: 4.4.2.
 - `glm_proxy.py` is a compatibility entry point only.
 - `glm_proxy_app/common.py` owns configuration, logging, shared state, and the threaded server type.
 - `glm_proxy_app/relay.py` owns interceptor servers and codex-relay child processes.

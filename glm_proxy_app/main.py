@@ -7,7 +7,7 @@ from .common import LISTEN, UPSTREAMS, ThreadedHTTPServer, log
 from .relay import start_interceptors, start_relays, stop_relays
 from .server import Handler
 
-VERSION = "4.3.3"
+VERSION = "4.4.2"
 
 
 def _log_upstreams():
