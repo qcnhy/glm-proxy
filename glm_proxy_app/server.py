@@ -1001,12 +1001,13 @@ class Handler(BaseHTTPRequestHandler):
                 if stream_error:
                     break
 
-                # === 超限检测（靠上游实际响应）===：response.failed 带超限文案 或 空 completed(无 output)
+                # === 超限检测（靠上游实际响应）===：response.failed 带超限文案
                 # → 返干净 400（Responses 形态）触发客户端压缩；探测期未提交 200，可直接 _send_raw(400)
+                # 注意：空 completed(无 output) 不在此拦截——无超限证据却伪造 context overflow 400 会让
+                # 客户端误压缩上下文（截图场景实测踩坑），应走下方空输出回退下一渠道。
                 if not committed[0] and (
-                        (early_err and not has_output
-                         and _is_overflow_signal(json.dumps(early_err[1], ensure_ascii=False)))
-                        or (held_completed is not None and not has_output)):
+                        early_err and not has_output
+                        and _is_overflow_signal(json.dumps(early_err[1], ensure_ascii=False))):
                     # 仅探测期（未发 200 头）可改返 400；watchdog 已强制 commit 则走正常收尾，防二次 send_response
                     try:
                         resp.close()
@@ -1016,9 +1017,9 @@ class Handler(BaseHTTPRequestHandler):
                                             upstream_text=json.dumps(early_err[1], ensure_ascii=False) if early_err else "")
                     return events, has_output, None, False
 
-                # 已预提交 SSE（GPT 心跳/探测 watchdog）时无法改返 HTTP 400；空 completed
-                # 仍属于“无可交付输出”，统一交给外层回退下一渠道。
-                if committed[0] and held_completed is not None and not has_output:
+                # 空 completed（无 output）：无论是否已预提交 SSE，都属“无可交付输出”，
+                # 统一交给外层回退下一渠道（不伪造超限 400）。
+                if held_completed is not None and not has_output:
                     try:
                         resp.close()
                     except Exception:
@@ -1203,9 +1204,10 @@ class Handler(BaseHTTPRequestHandler):
         else:
             err = json.dumps({"type": "error", "error": {"type": "invalid_request_error",
                                                          "message": msg}}).encode()
-        log.warning("[#%d]     !!! context overflow (~%dK > %dK), returning 400 to client",
+        log.warning("[#%d]     !!! context overflow (~%dK > %dK), returning 400 to client | upstream_text: %s",
                     getattr(self, '_req_id', 0),
-                    int(est_tokens // 1000) if est_tokens else 0, max_ctx // 1000)
+                    int(est_tokens // 1000) if est_tokens else 0, max_ctx // 1000,
+                    (upstream_text or "")[:300])
         self._send_raw(400, err, "application/json")
 
     def _send_context_exceeded(self, body, up):
