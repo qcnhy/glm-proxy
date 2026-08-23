@@ -85,6 +85,27 @@ def _strip_gpt_state(body):
     return removed, removed_previous
 
 
+def _strip_responses_images(body):
+    """Responses → Completions(relay) 链路剥离 input_image：GLM completions 端点
+    只接受 content.type=text（上游 1210 '参数非法'），图片会整请求 400。
+    剥离后用占位文本提示模型，避免静默丢图。返回替换的图片数（0=无图，不动 body）。"""
+    if not isinstance(body, dict):
+        return 0
+    items = body.get("input")
+    if not isinstance(items, list):
+        return 0
+    n = 0
+    for item in items:
+        content = item.get("content") if isinstance(item, dict) else None
+        if not isinstance(content, list):
+            continue
+        for i, block in enumerate(content):
+            if isinstance(block, dict) and block.get("type") == "input_image":
+                content[i] = {"type": "input_text", "text": "[图片已省略：当前渠道不支持图片输入]"}
+                n += 1
+    return n
+
+
 def _route_mode(up, is_responses, is_messages):
     """根据请求需求和渠道能力选择统一路由模式；None 表示不兼容。
 
