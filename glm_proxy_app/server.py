@@ -93,6 +93,7 @@ class Handler(BaseHTTPRequestHandler):
             raw = self.rfile.read(length)
             try:
                 body = json.loads(raw)
+                self._last_body = body  # 供 overflow 400 时落盘排查
             except json.JSONDecodeError as je:
                 # 客户端发的 JSON 非法或 Content-Length 与实际不符（截断/编码错乱）→
                 # 存证 + 干净 400（异常冒到外层会让客户端挂着收不到响应）
@@ -1208,6 +1209,16 @@ class Handler(BaseHTTPRequestHandler):
                     getattr(self, '_req_id', 0),
                     int(est_tokens // 1000) if est_tokens else 0, max_ctx // 1000,
                     (upstream_text or "")[:300])
+        # 落盘触发超限的请求体（仅出错时，不受 DEBUG 开关限制），供排查 est 与真实 token 偏差
+        body = getattr(self, '_last_body', None)
+        if body is not None:
+            try:
+                path = os.path.join(LOG_DIR, f"overflow_{time.strftime('%Y%m%d_%H%M%S')}_{getattr(self, '_req_id', 0)}.json")
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(json.dumps(body, ensure_ascii=False))
+                log.info("[#%d]     overflow request body saved: %s", getattr(self, '_req_id', 0), path)
+            except Exception:
+                pass
         self._send_raw(400, err, "application/json")
 
     def _send_context_exceeded(self, body, up):
