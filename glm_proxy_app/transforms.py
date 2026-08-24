@@ -98,6 +98,13 @@ def _strip_responses_images(body):
     for item in items:
         content = item.get("content") if isinstance(item, dict) else None
         if not isinstance(content, list):
+            # function_call_output.output 可能是 list（view_image 返回图片 base64，~1MB/张），
+            # completions 端点只收 text；同样剥离（1261 实锤触发源）
+            if (isinstance(item, dict) and item.get("type") == "function_call_output"
+                    and isinstance(item.get("output"), list)):
+                if any(isinstance(b, dict) and b.get("image_url") for b in item["output"]):
+                    item["output"] = "[图片已省略：当前渠道不支持图片输入]"
+                    n += 1
             continue
         for i, block in enumerate(content):
             if isinstance(block, dict) and block.get("type") == "input_image":
