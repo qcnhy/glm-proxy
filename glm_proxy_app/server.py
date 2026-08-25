@@ -3,6 +3,7 @@ import itertools
 import json
 import os
 import socket
+import ssl
 import threading
 import time
 import traceback
@@ -236,6 +237,8 @@ class Handler(BaseHTTPRequestHandler):
                     "Authorization": f"Bearer {up.get('key', '')}",
                     "Connection": "close",
                 }
+                if up.get("host_header"):  # SNI 被阻断的站点：openai_url 写 IP，Host 头还原域名
+                    up_headers["Host"] = up["host_header"]
                 if up.get("tokens_file"):
                     # ChatGPT 订阅 OAuth：fresh access_token + 账号头 + beta 头（实测必需组合）
                     _acc, _acct = _cg_fresh_access(up)
@@ -364,6 +367,9 @@ class Handler(BaseHTTPRequestHandler):
                     body["tools"] = _tools_bak  # 恢复 tools（回退下一上游时原样）
             if up.get("tokens_file"):
                 up_headers["User-Agent"] = "codex_cli_rs/0.45.0"  # ChatGPT backend 认 codex UA（实测组合）
+            elif up.get("codex_ua_only"):  # agentrouter 类站点：UA 白名单，仅认 codex 客户端
+                up_headers["User-Agent"] = "codex_cli_rs/0.45.0"
+                up_headers["originator"] = "codex_cli_rs"
             else:
                 up_headers["User-Agent"] = _UPSTREAM_UA  # 防 Cloudflare 1010
 
@@ -400,7 +406,12 @@ class Handler(BaseHTTPRequestHandler):
                 connect_timeout = (GPT_FIRST_OUTPUT_TIMEOUT
                                    if route_mode == "responses_direct" and is_stream
                                    else REQUEST_TIMEOUT)
-                resp = urlopen(req, timeout=connect_timeout)
+                _ctx = None
+                if up.get("host_header"):  # IP 直连 + Host 头还原域名：证书 CN 是域名，需关校验
+                    _ctx = ssl.create_default_context()
+                    _ctx.check_hostname = False
+                    _ctx.verify_mode = ssl.CERT_NONE
+                resp = urlopen(req, timeout=connect_timeout, context=_ctx)
                 if _connect_ka_stop is not None:
                     _connect_ka_stop.set()
 

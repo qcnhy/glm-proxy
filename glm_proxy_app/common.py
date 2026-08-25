@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v4.4.9 — codex-relay + Python 路由层
+GLM API 代理 v4.5.0 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
