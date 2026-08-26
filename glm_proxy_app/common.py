@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v4.5.5 — codex-relay + Python 路由层
+GLM API 代理 v4.5.6 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -154,6 +154,7 @@ STATIC_MODELS = json.dumps({
     "data": list({up["model"]: {"id": up["model"], "slug": up["model"], "object": "model",
                                 "display_name": up["model"],
                                 "description": up["model"],
+                                "supported_in_api": True,
                                 "supports_parallel_tool_calls": True,
                                 "default_reasoning_level": "medium",
                                 "supported_reasoning_levels": [
@@ -174,6 +175,7 @@ STATIC_MODELS = json.dumps({
     "models": list({up["model"]: {"id": up["model"], "slug": up["model"], "object": "model",
                                  "display_name": up["model"],
                                  "description": up["model"],
+                                 "supported_in_api": True,
                                  "supports_parallel_tool_calls": True,
                                  "default_reasoning_level": "medium",
                                  "supported_reasoning_levels": [
