@@ -136,36 +136,16 @@ class Handler(BaseHTTPRequestHandler):
         body_saved = False  # 调试body只保存一次（首次失败时）
         route_sse_committed = False  # GPT 已先发心跳时，后续 GLM 复用同一 SSE，不重复发 HTTP 头
 
-        # 客户端 Authorization key 路由：
-        # - key=0 → 第一个未 disabled 的 chain_exclude 直通渠道；没有时保持空缺
-        # - key=N (N>=1) → 第 N 个未 disabled 的普通链内渠道（1-based）
-        # - 其他 key → 默认按配置顺序回退（不含 chain_exclude 渠道）；受模型钉选 / 429 封锁影响
+        # 客户端 Authorization 仅作鉴权透传，不参与路由：
+        # v4.6.0 移除数字 key 强制渠道与模型名钉选——统一走配置顺序的回退链，
+        # 渠道优先级由 config.json 数组顺序 + disabled 开关控制（重启生效）。
         client_key = self.headers.get("Authorization", "").replace("Bearer ", "").strip()
-        force_upstream = None  # 强制渠道 name；None 表示默认回退链
-        # 普通 key 按当前启用渠道动态编号；禁用渠道后，后续渠道顺序前移。
-        chain_upstreams = [u for u in UPSTREAMS if not u.get("chain_exclude") and not u.get("disabled")]
-        exclude_upstreams = [u for u in UPSTREAMS if u.get("chain_exclude")]
-        enabled_excludes = [u for u in exclude_upstreams if not u.get("disabled")]
-        if client_key == "0" and enabled_excludes:
-            force_upstream = enabled_excludes[0]["name"]
-        elif client_key.isdigit() and int(client_key) >= 1:
-            idx = int(client_key) - 1
-            if idx < len(chain_upstreams):
-                force_upstream = chain_upstreams[idx]["name"]
-            else:
-                log.warning("[#%d] key=%s out of range (1..%d), fallback to default chain",
-                            self._req_id, client_key, len(chain_upstreams))
-        elif client_key == "0":
-            log.warning("[#%d] key=0 has no enabled direct upstream, fallback to default chain", self._req_id)
 
         # 普通回退链不能解析其他上游的服务端 item 引用。进入链前删除所有纯
         # item_reference、rs_*/reasoning 和 previous_response_id，保留完整消息及工具记录。
         # 钉选/数字 key 指向链内渠道时同样需要清理（GPT 会话切渠道不能带 rs_*）；
         # 唯一例外：目标是无状态 responses_direct 渠道（循环内自行 strip）。
-        _force_up = next((u for u in UPSTREAMS if u.get("name") == force_upstream), None) if force_upstream else None
-        _force_is_stateless_gpt = bool(_force_up and _force_up.get("responses_direct")
-                                       and _force_up.get("store_responses") is False)
-        if is_responses and isinstance(body, dict) and not _force_is_stateless_gpt:
+        if is_responses and isinstance(body, dict):
             _n_gpt, _had_prev = _strip_gpt_state(body)
             if _n_gpt or _had_prev:
                 dbg("[#%d]     [gpt-state] stripped %d GPT item(s), previous_response_id=%s",
@@ -173,54 +153,32 @@ class Handler(BaseHTTPRequestHandler):
 
         # GET/无 body 时也要初始化，避免 ROUTE 日志 NameError
         req_model = ""
-        # 模型名钉选：客户端指定的 model 若在 config 里有匹配 → 只按顺序走匹配的渠道，不回退到其他模型
-        model_pinned = False  # True=只走 model 匹配的渠道
         if isinstance(body, dict):
             req_model = body.get("model") or ""
-            if req_model and not force_upstream:
-                # 检查是否有任何渠道的 model == req_model（responses_direct 渠道不参与钉选，只走默认回退）
-                if any(not up.get("disabled") and not up.get("responses_direct") and
-                       (up.get("model") == req_model or up.get("messages_model") == req_model)
-                       for up in UPSTREAMS):
-                    model_pinned = True
-                # 注意：responses_direct（GPT 直通）渠道不参与模型钉选，只能通过 key=0 直达。
 
         # Responses 不按内容类型分叉；图片与文本走同一条协议路径。
         blocked_active = {k: datetime.fromtimestamp(v).strftime("%H:%M") for k, v in _channel_blocked_until.items() if v > time.time()}
-        log.info("[#%d] ROUTE: key=%s model=%s force=%s pinned=%s blocked=%s path=%s",
+        log.info("[#%d] ROUTE: key=%s model=%s blocked=%s path=%s",
                  self._req_id, client_key[:20] or "(empty)", req_model or "?",
-                 force_upstream, model_pinned, blocked_active or "{}",
+                 blocked_active or "{}",
                  self.path)
         for up in UPSTREAMS:
             if up.get("disabled"):
-                continue
-            # chain_exclude 渠道永不参与自动回退链，仅数字 key 可手动直达。
-            if up.get("chain_exclude") and up["name"] != force_upstream:
                 continue
             # v2.9.103: 超大载荷跳过 cf_gate 渠道（如 cmoyan）——大上下文会话源站处理超
             # Cloudflare 100s 上限必 524，白等约两分钟才回退。≥1MB 直接跳过走下一渠道。
             # v2.9.108: 改按 cf_gate 标志判定——chatgpt 官方 backend 早发 response.created
             # 不触发百秒闸，不受此限。
-            if not force_upstream and up.get("cf_gate") and len(raw) >= 1024 * 1024:
+            if up.get("cf_gate") and len(raw) >= 1024 * 1024:
                 log.info("[#%d]     [skip] %s: 载荷 %dKB ≥1MB，Cloudflare 必 524，跳过",
                          self._req_id, up["name"], len(raw) // 1024)
                 continue
-            # 数字 key 强制：只走对应渠道（跳过封锁限制）
-            if force_upstream:
-                if up["name"] != force_upstream:
-                    continue
-            else:
-                # 模型名钉选：只走 model 匹配的渠道，跳过不匹配的
-                if model_pinned:
-                    if req_model != up.get("model") and req_model != up.get("messages_model"):
-                        continue
-                # 渠道封锁检查：429 限额封锁期内跳过对应渠道
-                block_key = up["name"]
-                if _channel_blocked_until.get(block_key, 0) > time.time():
-                    log.info("[#%d]     [skip] %s blocked until %s",
-                             self._req_id, up["name"],
-                             datetime.fromtimestamp(_channel_blocked_until[block_key]).strftime("%H:%M"))
-                    continue
+            # 渠道封锁检查：429 限额封锁期内跳过对应渠道
+            if _channel_blocked_until.get(up["name"], 0) > time.time():
+                log.info("[#%d]     [skip] %s blocked until %s",
+                         self._req_id, up["name"],
+                         datetime.fromtimestamp(_channel_blocked_until[up["name"]]).strftime("%H:%M"))
+                continue
             route_mode = _route_mode(up, is_responses, is_messages)
             if route_mode is None:
                 continue
@@ -433,8 +391,7 @@ class Handler(BaseHTTPRequestHandler):
                             except (TypeError, ValueError):
                                 last_err = (502, b'{"error":"upstream failed before output"}')
                             if route_mode == "responses_direct":
-                                # 链外 GPT 失败后解除强制选择；后续与普通链使用同一回退规则。
-                                force_upstream = None
+                                # GPT 直通失败回退 GLM 链：先剥服务端状态引用再重放。
                                 _strip_gpt_state(body)
                             log.warning("[#%d]     !!! %s failed before output, trying next upstream",
                                         self._req_id, up["name"])
@@ -489,7 +446,6 @@ class Handler(BaseHTTPRequestHandler):
                 if _connect_ka_stop is not None:
                     _connect_ka_stop.set()
                     last_err = (e.code, err_body)
-                    force_upstream = None
                     _strip_gpt_state(body)
                     log.warning("[#%d]     !!! %s HTTP %d before output, fallback to GLM chain",
                                 self._req_id, up["name"], e.code)
@@ -516,7 +472,6 @@ class Handler(BaseHTTPRequestHandler):
                 if _connect_ka_stop is not None:
                     _connect_ka_stop.set()
                     last_err = e
-                    force_upstream = None
                     _strip_gpt_state(body)
                     log.warning("[#%d]     !!! %s connection reset before output, fallback to GLM chain: %s",
                                 self._req_id, up["name"], e)
@@ -528,7 +483,6 @@ class Handler(BaseHTTPRequestHandler):
                 if _connect_ka_stop is not None:
                     _connect_ka_stop.set()
                     last_err = e
-                    force_upstream = None
                     _strip_gpt_state(body)
                     log.warning("[#%d]     !!! %s error before output, fallback to GLM chain: %s",
                                 self._req_id, up["name"], e)
