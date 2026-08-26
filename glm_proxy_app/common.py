@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v4.5.0 — codex-relay + Python 路由层
+GLM API 代理 v4.5.1 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -152,6 +152,7 @@ _CHAIN_UPS = [up for up in UPSTREAMS if not up.get("responses_direct")]
 STATIC_MODELS = json.dumps({
     "object": "list",
     "data": list({up["model"]: {"id": up["model"], "slug": up["model"], "object": "model",
+                                "display_name": up["model"],
                                 "owned_by": up.get("owned_by", "zhipu"),
                                 "context_window": up.get("max_context_tokens", 128000),
                                 "max_context_window": up.get("max_context_tokens", 128000)}
@@ -159,7 +160,10 @@ STATIC_MODELS = json.dumps({
     # v2.9.87: Codex models_manager 期望 "models" 字段（非标准 OpenAI "data"），
     # 缺失会每 3 分钟报 "failed to decode models response: missing field models"
     # v2.9.92: Codex 新版还要每个 model 对象含 "slug" 字段，缺失报 "missing field `slug`"
+    # v4.5.1: Codex 0.147 还要 "display_name"，缺失报 missing field `display_name`
+    # 且模型列表刷新失败会导致新建会话超时（models_manager 卡住）
     "models": list({up["model"]: {"id": up["model"], "slug": up["model"], "object": "model",
+                                 "display_name": up["model"],
                                  "owned_by": up.get("owned_by", "zhipu"),
                                  "context_window": up.get("max_context_tokens", 128000),
                                  "max_context_window": up.get("max_context_tokens", 128000)}
