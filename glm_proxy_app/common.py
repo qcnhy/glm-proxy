@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v4.5.4 — codex-relay + Python 路由层
+GLM API 代理 v4.5.5 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -156,7 +156,10 @@ STATIC_MODELS = json.dumps({
                                 "description": up["model"],
                                 "supports_parallel_tool_calls": True,
                                 "default_reasoning_level": "medium",
-                                "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}, {"effort": "high"}],
+                                "supported_reasoning_levels": [
+                                    {"effort": "low", "description": "Low"},
+                                    {"effort": "medium", "description": "Medium"},
+                                    {"effort": "high", "description": "High"}],
                                 "shell_type": "unified_exec",
                                 "visibility": "list",
                                 "owned_by": up.get("owned_by", "zhipu"),
@@ -173,7 +176,10 @@ STATIC_MODELS = json.dumps({
                                  "description": up["model"],
                                  "supports_parallel_tool_calls": True,
                                  "default_reasoning_level": "medium",
-                                 "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}, {"effort": "high"}],
+                                 "supported_reasoning_levels": [
+                                     {"effort": "low", "description": "Low"},
+                                     {"effort": "medium", "description": "Medium"},
+                                     {"effort": "high", "description": "High"}],
                                  "shell_type": "unified_exec",
                                  "visibility": "list",
                                  "owned_by": up.get("owned_by", "zhipu"),
