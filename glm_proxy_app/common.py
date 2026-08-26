@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v4.5.2 — codex-relay + Python 路由层
+GLM API 代理 v4.5.3 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -153,6 +153,7 @@ STATIC_MODELS = json.dumps({
     "object": "list",
     "data": list({up["model"]: {"id": up["model"], "slug": up["model"], "object": "model",
                                 "display_name": up["model"],
+                                "description": up["model"],
                                 "default_reasoning_level": "medium",
                                 "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}, {"effort": "high"}],
                                 "shell_type": "unified_exec",
@@ -168,6 +169,7 @@ STATIC_MODELS = json.dumps({
     # 且模型列表刷新失败会导致新建会话超时（models_manager 卡住）
     "models": list({up["model"]: {"id": up["model"], "slug": up["model"], "object": "model",
                                  "display_name": up["model"],
+                                 "description": up["model"],
                                  "default_reasoning_level": "medium",
                                  "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}, {"effort": "high"}],
                                  "shell_type": "unified_exec",
