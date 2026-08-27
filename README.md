@@ -48,7 +48,6 @@ Codex CLI ──► GLM Proxy (:9999)
 - **流式错误拦截**：GLM 流式返回 1234（上下文超限）/1305（限速）错误时，合成正常结束保留已生成内容
 - **官方限速**：令牌桶控制官方 API 请求频率，防止 1305
 - **`max_tokens` 兜底**：自动补全默认值，避免智谱 `count_tokens` 在 `None` 时崩溃
-- **健康检查**：定时验证内网网关模型身份，异常时飞书告警
 - **namespace 工具名修正**：处理 codex-relay 对 MCP namespace 工具的命名拼接
 
 ## 配置
@@ -64,7 +63,6 @@ cp config.example.json config.json
 
 ```json
 {
-  "feishu_webhook": "https://...",            // 健康检查告警 webhook（可选）
   "upstreams": [
     {
       "name": "official",                      // 上游名称

@@ -1,6 +1,6 @@
 {
   "_comment": "复制本文件为 config.json 并填入真实密钥。config.json 不会被提交到 git。",
-  "_comment_upstreams": "渠道按优先级排列。能力由 URL 字段决定：有 openai_url+relay_port=可服务 Responses(codex-relay→Completions)与通用 OpenAI 路径，有 anthropic_url=可服务 /v1/messages 直连。路由 flag: require_health(需健康检查), disabled(禁用)。客户端发数字 key 强制选择链内渠道，内网渠道放在最后作为兜底。",
+  "_comment_upstreams": "渠道按优先级排列。能力由 URL 字段决定：有 openai_url+relay_port=可服务 Responses(codex-relay→Completions)与通用 OpenAI 路径，有 anthropic_url=可服务 /v1/messages 直连。路由 flag: disabled(禁用)。内网渠道放在最后作为兜底。",
   "upstreams": [
     {
       "_comment": "GPT 原生 Responses 固定渠道：使用独立数字 key，不加入 GLM 回退链。store_responses=false 时代理会删除所有纯 item_reference、rs_*/reasoning 和 previous_response_id；进入 GLM 回退链时执行相同清理。",
