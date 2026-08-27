@@ -21,7 +21,7 @@ from .transforms import (
     _est_tokens, _extract_additional_tools, _fix_tool_result_roles,
     _flatten_agent_messages, _inject_tool_rules, _is_overflow_signal,
     _merge_duplicate_tool_outputs, _normalize_sse_block,
-    _patch_msg_usage, _route_mode, _stream_timeout_error, _strip_gpt_state,
+    _patch_msg_usage, _route_mode, _select_upstream_model, _stream_timeout_error, _strip_gpt_state,
     _strip_responses_images,
 )
 
@@ -262,15 +262,10 @@ class Handler(BaseHTTPRequestHandler):
                     if _n_gpt or _had_prev:
                         dbg("[#%d]     [gpt-state] %s store=false stripped %d item(s), previous_response_id=%s",
                             self._req_id, up["name"], _n_gpt, _had_prev)
-                # Messages 路径走 Anthropic 端点，用 messages_model（如 grok-4.5-claude）；
-                # relay/通用 OpenAI 路径用 model（OpenAI 名）。
-                # responses_direct 渠道透传客户端原始 model（GPT 原生名，上游按名路由）；
-                # 用 req_model 而非 body["model"]——回退链前面的渠道可能已把 body["model"] 改写成自己的 model
-                if up.get("responses_direct"):
-                    # 客户端未指定 model 时兜底用渠道配置值，不透传空字符串
-                    body["model"] = req_model or up["model"]
-                else:
-                    body["model"] = up.get("messages_model", up["model"]) if is_messages else up["model"]
+                # available_models 是手动探测后固化在配置里的静态清单：请求模型精确匹配
+                # 时透传，否则使用渠道默认值。运行时不访问上游 /models。
+                # 始终用 req_model，避免前一回退渠道改写 body["model"] 污染后续选择。
+                body["model"] = _select_upstream_model(up, req_model, is_messages)
                 if is_responses and body.get("previous_response_id"):
                     pid_len = len(json.dumps(body, ensure_ascii=False))
                     if pid_len > 200000:

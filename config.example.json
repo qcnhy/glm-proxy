@@ -26,6 +26,7 @@
       "interceptor_port": 14446,
       "model": "glm-5.3",
       "messages_model": "glm-5.3",
+      "available_models": ["glm-5.3", "glm-5.3-flash"],
       "max_context_tokens": 1000000
     },
     {

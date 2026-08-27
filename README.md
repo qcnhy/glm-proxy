@@ -76,6 +76,7 @@ cp config.example.json config.json
       "interceptor_port": 14446,               // 拦截器端口
       "model": "glm-5.3",                      // Chat Completions 模型名
       "messages_model": "glm-5.3",             // Messages 端点模型名（不填则回退到 model）
+      "available_models": ["glm-5.3", "glm-5.3-flash"], // 一次性探测后固化的模型清单
       "max_context_tokens": 202745             // 上下文窗口
     }
   ]
@@ -93,6 +94,7 @@ cp config.example.json config.json
 | `anthropic_url` | 否 | 配置则可服务 `/v1/messages` 直连请求（Claude Code 等） |
 | `anthropic_auth` | 否 | `x-api-key`（智谱官方）或 `bearer`（中转站） |
 | `messages_model` | 否 | Messages 端点模型名，不填回退到 `model` |
+| `available_models` | 否 | 手动从上游 `/models` 探测后写入的静态模型 ID；客户端请求精确匹配时透传，否则使用 `model`/`messages_model`。代理运行时不会刷新 |
 | `max_context_tokens` | GLM 渠道必填 | 上下文窗口，上报 `/v1/models` 供 Codex 判断压缩时机；`responses_direct`（GPT 直通）渠道无需配置（Codex 原生认识 GPT 模型窗口） |
 
 ### GPT 原生 Responses 直通

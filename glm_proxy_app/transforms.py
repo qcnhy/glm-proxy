@@ -133,6 +133,19 @@ def _route_mode(up, is_responses, is_messages):
     return None
 
 
+def _select_upstream_model(up, requested_model, is_messages=False):
+    """按配置中固化的模型清单选择模型，不在运行时访问上游。
+
+    客户端模型精确匹配 available_models 时透传；缺失或不匹配时使用该路径的
+    配置默认值。available_models 未配置时保持旧行为，仅使用默认值。
+    """
+    default_model = up.get("messages_model", up["model"]) if is_messages else up["model"]
+    available = up.get("available_models")
+    if requested_model and isinstance(available, list) and requested_model in available:
+        return requested_model
+    return default_model
+
+
 def _stream_timeout_error(has_output, first_output_timeout):
     """将 Responses 读超时分类为可回退的首输出超时或不可续写的中途截断。"""
     limit = first_output_timeout or REQUEST_TIMEOUT

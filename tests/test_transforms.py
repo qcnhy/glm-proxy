@@ -5,6 +5,7 @@ from glm_proxy_app.transforms import (
     _inject_tool_rules,
     _merge_duplicate_tool_outputs,
     _route_mode,
+    _select_upstream_model,
     _stream_timeout_error,
     _strip_gpt_state,
 )
@@ -30,6 +31,26 @@ class RouteModeTests(unittest.TestCase):
         messages_only = {"anthropic_url": "https://example.test/v1/messages"}
         self.assertIsNone(_route_mode(messages_only, True, False))
         self.assertEqual("messages", _route_mode(messages_only, False, True))
+
+
+class ModelSelectionTests(unittest.TestCase):
+    def setUp(self):
+        self.upstream = {
+            "model": "glm-5.3",
+            "messages_model": "glm-5.3-flash",
+            "available_models": ["glm-5.3", "glm-5.3-flash", "glm-5.2"],
+        }
+
+    def test_matching_client_model_is_forwarded(self):
+        self.assertEqual("glm-5.2", _select_upstream_model(self.upstream, "glm-5.2"))
+
+    def test_unknown_model_uses_endpoint_default(self):
+        self.assertEqual("glm-5.3", _select_upstream_model(self.upstream, "gpt-5.6-sol"))
+        self.assertEqual("glm-5.3-flash", _select_upstream_model(self.upstream, "unknown", True))
+
+    def test_missing_catalog_keeps_legacy_default_behavior(self):
+        upstream = {"model": "gpt-5.6-sol"}
+        self.assertEqual("gpt-5.6-sol", _select_upstream_model(upstream, "gpt-5.4"))
 
 
 class StreamTimeoutTests(unittest.TestCase):
