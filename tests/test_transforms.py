@@ -8,6 +8,7 @@ from glm_proxy_app.transforms import (
     _select_upstream_model,
     _stream_timeout_error,
     _strip_gpt_state,
+    _strip_responses_images,
 )
 
 
@@ -129,6 +130,19 @@ class RequestNormalizationTests(unittest.TestCase):
         self.assertEqual(1, _merge_duplicate_tool_outputs(body))
         self.assertEqual("head\ntail", body["input"][0]["output"])
         self.assertEqual(2, len(body["input"]))
+
+
+    def test_all_call_output_images_are_stripped(self):
+        body = {"input": [
+            {"type": "custom_tool_call_output", "call_id": "c1",
+             "output": [{"type": "input_text", "text": "ok"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}]},
+            {"type": "function_call_output", "call_id": "c2",
+             "output": [{"type": "input_image", "image_url": "data:image/png;base64,BBBB"}]},
+        ]}
+        self.assertEqual(2, _strip_responses_images(body))
+        self.assertEqual("[图片已省略：当前渠道不支持图片输入]", body["input"][0]["output"])
+        self.assertEqual("[图片已省略：当前渠道不支持图片输入]", body["input"][1]["output"])
 
 
 if __name__ == "__main__":
