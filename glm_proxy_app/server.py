@@ -124,6 +124,18 @@ class Handler(BaseHTTPRequestHandler):
 
         # 3) 日志 + 计算 payload 大小
         raw_len = len(raw) if method == "POST" else 0
+        # Codex 原生远程压缩(native compaction)请求捕获：该协议要求上游返回
+        # compaction 输出项，当前 GLM 链无法产生。先落盘真实请求格式以便分析。
+        if is_responses and b"compact" in raw.lower():
+            try:
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                path = os.path.join(LOG_DIR, f"compact_req_{ts}_{self._req_id}.json")
+                with open(path, "wb") as f:
+                    f.write(raw)
+                log.info("[#%d]     [compact] compaction request captured: %s (%dKB)",
+                         self._req_id, path, len(raw) // 1024)
+            except Exception:
+                pass
         if is_responses:
             log.info("[#%d] >>> [%s] POST %s stream=%s tools=%d input=%d",
                      self._req_id, client_ip, self.path, is_stream, len(body.get("tools", [])),
