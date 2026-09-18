@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v4.7.0 — codex-relay + Python 路由层
+GLM API 代理 v4.7.1 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -165,7 +165,8 @@ STATIC_MODELS = json.dumps({
                                 "visibility": "list",
                                 "owned_by": up.get("owned_by", "zhipu"),
                                 "context_window": up.get("max_context_tokens", 128000),
-                                "max_context_window": up.get("max_context_tokens", 128000)}
+                                "max_context_window": up.get("max_context_tokens", 128000),
+                                "priority": up.get("priority", 0)}
                   for up in _CHAIN_UPS}.values()),
     # v2.9.87: Codex models_manager 期望 "models" 字段（非标准 OpenAI "data"），
     # 缺失会每 3 分钟报 "failed to decode models response: missing field models"
@@ -186,7 +187,8 @@ STATIC_MODELS = json.dumps({
                                  "visibility": "list",
                                  "owned_by": up.get("owned_by", "zhipu"),
                                  "context_window": up.get("max_context_tokens", 128000),
-                                 "max_context_window": up.get("max_context_tokens", 128000)}
+                                 "max_context_window": up.get("max_context_tokens", 128000),
+                                 "priority": up.get("priority", 0)}
                    for up in _CHAIN_UPS}.values()),
 }, ensure_ascii=False).encode()
 
