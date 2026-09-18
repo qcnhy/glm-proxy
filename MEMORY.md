@@ -22,3 +22,9 @@
 - Compile: `python3 -m compileall -q glm_proxy.py glm_proxy_app`
 - Tests: `python3 -m unittest discover -v`
 - Import smoke test should verify config and logs still resolve at the repository root.
+
+## Deployment hygiene
+
+- Deploy flow: edit locally, scp to targets (201: qcnhy@192.168.10.201 project dir; 100: Administrator@192.168.10.100 Desktop). Never leave helper scripts on remote hosts; prefer piping checks over ssh instead of scp+del.
+- If a remote temp file is created, the same command must delete it and re-verify emptiness (100 is Windows cmd: chained del can silently fail, re-check with dir).
+- Restart policy: 201 is dev and may be restarted directly; 100 is production and restarted only by the user, deploy files but never restart.

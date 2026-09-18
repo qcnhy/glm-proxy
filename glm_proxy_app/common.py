@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v4.7.1 — codex-relay + Python 路由层
+GLM API 代理 v4.7.2 — codex-relay + Python 路由层
 
 架构：
     Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
@@ -148,7 +148,8 @@ UPSTREAMS = _cfg.get("upstreams", [])
 
 # v3.0.1: responses_direct（GPT 直通）渠道不进列表——GPT 模型窗口 Codex 原生认识，
 # 代理替它报 context_window 反而会用默认值覆盖成错误窗口（chatgpt 渠道无该字段→128000）。
-_CHAIN_UPS = [up for up in UPSTREAMS if not up.get("responses_direct")]
+# v4.7.2: disabled 渠道的模型也不应广播（venus-deepseek 禁用后 models 仍列 deepseek-v4-pro）
+_CHAIN_UPS = [up for up in UPSTREAMS if not up.get("responses_direct") and not up.get("disabled")]
 STATIC_MODELS = json.dumps({
     "object": "list",
     "data": list({up["model"]: {"id": up["model"], "slug": up["model"], "object": "model",
