@@ -124,18 +124,6 @@ class Handler(BaseHTTPRequestHandler):
 
         # 3) 日志 + 计算 payload 大小
         raw_len = len(raw) if method == "POST" else 0
-        # Codex 原生远程压缩(native compaction)请求捕获：该协议要求上游返回
-        # compaction 输出项，当前 GLM 链无法产生。先落盘真实请求格式以便分析。
-        if is_responses and b"compact" in raw.lower():
-            try:
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                path = os.path.join(LOG_DIR, f"compact_req_{ts}_{self._req_id}.json")
-                with open(path, "wb") as f:
-                    f.write(raw)
-                log.info("[#%d]     [compact] compaction request captured: %s (%dKB)",
-                         self._req_id, path, len(raw) // 1024)
-            except Exception:
-                pass
         if is_responses:
             log.info("[#%d] >>> [%s] POST %s stream=%s tools=%d input=%d",
                      self._req_id, client_ip, self.path, is_stream, len(body.get("tools", [])),
@@ -176,6 +164,13 @@ class Handler(BaseHTTPRequestHandler):
                  self.path)
         for up in UPSTREAMS:
             if up.get("disabled"):
+                continue
+            # v4.8.0: 渠道可选 only_models —— 客户端模型精确匹配列表才使用该渠道，
+            # 否则视为不适用直接跳过（如 internal 仅承接显式指定 GLM-5.3-Flash 的请求）。
+            _only = up.get("only_models")
+            # v4.8.1: 大小写归一化匹配（客户端传 glm-5.3-flash 也能命中 GLM-5.3-Flash）
+            if isinstance(_only, list) and (not req_model or req_model.casefold() not in {m.casefold() for m in _only if isinstance(m, str)}):
+                dbg("[#%d]     [skip] %s: model %r not in only_models", self._req_id, up["name"], req_model)
                 continue
             # v2.9.103: 超大载荷跳过 cf_gate 渠道（如 cmoyan）——大上下文会话源站处理超
             # Cloudflare 100s 上限必 524，白等约两分钟才回退。≥1MB 直接跳过走下一渠道。

@@ -139,13 +139,16 @@ def _route_mode(up, is_responses, is_messages):
 def _select_upstream_model(up, requested_model, is_messages=False):
     """按配置中固化的模型清单选择模型，不在运行时访问上游。
 
-    客户端模型精确匹配 available_models 时透传；缺失或不匹配时使用该路径的
+    客户端模型匹配 available_models（v4.8.1 起大小写不敏感）时透传（用清单内的
+    规范写法，避免上游大小写敏感导致 MODEL_NOT_SUPPORTED）；不匹配时使用该路径的
     配置默认值。available_models 未配置时保持旧行为，仅使用默认值。
     """
     default_model = up.get("messages_model", up["model"]) if is_messages else up["model"]
     available = up.get("available_models")
-    if requested_model and isinstance(available, list) and requested_model in available:
-        return requested_model
+    if requested_model and isinstance(available, list):
+        for m in available:
+            if isinstance(m, str) and m.casefold() == requested_model.casefold():
+                return m
     return default_model
 
 
