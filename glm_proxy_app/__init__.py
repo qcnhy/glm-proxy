@@ -1,3 +1,3 @@
 """GLM Proxy 应用包。"""
 
-__version__ = "4.8.2"
+__version__ = "4.9.0"

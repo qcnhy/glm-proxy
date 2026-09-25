@@ -165,11 +165,13 @@ class Handler(BaseHTTPRequestHandler):
         for up in UPSTREAMS:
             if up.get("disabled"):
                 continue
-            # v4.8.0: 渠道可选 only_models —— 客户端模型精确匹配列表才使用该渠道，
-            # 否则视为不适用直接跳过（如 internal 仅承接显式指定 GLM-5.3-Flash 的请求）。
+            # v4.8.0: 渠道可选 only_models —— 客户端模型匹配列表才使用该渠道，
+            # 否则视为不适用直接跳过（如 internal 仅承接 Flash/haiku/luna 类请求）。
+            # v4.9.0: 改为大小写归一化的子串匹配——条目是请求模型的子串即命中
+            #（如 "haiku" 命中 claude-haiku-4-5，"luna" 命中 gpt-5.6-luna）。
             _only = up.get("only_models")
-            # v4.8.1: 大小写归一化匹配（客户端传 glm-5.3-flash 也能命中 GLM-5.3-Flash）
-            if isinstance(_only, list) and (not req_model or req_model.casefold() not in {m.casefold() for m in _only if isinstance(m, str)}):
+            if isinstance(_only, list) and (not req_model or not any(
+                    isinstance(m, str) and m.casefold() in req_model.casefold() for m in _only)):
                 dbg("[#%d]     [skip] %s: model %r not in only_models", self._req_id, up["name"], req_model)
                 continue
             # v2.9.103: 超大载荷跳过 cf_gate 渠道（如 cmoyan）——大上下文会话源站处理超
