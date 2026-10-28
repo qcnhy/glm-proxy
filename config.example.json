@@ -25,6 +25,7 @@
       "key": "YOUR_GATEWAY_KEY",
       "model": "GLM-5.3-Flash",
       "only_models": ["flash", "luna", "haiku"],
+      "probe": true,
       "max_context_tokens": 1000000
     },
     {

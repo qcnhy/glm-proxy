@@ -74,6 +74,7 @@ cp config.example.json config.json
 | `store_responses` | Responses | `false` 时启用无状态剥离 |
 | `strip_max_output` | Responses | 删除 max_output_tokens（上游不认该字段时） |
 | `cf_gate` | 全部 | Cloudflare 百秒闸渠道标记，≥1MB 载荷跳过 |
+| `probe` | Responses | `true` 启用周期探针（每 5 分钟向 responses_url 发 1-token 请求保活/记录可用性） |
 | `disabled` | - | `true` 完全禁用该渠道 |
 
 ## 使用
