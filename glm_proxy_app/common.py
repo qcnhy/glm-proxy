@@ -16,6 +16,7 @@ GLM API 代理 v5.2.1 — Python 路由层（codex-relay 已退役）
     - 日志和错误请求保存到 logs/ 目录
 """
 import json, traceback, threading, time, socket, os, signal, sys, logging, shutil, subprocess
+from logging.handlers import RotatingFileHandler
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from urllib.request import Request, urlopen
@@ -125,7 +126,17 @@ def _load_config():
         print("config.json 不存在，请复制 config.example.json 并填入密钥", file=sys.stderr)
         return {"upstreams": []}
     with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+        cfg = json.load(f)
+    # v5.4.3: 启动期 fail-fast——启用渠道缺 name/model 会在请求期 up["model"] 抛 KeyError
+    # 变成难排查的 500。启动时直接报清是哪个渠道缺哪个字段。
+    for up in cfg.get("upstreams", []):
+        if up.get("disabled"):
+            continue
+        missing = [k for k in ("name", "model") if not up.get(k)]
+        if missing:
+            raise SystemExit(f"config.json 渠道配置错误: 缺少必填字段 {','.join(missing)} "
+                             f"(upstream={up.get('name', '<未命名>')})")
+    return cfg
 
 _cfg = _load_config()
 
@@ -204,8 +215,11 @@ def _setup_logger():
     ch.setFormatter(fmt)
     log.addHandler(ch)
     # 进程内直接写文件（不依赖启动命令的 stderr 重定向，Windows 也有日志）
+    # v5.4.3: 滚动轮转（10MB × 3 备份）——100 是 Windows 裸跑无 logrotate，
+    # 旧 FileHandler 曾把 proxy.log 长到 41MB。
     try:
-        fh = logging.FileHandler(os.path.join(LOG_DIR, "proxy.log"), encoding="utf-8")
+        fh = RotatingFileHandler(os.path.join(LOG_DIR, "proxy.log"), encoding="utf-8",
+                                 maxBytes=10 * 1024 * 1024, backupCount=3)
         fh.setFormatter(fmt)
         log.addHandler(fh)
     except Exception as e:

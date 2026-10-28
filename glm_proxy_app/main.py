@@ -10,7 +10,7 @@ from urllib.request import Request, urlopen
 from .common import LISTEN, UPSTREAMS, ThreadedHTTPServer, log
 from .server import Handler
 
-VERSION = "5.4.2"
+VERSION = "5.4.3"
 
 _PROBE_INTERVAL = 300  # 内网网关探针周期（秒），兼作保活
 

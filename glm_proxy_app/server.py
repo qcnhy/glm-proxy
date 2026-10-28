@@ -365,10 +365,11 @@ class Handler(BaseHTTPRequestHandler):
                             # 未发头即失败（429限流/502不可达/DNS等），回退下一上游；
                             # 记住错误供链尾 _send_last_error 呈现（否则全链失败时客户端只看到 None）
                             fcode, ferr = fallback
-                            try:
-                                last_err = (int(fcode), json.dumps({"error": ferr}).encode())
-                            except (TypeError, ValueError):
-                                last_err = (502, b'{"error":"upstream failed before output"}')
+                            # v5.4.3: 保留真实错误（含 empty_output/incomplete_stream 等字符串码）。
+                            # 旧代码 int(fcode) 对字符串码抛 ValueError，一律落到泛化的
+                            # "upstream failed before output"，客户端看不出真实失败原因。
+                            last_err = (fcode if isinstance(fcode, int) else 502,
+                                        json.dumps({"error": ferr}).encode())
                             if route_mode == "responses_url":
                                 # GPT 直通失败回退 GLM 链：先剥服务端状态引用再重放。
                                 _strip_gpt_state(body)
