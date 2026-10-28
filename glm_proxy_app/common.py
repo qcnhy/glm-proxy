@@ -146,10 +146,10 @@ LOG_DIR = os.path.join(PROJECT_ROOT, "logs")
 
 UPSTREAMS = _cfg.get("upstreams", [])
 
-# v3.0.1: responses_url（GPT 直通）渠道不进列表——GPT 模型窗口 Codex 原生认识，
-# 代理替它报 context_window 反而会用默认值覆盖成错误窗口（chatgpt 渠道无该字段→128000）。
-# v4.7.2: disabled 渠道的模型也不应广播（venus-deepseek 禁用后 models 仍列 deepseek-v4-pro）
-_CHAIN_UPS = [up for up in UPSTREAMS if not up.get("responses_url") and not up.get("disabled")]
+# v4.7.2: disabled 渠道的模型不广播（venus-deepseek 禁用后 models 仍列 deepseek-v4-pro）。
+# v5.0.0 后全渠道 responses_url 化，旧条件（排除 responses_url 渠道）会滤掉一切启用渠道，
+# 导致 /v1/models 返回空列表、Codex 无模型可选。改为只按 disabled 过滤，按 model 去重。
+_CHAIN_UPS = [up for up in UPSTREAMS if not up.get("disabled")]
 STATIC_MODELS = json.dumps({
     "object": "list",
     "data": list({up["model"]: {"id": up["model"], "slug": up["model"], "object": "model",
