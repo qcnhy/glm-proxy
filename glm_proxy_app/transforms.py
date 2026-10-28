@@ -268,19 +268,15 @@ def _extract_additional_tools(body):
                         dbg("    [additional_tools] namespace %s subs: %s", t.get("name"), ", ".join(subs))
     return body
 
+def _flatten_encrypted_content(body):
+    """v4.9.2 瘦身版 agent 展平：仅处理 encrypted_content 块。
 
-def _flatten_agent_messages(body):
-    """规整 Codex 多智能体（sub-agent）消息为标准类型，避免 relay 路径产出未知内容类型。
-
-    Codex 桌面版多智能体功能在 input 数组里发：
-    - type=agent_message：父 agent 给子 agent 的协作消息（NEW_TASK 等，含 author/recipient）
-    - content block type=encrypted_content：携带任务 payload 文本（encrypted_content 字段）
-    codex-relay 不认识 agent_message，会把它的 content 块（含 encrypted_content）原样透传，
-    GLM/智谱 Anthropic 端点只认 text/image/tool_use/tool_result → 1214「content[N].type 类型错误」。
-
-    这里：agent_message → message(role=user，子 agent 收到的任务即用户指令)；
-          encrypted_content 块 → input_text（取其 encrypted_content 字段文本）。
-    relay 路径规整后产出标准类型。幂等。"""
+    codex-relay 0.6.0 已原生转译明文 agent_message（agent_message content must
+    contain only plaintext text parts），且对 encrypted_content 明确拒绝：
+    "encrypted agent_message content cannot be forwarded to a Chat Completions
+    upstream"（HTTP 422）。故只需把所有位置的 encrypted_content 块降级为
+    input_text（取其 encrypted_content 字段文本），agent_message 类型本身交给
+    relay 转译。幂等。"""
     if not isinstance(body, dict):
         return body
     inp = body.get("input")
@@ -288,7 +284,6 @@ def _flatten_agent_messages(body):
         return body
 
     def _flat_blocks(content):
-        """encrypted_content → input_text；其余块原样保留。返回新列表；无改动返回 None。"""
         if not isinstance(content, list):
             return None
         out, changed = [], False
@@ -300,33 +295,17 @@ def _flatten_agent_messages(body):
                 out.append(b)
         return out if changed else None
 
-    new_inp, changed = [], False
-    n_agent = n_enc = 0
-    for item in inp:
-        if not isinstance(item, dict):
-            new_inp.append(item)
+    n_enc = 0
+    for idx, item in enumerate(inp):
+        if not isinstance(item, dict) or not isinstance(item.get("content"), list):
             continue
-        if item.get("type") == "agent_message":
-            changed = True
-            n_agent += 1
-            raw_c = item.get("content", [])
-            blocks = _flat_blocks(raw_c) or raw_c
-            n_enc += sum(1 for b in (raw_c or []) if isinstance(b, dict) and b.get("type") == "encrypted_content")
-            new_inp.append({"type": "message", "role": "user", "content": blocks})
-        else:
-            # 普通 message 的 content 也可能混入 encrypted_content 块
-            if item.get("type") == "message":
-                orig_c = item.get("content")
-                blocks = _flat_blocks(orig_c)
-                if blocks is not None:
-                    changed = True
-                    n_enc += sum(1 for b in (orig_c or []) if isinstance(b, dict) and b.get("type") == "encrypted_content")
-                    item = {**item, "content": blocks}
-            new_inp.append(item)
-    if changed:
-        body["input"] = new_inp
-        dbg("    [agent_msg] flattened %d agent_message→message, %d encrypted_content→input_text",
-                 n_agent, n_enc)
+        blocks = _flat_blocks(item["content"])
+        if blocks is not None:
+            n_enc += sum(1 for b in item["content"]
+                         if isinstance(b, dict) and b.get("type") == "encrypted_content")
+            inp[idx] = {**item, "content": blocks}
+    if n_enc:
+        dbg("    [agent_msg] flattened %d encrypted_content→input_text", n_enc)
     return body
 
 

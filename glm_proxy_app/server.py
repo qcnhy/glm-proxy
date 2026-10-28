@@ -19,7 +19,7 @@ from .common import (
 )
 from .transforms import (
     _est_tokens, _extract_additional_tools, _fix_tool_result_roles,
-    _flatten_agent_messages, _inject_tool_rules, _is_overflow_signal,
+    _flatten_encrypted_content, _inject_tool_rules, _is_overflow_signal,
     _merge_duplicate_tool_outputs, _normalize_sse_block,
     _patch_msg_usage, _route_mode, _select_upstream_model, _stream_timeout_error, _strip_gpt_state,
     _strip_responses_images,
@@ -281,7 +281,7 @@ class Handler(BaseHTTPRequestHandler):
                         log.warning("    payload %dKB, stripping previous_response_id", pid_len // 1024)
                         del body["previous_response_id"]
                 _extract_additional_tools(body)  # Codex additional_tools(input 内) → 顶层 tools
-                _flatten_agent_messages(body)  # Codex 多智能体 agent_message/encrypted_content → message/input_text
+                _flatten_encrypted_content(body)  # 仅降级 encrypted_content；明文 agent_message 由 relay 0.6.0 原生转译
                 # namespace 展平已移除（v2.9.93）：codex-relay 0.5.8 (#62) 原生处理 namespace，
                 # custom 子工具裸名/function 子工具 namespaced 编码由 relay 自己正确 round-trip。
                 _inject_tool_rules(body)  # 注入 exec 沙箱规则（relay 路径覆盖）
@@ -942,7 +942,9 @@ class Handler(BaseHTTPRequestHandler):
                             log.warning("[#%d]     !!! %s response.failed (mid-stream): %s", self._req_id, upstream_name, err)
                             _write(out)
                             continue
-                        if t == "response.completed":
+                        # v4.9.3: GLM 原生 Responses 在 max_output_tokens 截断时发
+                        # response.incomplete（而非 completed）——同样是合法终态，按 completed 同等处理。
+                        if t in ("response.completed", "response.incomplete"):
                             held_completed = p
                             continue
                         # probe-hold：非内容块(response.created 等)握住不发，见首条内容才 flush；
@@ -1129,7 +1131,7 @@ class Handler(BaseHTTPRequestHandler):
         pt = p.get("type", "")
         # 提取 usage 用于日志
         usage = None
-        if pt == "response.completed":
+        if pt in ("response.completed", "response.incomplete"):
             usage = p.get("response", {}).get("usage")
         elif pt == "message_delta":
             delta_usage = p.get("usage")

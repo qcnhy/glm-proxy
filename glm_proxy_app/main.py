@@ -11,7 +11,7 @@ from .common import LISTEN, UPSTREAMS, ThreadedHTTPServer, log
 from .relay import start_interceptors, start_relays, stop_relays
 from .server import Handler
 
-VERSION = "4.9.1"
+VERSION = "4.9.3"
 
 _PROBE_INTERVAL = 300  # venusgroup 内网探针周期（秒），兼作保活
 
