@@ -66,7 +66,7 @@ cp config.example.json config.json
   "upstreams": [
     {
       "name": "official",                      // 上游名称
-      "openai_url": "...",                     // Chat Completions 端点（Responses 走 codex-relay 到这里）
+      "completion_url": "...",                     // Chat Completions 端点（Responses 走 codex-relay 到这里）
       "anthropic_url": "...",                  // Anthropic Messages 端点（/v1/messages 直连）
       "anthropic_auth": "x-api-key",           // 认证方式：x-api-key / bearer
       "key": "...",                            // API 密钥

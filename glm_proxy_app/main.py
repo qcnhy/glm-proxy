@@ -10,7 +10,7 @@ from urllib.request import Request, urlopen
 from .common import LISTEN, UPSTREAMS, ThreadedHTTPServer, log
 from .server import Handler
 
-VERSION = "5.2.5"
+VERSION = "5.3.0"
 
 _PROBE_INTERVAL = 300  # venusgroup 内网探针周期（秒），兼作保活
 
@@ -18,12 +18,12 @@ _PROBE_INTERVAL = 300  # venusgroup 内网探针周期（秒），兼作保活
 def _probe_venus_loop():
     """v4.9.1: venusgroup 内网渠道周期探针。
 
-    每 5 分钟对 openai_url 指向 venusgroup 的启用渠道发一条 1-token 请求：
+    每 5 分钟对 completion_url 指向 venusgroup 的启用渠道发一条 1-token 请求：
     - 记录可用性日志（仅观测，不影响路由——失败渠道由现有回退链处理）
     - 顺带保活内网网关会话/连接
     """
     targets = [up for up in UPSTREAMS
-               if "venusgroup" in up.get("openai_url", "") and not up.get("disabled")]
+               if "venusgroup" in up.get("completion_url", "") and not up.get("disabled")]
     if not targets:
         return
     ctx = ssl.create_default_context()
@@ -34,7 +34,7 @@ def _probe_venus_loop():
             body = json.dumps({"model": model,
                                "messages": [{"role": "user", "content": "ping"}],
                                "max_tokens": 1}).encode()
-            req = Request(up["openai_url"].rstrip("/") + "/chat/completions", data=body,
+            req = Request(up["completion_url"].rstrip("/") + "/chat/completions", data=body,
                           headers={"Content-Type": "application/json",
                                    "Authorization": "Bearer " + up.get("key", "")},
                           method="POST")

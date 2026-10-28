@@ -23,11 +23,11 @@ class RouteModeTests(unittest.TestCase):
         self.assertIsNone(_route_mode(upstream, True, False))
 
     def test_openai_mode_excludes_responses_url(self):
-        upstream = {"openai_url": "https://example.test/v1"}
+        upstream = {"completion_url": "https://example.test/v1"}
         self.assertEqual("openai", _route_mode(upstream, False, False))
-        with_responses = {"openai_url": "https://example.test/v1",
+        with_responses = {"completion_url": "https://example.test/v1",
                           "responses_url": "https://example.test/responses"}
-        # v5.2.5: completions 直通独立于 responses_url —— 有 openai_url 即承接
+        # v5.2.5: completions 直通独立于 responses_url —— 有 completion_url 即承接
         self.assertEqual("responses_url", _route_mode(with_responses, True, False))
         self.assertEqual("openai", _route_mode(with_responses, False, False))
 

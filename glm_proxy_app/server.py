@@ -199,7 +199,7 @@ class Handler(BaseHTTPRequestHandler):
                     "Authorization": f"Bearer {up.get('key', '')}",
                     "Connection": "close",
                 }
-                if up.get("host_header"):  # SNI 被阻断的站点：openai_url 写 IP，Host 头还原域名
+                if up.get("host_header"):  # SNI 被阻断的站点：completion_url 写 IP，Host 头还原域名
                     up_headers["Host"] = up["host_header"]
                 if up.get("tokens_file"):
                     # ChatGPT 订阅 OAuth：fresh access_token + 账号头 + beta 头（实测必需组合）
@@ -229,7 +229,7 @@ class Handler(BaseHTTPRequestHandler):
                 api_path = self.path
                 if api_path.startswith("/v1/"):
                     api_path = api_path[3:]
-                url = up["openai_url"].rstrip("/") + api_path
+                url = up["completion_url"].rstrip("/") + api_path
                 up_headers = {
                     "Authorization": f"Bearer {up['key']}",
                     "Connection": "close",

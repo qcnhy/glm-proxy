@@ -13,7 +13,7 @@
 | https://open.bigmodel.cn/api/coding/paas/v4 | NO (404 on /responses) | YES (current completions passthrough) | Coding Plan subscription quota |
 | https://open.bigmodel.cn/api/anthropic/v1/messages | n/a | n/a (Messages protocol) | subscription |
 
-official channel uses THREE URLs: responses_url=/api/v1/responses, openai_url=/api/coding/paas/v4 (subscription quota for completions clients), anthropic_url=/api/anthropic/v1/messages. Do NOT "simplify" by merging these - v5.2.5 incident: channel merge dropped openai_url handling and broke /v1/chat/completions passthrough.
+official channel uses THREE URLs: responses_url=/api/v1/responses, completion_url=/api/coding/paas/v4 (subscription quota for completions clients), anthropic_url=/api/anthropic/v1/messages. Do NOT "simplify" by merging these - v5.2.5 incident: channel merge dropped completion_url handling and broke /v1/chat/completions passthrough.
 
 ## Toolchain transforms (probe-verified, keep them)
 

@@ -100,10 +100,10 @@ def _route_mode(up, is_responses, is_messages):
         return None
     if is_messages:
         return "messages" if up.get("anthropic_url") else None
-    # v5.2.5: /v1/chat/completions 等通用 OpenAI 路径仍需直通（openai_url 为专用
+    # v5.2.5: /v1/chat/completions 等通用 OpenAI 路径仍需直通（completion_url 为专用
     # completions 端点，如智谱 coding plan 的 /api/coding/paas/v4）；responses_url
-    # 只声明 Responses 端点能力，不覆盖 completions。有 openai_url 即可承接。
-    if up.get("openai_url"):
+    # 只声明 Responses 端点能力，不覆盖 completions。有 completion_url 即可承接。
+    if up.get("completion_url"):
         return "openai"
     return None
 

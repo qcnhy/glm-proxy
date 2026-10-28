@@ -1,11 +1,11 @@
 {
   "_comment": "复制本文件为 config.json 并填入真实密钥。config.json 不会被提交到 git。",
-  "_comment_upstreams": "渠道按优先级排列。能力由 URL 字段决定：有 openai_url+relay_port=可服务 Responses(codex-relay→Completions)与通用 OpenAI 路径，有 anthropic_url=可服务 /v1/messages 直连。路由 flag: disabled(禁用)。内网渠道放在最后作为兜底。",
+  "_comment_upstreams": "渠道按优先级排列。能力由 URL 字段决定：有 completion_url+relay_port=可服务 Responses(codex-relay→Completions)与通用 OpenAI 路径，有 anthropic_url=可服务 /v1/messages 直连。路由 flag: disabled(禁用)。内网渠道放在最后作为兜底。",
   "upstreams": [
     {
       "_comment": "GPT 原生 Responses 固定渠道：使用独立数字 key，不加入 GLM 回退链。store_responses=false 时代理会删除所有纯 item_reference、rs_*/reasoning 和 previous_response_id；进入 GLM 回退链时执行相同清理。",
       "name": "chatgpt",
-      "openai_url": "https://chatgpt.com/backend-api/codex",
+      "completion_url": "https://chatgpt.com/backend-api/codex",
       "tokens_file": "chatgpt_tokens.json",
       "key": "",
       "model": "gpt-5.6-sol",
@@ -16,9 +16,9 @@
       "store_responses": false
     },
     {
-      "_comment": "智谱官方：原生两端点，一个 key 通吃。openai_url 用 coding 路径。",
+      "_comment": "智谱官方：原生两端点，一个 key 通吃。completion_url 用 coding 路径。",
       "name": "official",
-      "openai_url": "https://open.bigmodel.cn/api/coding/paas/v4",
+      "completion_url": "https://open.bigmodel.cn/api/coding/paas/v4",
       "anthropic_url": "https://open.bigmodel.cn/api/anthropic/v1/messages",
       "anthropic_auth": "x-api-key",
       "key": "YOUR_ZHIPU_API_KEY",
@@ -32,7 +32,7 @@
     {
       "_comment": "Venus DeepSeek V4 Pro",
       "name": "venus-deepseek",
-      "openai_url": "https://aigateway.venusgroup.com.cn/ai/deepseek/openai/v1",
+      "completion_url": "https://aigateway.venusgroup.com.cn/ai/deepseek/openai/v1",
       "anthropic_url": "https://aigateway.venusgroup.com.cn/ai/deepseek/anthropic/v1/messages",
       "anthropic_auth": "bearer",
       "key": "YOUR_INTERNAL_KEY",
@@ -45,7 +45,7 @@
     {
       "_comment": "内网千问兜底",
       "name": "internal",
-      "openai_url": "https://aigateway.venusgroup.com.cn/ai/aliyun/openai/v1",
+      "completion_url": "https://aigateway.venusgroup.com.cn/ai/aliyun/openai/v1",
       "anthropic_url": "https://aigateway.venusgroup.com.cn/ai/aliyun/anthropic/v1/messages",
       "anthropic_auth": "bearer",
       "key": "YOUR_INTERNAL_KEY",
