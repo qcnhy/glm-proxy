@@ -228,8 +228,11 @@ def _setup_logger():
 
 log = _setup_logger()
 
-# ── 调试开关：排查问题时设 GLM_PROXY_DEBUG=1 启用排查日志/请求落盘 ──
-DEBUG = os.environ.get("GLM_PROXY_DEBUG", "").strip().lower() not in ("", "0", "false")
+# ── 调试开关：GLM_PROXY_DEBUG=1 或 logs/DEBUG 标记文件存在时启用排查日志/请求落盘 ──
+# 标记文件方式与启动方式无关（bat/sshd/双击），适合远程排查偶发问题
+_LOG_DIR_TMP = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+DEBUG = (os.environ.get("GLM_PROXY_DEBUG", "").strip().lower() not in ("", "0", "false")
+         or os.path.exists(os.path.join(_LOG_DIR_TMP, "DEBUG")))
 
 
 def dbg(fmt, *args):
