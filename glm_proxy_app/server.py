@@ -324,9 +324,9 @@ class Handler(BaseHTTPRequestHandler):
             _connect_ka_stop = None
             if (is_stream and is_responses and route_mode == "responses_url"
                     and not route_sse_committed):
-            _connect_ka_stop = threading.Event()
-            _conn_wlock = threading.Lock()  # v5.4.7: 预提交心跳与后续 relay 写出共享锁，防交错半行
-            self.send_response(200)
+                _connect_ka_stop = threading.Event()
+                _conn_wlock = threading.Lock()  # v5.4.7: 预提交心跳与后续 relay 写出共享锁，防交错半行
+                self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Connection", "close")
