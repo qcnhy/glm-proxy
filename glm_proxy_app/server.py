@@ -890,6 +890,12 @@ class Handler(BaseHTTPRequestHandler):
                         if usage:
                             last_usage = usage
                         events += 1
+                        # v5.3.2: 首输出 deadline 改为"活动窗口"——任何上游 SSE 块都证明渠道
+                        # 存活（GLM 长思考会先刷数千条 reasoning_text.delta，正文可能在 45s 后），
+                        # 按块滚动续期，只有真正静默 45s 才判 timeout。
+                        # reasoning 仍不算可交付内容：不置 has_output、不提前提交 200，回退语义不变。
+                        if first_output_timeout and not has_output:
+                            first_output_deadline = time.monotonic() + first_output_timeout
                         etype, dstr = "", ""
                         for l in out.decode("utf-8", errors="replace").split("\n"):
                             if l.startswith("event: "):
