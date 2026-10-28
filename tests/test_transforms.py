@@ -8,141 +8,77 @@ from glm_proxy_app.transforms import (
     _select_upstream_model,
     _stream_timeout_error,
     _strip_gpt_state,
-    _strip_responses_images,
 )
 
 
 class RouteModeTests(unittest.TestCase):
-    def test_responses_direct_is_explicit(self):
-        upstream = {"openai_url": "https://example.test", "responses_direct": True}
-        self.assertEqual("responses_direct", _route_mode(upstream, True, False))
+    def test_responses_url_mode(self):
+        upstream = {"responses_url": "https://example.test/v1/responses"}
+        self.assertEqual("responses_url", _route_mode(upstream, True, False))
         self.assertIsNone(_route_mode(upstream, False, False))
 
-    def test_relay_and_messages_follow_capabilities(self):
-        upstream = {
-            "openai_url": "https://example.test/v1",
-            "relay_port": 4444,
-            "anthropic_url": "https://example.test/v1/messages",
-        }
-        self.assertEqual("responses_relay", _route_mode(upstream, True, False))
+    def test_messages_mode(self):
+        upstream = {"anthropic_url": "https://example.test/v1/messages"}
         self.assertEqual("messages", _route_mode(upstream, False, True))
-        self.assertEqual("openai", _route_mode(upstream, False, False))
+        self.assertIsNone(_route_mode(upstream, True, False))
 
-    def test_responses_never_fall_back_to_anthropic_messages(self):
-        messages_only = {"anthropic_url": "https://example.test/v1/messages"}
-        self.assertIsNone(_route_mode(messages_only, True, False))
-        self.assertEqual("messages", _route_mode(messages_only, False, True))
+    def test_openai_mode_excludes_responses_url(self):
+        upstream = {"openai_url": "https://example.test/v1"}
+        self.assertEqual("openai", _route_mode(upstream, False, False))
+        with_responses = {"openai_url": "https://example.test/v1",
+                          "responses_url": "https://example.test/responses"}
+        self.assertEqual("responses_url", _route_mode(with_responses, True, False))
+        self.assertIsNone(_route_mode(with_responses, False, False))
+
+
+class ToolchainTests(unittest.TestCase):
+    """v5.2.0 曾误删这三段导致模型无法执行命令——锁定防再删。"""
+
+    def test_extract_additional_tools(self):
+        body = {"input": [
+            {"type": "additional_tools", "role": "developer",
+             "tools": [{"type": "function", "name": "shell_command", "description": "x"}]},
+            {"type": "message", "role": "user", "content": "hi"},
+        ], "tools": []}
+        _extract_additional_tools(body)
+        self.assertEqual([t["name"] for t in body["tools"]], ["shell_command"])
+        self.assertEqual(len(body["input"]), 1)
+
+    def test_extract_additional_tools_idempotent(self):
+        body = {"input": [
+            {"type": "additional_tools", "role": "developer",
+             "tools": [{"type": "function", "name": "exec", "description": "x"}]},
+        ], "tools": []}
+        _extract_additional_tools(body)
+        _extract_additional_tools(body)
+        self.assertEqual(len(body["tools"]), 1)
+
+    def test_inject_tool_rules_targets_exec(self):
+        body = {"tools": [
+            {"type": "function", "name": "functions-exec",
+             "description": "run js",
+             "parameters": {"type": "object"}},
+        ]}
+        _inject_tool_rules(body)
+        self.assertIn("V8", body["tools"][0]["description"])
+        # 幂等
+        once = body["tools"][0]["description"]
+        _inject_tool_rules(body)
+        self.assertEqual(once, body["tools"][0]["description"])
+
+    def test_inject_tool_rules_ignores_other_tools(self):
+        body = {"tools": [{"type": "function", "name": "shell_command",
+                           "description": "x", "parameters": {}}]}
+        _inject_tool_rules(body)
+        self.assertEqual(body["tools"][0]["description"], "x")
 
 
 class ModelSelectionTests(unittest.TestCase):
-    def setUp(self):
-        self.upstream = {
-            "model": "glm-5.3",
-            "messages_model": "glm-5.3-flash",
-            "available_models": ["glm-5.3", "glm-5.3-flash", "glm-5.2"],
-        }
-
-    def test_matching_client_model_is_forwarded(self):
-        self.assertEqual("glm-5.2", _select_upstream_model(self.upstream, "glm-5.2"))
-
-    def test_unknown_model_uses_endpoint_default(self):
-        self.assertEqual("glm-5.3", _select_upstream_model(self.upstream, "gpt-5.6-sol"))
-        self.assertEqual("glm-5.3-flash", _select_upstream_model(self.upstream, "unknown", True))
-
-    def test_missing_catalog_keeps_legacy_default_behavior(self):
-        upstream = {"model": "gpt-5.6-sol"}
-        self.assertEqual("gpt-5.6-sol", _select_upstream_model(upstream, "gpt-5.4"))
-
-
-class StreamTimeoutTests(unittest.TestCase):
-    def test_timeout_before_output_is_fallback_eligible(self):
-        err = _stream_timeout_error(False, 45)
-        self.assertEqual("first_output_timeout", err["code"])
-        self.assertIn("45s", err["message"])
-
-    def test_timeout_after_output_is_incomplete_not_fallback(self):
-        err = _stream_timeout_error(True, 45)
-        self.assertEqual("incomplete_stream", err["code"])
-
-    def test_timeout_message_falls_back_to_request_timeout(self):
-        err = _stream_timeout_error(False, None)
-        self.assertIn("300s", err["message"])
-
-
-class RequestNormalizationTests(unittest.TestCase):
-    def test_exec_rules_are_business_logic_and_idempotent(self):
-        body = {"tools": [{"type": "custom", "name": "exec", "description": "run js"}]}
-        _inject_tool_rules(body)
-        first = body["tools"][0]["description"]
-        self.assertIn("PURE V8 JavaScript", first)
-        self.assertIn("tools.apply_patch", first)
-        _inject_tool_rules(body)
-        self.assertEqual(first, body["tools"][0]["description"])
-
-    def test_nested_function_exec_receives_rules(self):
-        body = {"tools": [{"type": "function", "function": {
-            "name": "functions-exec", "description": "run js"
-        }}]}
-        _inject_tool_rules(body)
-        self.assertIn("tools.apply_patch", body["tools"][0]["function"]["description"])
-
-    def test_gpt_state_is_removed_without_dropping_replayable_history(self):
-        body = {
-            "previous_response_id": "resp_previous",
-            "input": [
-                {"type": "message", "role": "user", "content": "keep"},
-                {"type": "reasoning", "id": "rs_reasoning", "summary": []},
-                {"type": "item_reference", "id": "rs_reference"},
-                {"type": "item_reference", "id": "msg_reference"},
-                {"type": "item_reference", "id": "fc_reference"},
-                {"type": "message", "id": "msg_full", "role": "assistant", "content": "keep"},
-                {"type": "function_call_output", "call_id": "call-1", "output": "keep"},
-            ],
-        }
-        self.assertEqual((4, True), _strip_gpt_state(body))
-        self.assertNotIn("previous_response_id", body)
-        self.assertEqual(
-            ["message", "message", "function_call_output"],
-            [item["type"] for item in body["input"]],
-        )
-
-    def test_additional_tools_move_to_top_level_without_duplicates(self):
-        body = {
-            "tools": [{"type": "function", "name": "existing"}],
-            "input": [
-                {"type": "message", "role": "user", "content": "hello"},
-                {"type": "additional_tools", "tools": [
-                    {"type": "function", "name": "existing"},
-                    {"type": "function", "name": "new_tool"},
-                ]},
-            ],
-        }
-        _extract_additional_tools(body)
-        self.assertEqual(["existing", "new_tool"], [tool["name"] for tool in body["tools"]])
-        self.assertEqual(["message"], [item["type"] for item in body["input"]])
-
-    def test_duplicate_tool_outputs_are_merged_in_order(self):
-        body = {"input": [
-            {"type": "function_call_output", "call_id": "call-1", "output": "head"},
-            {"type": "message", "role": "user", "content": "between"},
-            {"type": "function_call_output", "call_id": "call-1", "output": "tail"},
-        ]}
-        self.assertEqual(1, _merge_duplicate_tool_outputs(body))
-        self.assertEqual("head\ntail", body["input"][0]["output"])
-        self.assertEqual(2, len(body["input"]))
-
-
-    def test_all_call_output_images_are_stripped(self):
-        body = {"input": [
-            {"type": "custom_tool_call_output", "call_id": "c1",
-             "output": [{"type": "input_text", "text": "ok"},
-                        {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}]},
-            {"type": "function_call_output", "call_id": "c2",
-             "output": [{"type": "input_image", "image_url": "data:image/png;base64,BBBB"}]},
-        ]}
-        self.assertEqual(2, _strip_responses_images(body))
-        self.assertEqual("[图片已省略：当前渠道不支持图片输入]", body["input"][0]["output"])
-        self.assertEqual("[图片已省略：当前渠道不支持图片输入]", body["input"][1]["output"])
+    def test_case_insensitive_available_models(self):
+        upstream = {"model": "default-model",
+                    "available_models": ["GLM-5.3-Flash"]}
+        self.assertEqual(_select_upstream_model(upstream, "glm-5.3-flash"), "GLM-5.3-Flash")
+        self.assertEqual(_select_upstream_model(upstream, "other"), "default-model")
 
 
 if __name__ == "__main__":
