@@ -324,8 +324,9 @@ class Handler(BaseHTTPRequestHandler):
             _connect_ka_stop = None
             if (is_stream and is_responses and route_mode == "responses_url"
                     and not route_sse_committed):
-                _connect_ka_stop = threading.Event()
-                self.send_response(200)
+            _connect_ka_stop = threading.Event()
+            _conn_wlock = threading.Lock()  # v5.4.7: 预提交心跳与后续 relay 写出共享锁，防交错半行
+            self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Connection", "close")
@@ -338,8 +339,11 @@ class Handler(BaseHTTPRequestHandler):
                 def _connect_keepalive():
                     while not _connect_ka_stop.wait(3):
                         try:
-                            self.wfile.write(b": keepalive\n\n")
-                            self.wfile.flush()
+                            with _conn_wlock:
+                                if _connect_ka_stop.is_set():
+                                    break
+                                self.wfile.write(b": keepalive\n\n")
+                                self.wfile.flush()
                         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
                             break
                 threading.Thread(target=_connect_keepalive, daemon=True).start()
@@ -359,6 +363,9 @@ class Handler(BaseHTTPRequestHandler):
                 resp = urlopen(req, timeout=connect_timeout, context=_ctx)
                 if _connect_ka_stop is not None:
                     _connect_ka_stop.set()
+                    # v5.4.7: 等在途 keepalive 写完（持锁）再放行 relay，杜绝半行交错
+                    with _conn_wlock:
+                        pass
 
                 if is_stream:
                     if is_responses:
