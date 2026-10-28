@@ -151,14 +151,22 @@ class Handler(BaseHTTPRequestHandler):
 
         # GET/无 body 时也要初始化，避免 ROUTE 日志 NameError
         req_model = ""
+        req_effort = ""
         if isinstance(body, dict):
             req_model = body.get("model") or ""
+            # v5.4.4: 推理等级也入 ROUTE 日志——Codex 每会话固定，排查长思考/超时问题时
+            # 需要直接看到本次请求的 effort（Responses: reasoning.effort；Completions 旧写法
+            # reasoning_effort；Messages 无此字段，留空）。
+            _reasoning = body.get("reasoning")
+            if isinstance(_reasoning, dict):
+                req_effort = _reasoning.get("effort") or ""
+            req_effort = req_effort or body.get("reasoning_effort") or ""
 
         # Responses 不按内容类型分叉；图片与文本走同一条协议路径。
         blocked_active = {k: datetime.fromtimestamp(v).strftime("%H:%M") for k, v in _channel_blocked_until.items() if v > time.time()}
-        log.info("[#%d] ROUTE: key=%s model=%s blocked=%s path=%s",
+        log.info("[#%d] ROUTE: key=%s model=%s effort=%s blocked=%s path=%s",
                  self._req_id, client_key[:20] or "(empty)", req_model or "?",
-                 blocked_active or "{}",
+                 req_effort or "-", blocked_active or "{}",
                  self.path)
         for up in UPSTREAMS:
             if up.get("disabled"):
