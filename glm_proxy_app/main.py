@@ -8,10 +8,9 @@ import time
 from urllib.request import Request, urlopen
 
 from .common import LISTEN, UPSTREAMS, ThreadedHTTPServer, log
-from .relay import start_interceptors, start_relays, stop_relays
 from .server import Handler
 
-VERSION = "4.9.3"
+VERSION = "5.0.0"
 
 _PROBE_INTERVAL = 300  # venusgroup 内网探针周期（秒），兼作保活
 
@@ -50,10 +49,12 @@ def _probe_venus_loop():
 def _log_upstreams():
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
-        if "relay_port" in up:
-            log.info("  %s: relay :%d → interceptor :%d → %s | model=%s ctx=%s",
-                     up["name"], up["relay_port"], up["interceptor_port"],
-                     up["openai_url"], up["model"], ctx)
+        if up.get("responses_native_url"):
+            log.info("  %s: native-responses → %s | model=%s ctx=%s",
+                     up["name"], up["responses_native_url"], up["model"], ctx)
+        elif up.get("responses_direct"):
+            log.info("  %s: responses-direct → %s | model=%s ctx=%s",
+                     up["name"], up["openai_url"], up["model"], ctx)
         else:
             log.info("  %s: messages → %s | model=%s ctx=%s",
                      up["name"], up.get("anthropic_url", "?"), up["model"], ctx)
@@ -62,14 +63,10 @@ def _log_upstreams():
 def main():
     log.info("GLM Proxy v%s :%d", VERSION, LISTEN[1])
     _log_upstreams()
-    start_interceptors()
-    start_relays()
-    time.sleep(1)
     threading.Thread(target=_probe_venus_loop, daemon=True, name="venus-probe").start()
 
     def shutdown(_sig=None, _frame=None):
         log.info("Shutting down...")
-        stop_relays()
         raise SystemExit(0)
 
     signal.signal(signal.SIGTERM, shutdown)

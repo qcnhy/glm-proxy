@@ -85,48 +85,20 @@ def _strip_gpt_state(body):
     return removed, removed_previous
 
 
-def _strip_responses_images(body):
-    """Responses → Completions(relay) 链路剥离 input_image：GLM completions 端点
-    只接受 content.type=text（上游 1210 '参数非法'），图片会整请求 400。
-    剥离后用占位文本提示模型，避免静默丢图。返回替换的图片数（0=无图，不动 body）。"""
-    if not isinstance(body, dict):
-        return 0
-    items = body.get("input")
-    if not isinstance(items, list):
-        return 0
-    n = 0
-    for item in items:
-        content = item.get("content") if isinstance(item, dict) else None
-        if not isinstance(content, list):
-            # *_call_output.output 可能是 list（view_image 返回图片 base64，~1MB/张），
-            # completions 端点只收 text；同样剥离（1261 实锤触发源）。
-            # 按 "*_call_output" 通用匹配：custom_tool_call_output 同样携带图片且
-            # 曾漏剥导致 4.9MB base64 直发上游触发 1261（2026-08-28 #3304）。
-            if (isinstance(item, dict) and isinstance(item.get("type"), str)
-                    and item["type"].endswith("_call_output")
-                    and isinstance(item.get("output"), list)):
-                if any(isinstance(b, dict) and b.get("image_url") for b in item["output"]):
-                    item["output"] = "[图片已省略：当前渠道不支持图片输入]"
-                    n += 1
-            continue
-        for i, block in enumerate(content):
-            if isinstance(block, dict) and block.get("type") == "input_image":
-                content[i] = {"type": "input_text", "text": "[图片已省略：当前渠道不支持图片输入]"}
-                n += 1
-    return n
-
-
 def _route_mode(up, is_responses, is_messages):
     """根据请求需求和渠道能力选择统一路由模式；None 表示不兼容。
 
     路由只依赖能力字段，不依赖渠道名称或配置位置。
     """
     if is_responses:
+        # v4.9.4: responses_native_url — 渠道自身提供原生 Responses 端点（如
+        # venusgroup /ai/zhipu/responses），直通不走 codex-relay，图片原生多模态。
         if up.get("responses_direct") and up.get("openai_url"):
             return "responses_direct"
-        # Responses 统一走 codex-relay（Responses→Chat Completions）
-        if up.get("openai_url") and up.get("relay_port"):
-            return "responses_relay"
+        if up.get("responses_native_url"):
+            return "responses_native"
+        # v5.0.0: codex-relay 退役。无原生 Responses 能力且无 relay 的渠道不再承接
+        # responses 请求（跳过走回退链）。
         return None
     if is_messages:
         return "messages" if up.get("anthropic_url") else None

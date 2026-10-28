@@ -22,7 +22,6 @@ from .transforms import (
     _flatten_encrypted_content, _inject_tool_rules, _is_overflow_signal,
     _merge_duplicate_tool_outputs, _normalize_sse_block,
     _patch_msg_usage, _route_mode, _select_upstream_model, _stream_timeout_error, _strip_gpt_state,
-    _strip_responses_images,
 )
 
 class Handler(BaseHTTPRequestHandler):
@@ -193,12 +192,14 @@ class Handler(BaseHTTPRequestHandler):
                 continue
 
             # 构建目标 URL 和请求头（每个上游只需一次）
-            if route_mode == "responses_direct":
-                # 原生 Responses 端点直通
+            if route_mode in ("responses_direct", "responses_native"):
+                # 原生 Responses 端点直通（responses_direct=OpenAI 形态 URL 拼路径；
+                # responses_native=渠道给完整端点 URL，不拼路径）
                 api_path = self.path
                 if api_path.startswith("/v1/"):
                     api_path = api_path[3:]
-                url = up["openai_url"].rstrip("/") + api_path
+                url = (up["responses_native_url"] if route_mode == "responses_native"
+                       else up["openai_url"].rstrip("/") + api_path)
                 up_headers = {
                     "Content-Type": "application/json",
                     "Authorization": f"Bearer {up.get('key', '')}",
@@ -215,13 +216,6 @@ class Handler(BaseHTTPRequestHandler):
                             up_headers["chatgpt-account-id"] = _acct
                         up_headers["OpenAI-Beta"] = "responses=experimental"
                         up_headers["originator"] = "codex_cli_rs"
-            elif route_mode == "responses_relay":
-                # Responses API → codex-relay（Chat Completions 路径，OpenAI 原生）
-                url = f"http://127.0.0.1:{up['relay_port']}{self.path}"
-                up_headers = {
-                    "Content-Type": "application/json",
-                    "Authorization": self.headers.get("Authorization", ""),
-                }
             elif route_mode == "messages":
                 # Messages API → Anthropic 端点
                 url = up["anthropic_url"].rstrip("/")
@@ -301,15 +295,6 @@ class Handler(BaseHTTPRequestHandler):
                 # ChatGPT backend 拒绝 max_output_tokens；store 由渠道显式配置。
                 _scg = up.get("strip_max_output")
                 _mox = body.pop("max_output_tokens", None) if _scg else None
-                # Responses→Completions(relay) 链路剥离图片（GLM completions 只收 text，1210）
-                _img_backup = None
-                if route_mode == "responses_relay":
-                    _img_backup = json.dumps(body.get("input"), ensure_ascii=False) if isinstance(body.get("input"), list) else None
-                    _n_img = _strip_responses_images(body)
-                    if not _n_img:
-                        _img_backup = None
-                    else:
-                        log.info("[#%d]     [strip] %s: removed %d input_image(s) for completions", self._req_id, up["name"], _n_img)
                 _force_store = up.get("store_responses")
                 _store_bak = body.get("store", "__absent__") if _force_store is not None else "__skip__"
                 if _force_store is not None:
@@ -317,8 +302,6 @@ class Handler(BaseHTTPRequestHandler):
                 payload = json.dumps(body).encode()
                 if _mox is not None:
                     body["max_output_tokens"] = _mox  # 恢复（回退下一上游时原样）
-                if _img_backup is not None:
-                    body["input"] = json.loads(_img_backup)  # 恢复图片（回退其他渠道时原样）
                 if _store_bak == "__absent__":
                     body.pop("store", None)
                 elif _store_bak != "__skip__":

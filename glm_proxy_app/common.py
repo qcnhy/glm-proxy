@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v4.9.3 — codex-relay + Python 路由层
+GLM API 代理 v5.0.0 — Python 路由层（codex-relay 已退役）
 
 架构：
-    Codex CLI → 本代理(:9999) → codex-relay(:4444/:4445) → 上游 /chat/completions
-                             ↘ 其他路径直接透传上游
+    Codex CLI → 本代理(:9999) → 各上游原生端点
+      /v1/responses → responses_native_url（内网）或 responses_direct（官方 /api/v1）
+      /v1/messages  → anthropic_url 直连
+      /v1/chat/completions → openai_url 直连
 
 功能：
-    - codex-relay 负责 Responses API ↔ Chat Completions 翻译（社区维护）
-    - Python 层负责：模型覆盖、密钥注入、多上游回退
+    - GLM 内部端点（/ai/zhipu/responses）与官方端点（/api/v1/responses）均原生
+      支持 Responses 协议，转译层 codex-relay 自 v5.0.0 起退役
+    - Python 层负责：模型覆盖、密钥注入、多上游回退、429 封锁、探针保活
     - /v1/models 返回静态模型列表
     - 日志和错误请求保存到 logs/ 目录
-
-依赖：
-    pip install codex-relay（启动时自动安装/升级）
 """
 import json, traceback, threading, time, socket, os, signal, sys, logging, shutil, subprocess
 from http.server import HTTPServer, BaseHTTPRequestHandler
