@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v5.0.0 — Python 路由层（codex-relay 已退役）
+GLM API 代理 v5.1.0 — Python 路由层（codex-relay 已退役）
 
 架构：
     Codex CLI → 本代理(:9999) → 各上游原生端点
-      /v1/responses → responses_native_url（内网）或 responses_direct（官方 /api/v1）
+      /v1/responses → responses_url（完整端点 URL 直通）
       /v1/messages  → anthropic_url 直连
       /v1/chat/completions → openai_url 直连
 
 功能：
     - GLM 内部端点（/ai/zhipu/responses）与官方端点（/api/v1/responses）均原生
-      支持 Responses 协议，转译层 codex-relay 自 v5.0.0 起退役
+      支持 Responses 协议，转译层 codex-relay 自 v5.1.0 起退役
     - Python 层负责：模型覆盖、密钥注入、多上游回退、429 封锁、探针保活
     - /v1/models 返回静态模型列表
     - 日志和错误请求保存到 logs/ 目录
@@ -146,10 +146,10 @@ LOG_DIR = os.path.join(PROJECT_ROOT, "logs")
 
 UPSTREAMS = _cfg.get("upstreams", [])
 
-# v3.0.1: responses_direct（GPT 直通）渠道不进列表——GPT 模型窗口 Codex 原生认识，
+# v3.0.1: responses_url（GPT 直通）渠道不进列表——GPT 模型窗口 Codex 原生认识，
 # 代理替它报 context_window 反而会用默认值覆盖成错误窗口（chatgpt 渠道无该字段→128000）。
 # v4.7.2: disabled 渠道的模型也不应广播（venus-deepseek 禁用后 models 仍列 deepseek-v4-pro）
-_CHAIN_UPS = [up for up in UPSTREAMS if not up.get("responses_direct") and not up.get("disabled")]
+_CHAIN_UPS = [up for up in UPSTREAMS if not up.get("responses_url") and not up.get("disabled")]
 STATIC_MODELS = json.dumps({
     "object": "list",
     "data": list({up["model"]: {"id": up["model"], "slug": up["model"], "object": "model",

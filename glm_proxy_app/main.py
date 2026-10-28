@@ -49,12 +49,9 @@ def _probe_venus_loop():
 def _log_upstreams():
     for up in UPSTREAMS:
         ctx = f"{up['max_context_tokens'] // 1000}K" if up.get("max_context_tokens") else "?"
-        if up.get("responses_native_url"):
-            log.info("  %s: native-responses → %s | model=%s ctx=%s",
-                     up["name"], up["responses_native_url"], up["model"], ctx)
-        elif up.get("responses_direct"):
-            log.info("  %s: responses-direct → %s | model=%s ctx=%s",
-                     up["name"], up["openai_url"], up["model"], ctx)
+        if up.get("responses_url"):
+            log.info("  %s: responses → %s | model=%s ctx=%s",
+                     up["name"], up["responses_url"], up["model"], ctx)
         else:
             log.info("  %s: messages → %s | model=%s ctx=%s",
                      up["name"], up.get("anthropic_url", "?"), up["model"], ctx)

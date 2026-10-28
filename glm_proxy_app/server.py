@@ -143,7 +143,7 @@ class Handler(BaseHTTPRequestHandler):
         # 普通回退链不能解析其他上游的服务端 item 引用。进入链前删除所有纯
         # item_reference、rs_*/reasoning 和 previous_response_id，保留完整消息及工具记录。
         # 钉选/数字 key 指向链内渠道时同样需要清理（GPT 会话切渠道不能带 rs_*）；
-        # 唯一例外：目标是无状态 responses_direct 渠道（循环内自行 strip）。
+        # 唯一例外：目标是无状态 responses_url 渠道（循环内自行 strip）。
         if is_responses and isinstance(body, dict):
             _n_gpt, _had_prev = _strip_gpt_state(body)
             if _n_gpt or _had_prev:
@@ -192,14 +192,9 @@ class Handler(BaseHTTPRequestHandler):
                 continue
 
             # 构建目标 URL 和请求头（每个上游只需一次）
-            if route_mode in ("responses_direct", "responses_native"):
-                # 原生 Responses 端点直通（responses_direct=OpenAI 形态 URL 拼路径；
-                # responses_native=渠道给完整端点 URL，不拼路径）
-                api_path = self.path
-                if api_path.startswith("/v1/"):
-                    api_path = api_path[3:]
-                url = (up["responses_native_url"] if route_mode == "responses_native"
-                       else up["openai_url"].rstrip("/") + api_path)
+            if route_mode == "responses_url":
+                # v5.1.0: 渠道配置完整 Responses 端点 URL，直通不拼路径
+                url = up["responses_url"]
                 up_headers = {
                     "Content-Type": "application/json",
                     "Authorization": f"Bearer {up.get('key', '')}",
@@ -260,7 +255,7 @@ class Handler(BaseHTTPRequestHandler):
             payload = None
             if body is not None:
                 # 无状态 GPT 渠道同样不能解析上一轮未持久化或其他上游的纯 item_reference。
-                if route_mode == "responses_direct" and up.get("store_responses") is False:
+                if route_mode == "responses_url" and up.get("store_responses") is False:
                     _n_gpt, _had_prev = _strip_gpt_state(body)
                     if _n_gpt or _had_prev:
                         dbg("[#%d]     [gpt-state] %s store=false stripped %d item(s), previous_response_id=%s",
@@ -323,7 +318,7 @@ class Handler(BaseHTTPRequestHandler):
             # GPT 直通为 key=0 独占渠道：连接上游等待响应头期间先向客户端提交 SSE
             # 并发送心跳，避免长首包触发 Codex idle timeout。
             _connect_ka_stop = None
-            if is_stream and is_responses and route_mode == "responses_direct":
+            if is_stream and is_responses and route_mode == "responses_url":
                 _connect_ka_stop = threading.Event()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
@@ -347,9 +342,9 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 req = Request(url, data=payload, headers=up_headers, method=method)
                 first_output_deadline = (time.monotonic() + GPT_FIRST_OUTPUT_TIMEOUT
-                                         if route_mode == "responses_direct" and is_stream else None)
+                                         if route_mode == "responses_url" and is_stream else None)
                 connect_timeout = (GPT_FIRST_OUTPUT_TIMEOUT
-                                   if route_mode == "responses_direct" and is_stream
+                                   if route_mode == "responses_url" and is_stream
                                    else REQUEST_TIMEOUT)
                 _ctx = None
                 if up.get("host_header"):  # IP 直连 + Host 头还原域名：证书 CN 是域名，需关校验
@@ -367,7 +362,7 @@ class Handler(BaseHTTPRequestHandler):
                             resp, up, url, up_headers, payload, method, _est_tokens(body),
                             precommitted=route_sse_committed,
                             first_output_timeout=(GPT_FIRST_OUTPUT_TIMEOUT
-                                                  if route_mode == "responses_direct" else None),
+                                                  if route_mode == "responses_url" else None),
                             first_output_deadline=first_output_deadline)
                         if fallback:
                             # 未发头即失败（429限流/502不可达/DNS等），回退下一上游；
@@ -377,7 +372,7 @@ class Handler(BaseHTTPRequestHandler):
                                 last_err = (int(fcode), json.dumps({"error": ferr}).encode())
                             except (TypeError, ValueError):
                                 last_err = (502, b'{"error":"upstream failed before output"}')
-                            if route_mode == "responses_direct":
+                            if route_mode == "responses_url":
                                 # GPT 直通失败回退 GLM 链：先剥服务端状态引用再重放。
                                 _strip_gpt_state(body)
                             log.warning("[#%d]     !!! %s failed before output, trying next upstream",
@@ -825,7 +820,7 @@ class Handler(BaseHTTPRequestHandler):
         def _commit_locked():
             # 调用方须持 wlock。probe-before-commit：延迟提交 200，首次 _write 才提交，
             # 便于超限(200流式)时改返干净 400。commit 后启动 keepalive——
-            # responses_direct 直通渠道无 codex-relay keepalive，GPT 大上下文首内容可达数分钟，
+            # responses_url 直通渠道无 codex-relay keepalive，GPT 大上下文首内容可达数分钟，
             # 不发心跳客户端会 "Stream idle timeout" 断开（与 messages 路径 v2.9.80 同型问题）
             if committed[0]:
                 return
@@ -1193,9 +1188,9 @@ class Handler(BaseHTTPRequestHandler):
         供缺口1(500/502) 与 缺口3(流式 context_exceeded) 复用。只在上游「确实处理不了」时
         才拦截返 400 触发客户端压缩重试——不做飞行前预判拦截（用户要求：先让请求发出去试）。
         返回 True=已发400(调用方应return)；False=未超限不拦截(调用方继续回退下一个上游)。"""
-        # responses_direct（GPT 直通）不走 est 启发式：GPT 超限会返回结构化 400（带真实上限），
+        # responses_url（GPT 直通）不走 est 启发式：GPT 超限会返回结构化 400（带真实上限），
         # 由 _is_overflow_signal 路径处理；est>0.9*兜底值(200K) 的猜测对 GPT 只会误伤。
-        if up.get("responses_direct"):
+        if up.get("responses_url"):
             return False
         max_ctx = up.get("max_context_tokens", 200000)
         est_tokens = _est_tokens(body)  # 剔除 base64 图片，避免虚高

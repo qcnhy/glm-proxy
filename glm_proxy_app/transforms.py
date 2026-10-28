@@ -91,19 +91,17 @@ def _route_mode(up, is_responses, is_messages):
     路由只依赖能力字段，不依赖渠道名称或配置位置。
     """
     if is_responses:
-        # v4.9.4: responses_native_url — 渠道自身提供原生 Responses 端点（如
-        # venusgroup /ai/zhipu/responses），直通不走 codex-relay，图片原生多模态。
-        if up.get("responses_direct") and up.get("openai_url"):
-            return "responses_direct"
-        if up.get("responses_native_url"):
-            return "responses_native"
+        # v5.1.0: 统一 responses_url — 渠道配置完整 Responses 端点 URL 直通
+        # （官方 /api/v1、venusgroup /ai/zhipu/responses、GPT 后端等）。
+        if up.get("responses_url"):
+            return "responses_url"
         # v5.0.0: codex-relay 退役。无原生 Responses 能力且无 relay 的渠道不再承接
         # responses 请求（跳过走回退链）。
         return None
     if is_messages:
         return "messages" if up.get("anthropic_url") else None
-    # responses_direct 声明的是单端点能力，不隐式扩展为通用 OpenAI 能力。
-    if up.get("openai_url") and not up.get("responses_direct"):
+    # responses_url 声明的是单端点能力，不隐式扩展为通用 OpenAI 能力。
+    if up.get("openai_url") and not up.get("responses_url"):
         return "openai"
     return None
 
