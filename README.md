@@ -1,184 +1,116 @@
 # GLM Proxy
 
-让 [Codex CLI](https://developers.openai.com/codex/cli/) 直接使用智谱 GLM 系列模型（glm-5 / glm-5.1 / glm-5.3）的本地代理。
+让 [Codex CLI](https://developers.openai.com/codex/cli/) / Claude Code 直接使用 GLM、DeepSeek 等模型的本地多上游代理。
 
-Codex CLI 原生只支持 OpenAI Responses API，而智谱 GLM 提供 Chat Completions 和 Anthropic Messages 两种端点。本代理通过 codex-relay 做 Responses ↔ Chat Completions 协议翻译，并处理 Codex 与 GLM 之间的工具格式差异（特别是 `apply_patch`）。
+Codex CLI 原生只支持 OpenAI Responses API。本代理按渠道能力把请求直通到三种端点（Responses / Chat Completions / Anthropic Messages），并处理 Codex 与各上游之间的工具格式差异（特别是 `apply_patch`）。
 
 ## 架构
 
 ```
-Codex CLI ──► GLM Proxy (:9999)
-                │
-                 ├─► codex-relay ──► GLM Chat Completions 端点
-                              (Responses→Chat Completions)
-                 │
-                 └─► key=0 ──► GPT 原生 Responses 直通（支持图片）
+客户端（Codex CLI / Claude Code / 其他 OpenAI 兼容工具）
+   │
+   ▼
+GLM Proxy (:9999)
+   │  按 URL 能力字段路由，多上游按配置顺序回退
+   ├─ /v1/responses       ──► responses_url   （Responses API 直通）
+   ├─ /v1/chat/completions ──► completion_url （Chat Completions 直通）
+   └─ /v1/messages        ──► anthropic_url   （Anthropic Messages 直通）
 ```
-
-### 核心组件
-
-| 组件 | 作用 |
-|------|------|
-| **GLM Proxy**（本仓库） | 主入口 `:9999`。多上游回退、密钥注入、限速、`apply_patch` 工具格式修复、流式错误拦截 |
-| **codex-relay** | Responses API ↔ Chat Completions 翻译（Responses 主路径）。启动时自动 pip 安装 |
 
 ### 代码结构
 
-`glm_proxy.py` 只保留兼容启动入口，具体职责拆在 `glm_proxy_app/`：
+`glm_proxy.py` 是兼容启动入口，具体职责拆在 `glm_proxy_app/`：
 
 | 模块 | 职责 |
 |------|------|
-| `common.py` | 配置、日志、共享状态和 HTTP Server 基础设施 |
-| `relay.py` | 上游拦截器及 codex-relay 子进程生命周期 |
-| `transforms.py` | 请求、工具调用和 SSE 的无状态规范化 |
-| `server.py` | 客户端 HTTP Handler、上游路由和流式响应处理 |
-| `main.py` | 应用装配、启动和优雅退出 |
+| `common.py` | 配置加载、日志、共享状态、HTTP Server 基础设施 |
+| `transforms.py` | 请求/工具调用/SSE 的无状态规范化与路由模式判定 |
+| `server.py` | 客户端 HTTP Handler、上游路由、流式响应与回退 |
+| `main.py` | 应用启动、venusgroup 探针线程、优雅退出 |
 
-模块依赖保持单向：`common → transforms/relay → server → main`。新增协议修复优先放在
-`transforms.py`，不要继续塞进 HTTP Handler。
+模块依赖单向：`common → transforms → server → main`。协议修复优先放 `transforms.py`。
+
+## 路由规则
+
+- **能力由 URL 字段决定**：有 `responses_url` 才承接 `/v1/responses`；有 `completion_url` 才承接 `/v1/chat/completions`；有 `anthropic_url` 才承接 `/v1/messages`。端点 URL 全部在配置里写完整，代码不拼接路径。
+- **only_models**：可选子串白名单（大小写不敏感）。配置项是请求模型名的子串即命中（如 `flash` 命中 `GLM-5.3-Flash`、`glm-5.3-flash`）。未配置则该渠道对任意模型开放。
+- **available_models**：静态模型清单。请求模型精确匹配（大小写不敏感）时透传该清单内的规范写法，否则使用渠道 `model`（Messages 路径用 `messages_model`）。运行时不访问上游 `/models`。
+- **回退链**：按 `upstreams` 配置顺序尝试；单渠道失败/限流/无输出自动切下一个。`disabled: true` 的渠道完全跳过。
+- **模型改写**：发往上游的模型名 = `available_models` 精确命中项或渠道默认 `model`。 `only_models` 只做渠道筛选，不参与改写。
 
 ## 功能
 
-- **协议翻译**：codex-relay 把 Codex 的 Responses API 请求转成 GLM 能理解的 Chat Completions 格式；`/v1/messages`（Claude Code 等）直连 Anthropic Messages 端点
-- **多上游回退**：配置多个上游（内网网关 / 中转站 / 智谱官方），按优先级和健康状态自动切换
-- **`apply_patch` 支持**：GLM 不原生支持 Codex 的 FREEFORM 工具，代理做双向转换
-  - 请求侧：`custom`/`grammar` 工具定义 → GLM 可调用的 function 格式
-  - 响应侧：GLM 的 `function_call` → Codex 的 `custom_tool_call`（含完整流式 delta 事件）
-  - 请求侧：Codex 的 `custom_tool_call_output` → GLM 的 `function_call_output`
-- **流式错误拦截**：GLM 流式返回 1234（上下文超限）/1305（限速）错误时，合成正常结束保留已生成内容
-- **官方限速**：令牌桶控制官方 API 请求频率，防止 1305
-- **`max_tokens` 兜底**：自动补全默认值，避免智谱 `count_tokens` 在 `None` 时崩溃
-- **namespace 工具名修正**：处理 codex-relay 对 MCP namespace 工具的命名拼接
+- **三端点直通**：Responses / Chat Completions / Anthropic Messages，按渠道配置各端独立可用
+- **多上游回退**：DNS 失败、HTTP 4xx/5xx、流式无输出、限流 429（自动按 Retry-After 封锁渠道）逐级切换
+- **SSE 活动窗口超时**：首输出 45s 判据按上游 SSE 块滚动续期——模型长时间只推 reasoning 不会被误杀；真正静默 45s 才回退
+- **probe-before-commit**：非内容事件先握住，见首条可交付内容（正文/工具调用）才提交 200；上游超限改返干净 400 触发客户端自动压缩
+- **GPT 无状态处理**：`store_responses: false` 渠道自动剥 `previous_response_id`、`rs_*`/reasoning 引用，回退 GLM 链时同样清理
+- **工具链修复**：`additional_tools` 提取到顶层、exec 沙箱规则注入、tool_use input 规范化——删过一次导致无法执行命令，现有单测锁定
+- **上下文超限**：识别上游超限信号（含 Venus/智谱各家文案），返回结构化 400 让客户端压缩后重试
 
 ## 配置
-
-密钥等敏感信息存在 `config.json`（已 gitignore，不会提交）。首次使用：
 
 ```bash
 cp config.example.json config.json
 # 编辑 config.json 填入真实密钥
 ```
 
-配置结构见 [config.example.json](config.example.json)：
+`config.json` 已 gitignore。字段说明：
 
-```json
-{
-  "upstreams": [
-    {
-      "name": "official",                      // 上游名称
-      "completion_url": "...",                     // Chat Completions 端点（Responses 走 codex-relay 到这里）
-      "anthropic_url": "...",                  // Anthropic Messages 端点（/v1/messages 直连）
-      "anthropic_auth": "x-api-key",           // 认证方式：x-api-key / bearer
-      "key": "...",                            // API 密钥
-      "relay_port": 4446,                      // codex-relay 端口
-      "interceptor_port": 14446,               // 拦截器端口
-      "model": "glm-5.3",                      // Chat Completions 模型名
-      "messages_model": "glm-5.3",             // Messages 端点模型名（不填则回退到 model）
-      "available_models": ["glm-5.3", "glm-5.3-flash"], // 一次性探测后固化的模型清单
-      "max_context_tokens": 202745             // 上下文窗口
-    }
-  ]
-}
-```
-
-**上游字段说明：**
-
-| 字段 | 必填 | 说明 |
-|------|------|------|
-| `name` | 是 | 上游标识，用于路由和日志 |
-| `key` | 是 | API 密钥 |
-| `model` | 是 | Chat Completions 路径用的模型名 |
-| `relay_port` / `interceptor_port` | 是 | codex-relay 子进程端口，各上游不能重复 |
-| `anthropic_url` | 否 | 配置则可服务 `/v1/messages` 直连请求（Claude Code 等） |
-| `anthropic_auth` | 否 | `x-api-key`（智谱官方）或 `bearer`（中转站） |
-| `messages_model` | 否 | Messages 端点模型名，不填回退到 `model` |
-| `available_models` | 否 | 手动从上游 `/models` 探测后写入的静态模型 ID；客户端请求精确匹配时透传，否则使用 `model`/`messages_model`。代理运行时不会刷新 |
-| `max_context_tokens` | GLM 渠道必填 | 上下文窗口，上报 `/v1/models` 供 Codex 判断压缩时机；`responses_direct`（GPT 直通）渠道无需配置（Codex 原生认识 GPT 模型窗口） |
-
-### GPT 原生 Responses 直通
-
-GPT 渠道放在 `upstreams` 最前面，配置 `responses_direct: true` 和 `chain_exclude: true`。这些渠道不参与默认回退链，也不接受 `/v1/messages` 或 Chat Completions；只能用数字 key 手动直达。
-
-Responses 服务端 item ID 只存在于生成它的上游。当前 GPT 渠道使用 `store_responses: false`：代理会在请求 GPT 前删除所有纯 `item_reference`、`rs_*`/`reasoning` 状态和 `previous_response_id`；当请求进入 GLM 回退链时执行相同清理，同时保留带完整内容的普通消息、函数调用和工具输出。
-
-多个 GPT 渠道中应只启用一个：将要用的渠道设为 `"disabled": false`，其余设为 `true`，然后重启代理。启用的链外直通渠道使用 key 0；如果全部 disabled，key 0 保持空缺。普通链内渠道始终从 key 1 开始编号，不受 GPT 启停影响。
-
-GPT 模型不出现在 `/v1/models` 列表中（Codex 对 GPT 模型名使用原生窗口知识），也不参与本地上下文超限启发式——GPT 超限会返回结构化错误，由错误处理层直接转发。
-
-Responses 不按是否带 `input_image` 分叉；图片和文本统一走 codex-relay 路径处理。如果上游明确返回图片不兼容错误，再由错误处理层执行后续降级。
+| 字段 | 适用端点 | 说明 |
+|------|---------|------|
+| `name` | - | 渠道标识，用于日志与限流封锁 |
+| `responses_url` | Responses | 完整 URL。留空则该渠道不承接 `/v1/responses` |
+| `completion_url` | Completions | 完整 URL（含 `/chat/completions`）。留空则不承接该路径 |
+| `anthropic_url` | Messages | 完整 URL。留空则不承接 `/v1/messages` |
+| `key` | 全部 | API 密钥（`tokens_file` 渠道可留空） |
+| `anthropic_auth` | Messages | `x-api-key`（默认，智谱官方）或 `bearer`（中转站） |
+| `model` | 全部 | Responses/Completions 路径默认模型名 |
+| `messages_model` | Messages | Messages 路径模型名，缺省回退 `model` |
+| `available_models` | 全部 | 精确匹配透传清单（规范写法），见路由规则 |
+| `only_models` | 全部 | 子串白名单，见路由规则 |
+| `max_context_tokens` | - | 上报 `/v1/models` 供客户端判断压缩时机 |
+| `tokens_file` | Responses | ChatGPT 订阅 OAuth token 文件 |
+| `store_responses` | Responses | `false` 时启用无状态剥离 |
+| `strip_max_output` | Responses | 删除 max_output_tokens（上游不认该字段时） |
+| `cf_gate` | 全部 | Cloudflare 百秒闸渠道标记，≥1MB 载荷跳过 |
+| `disabled` | - | `true` 完全禁用该渠道 |
 
 ## 使用
 
-### 1. 安装依赖
-
 ```bash
-pip install codex-relay
+python3 glm_proxy.py   # 默认 0.0.0.0:9999，无需额外依赖（纯标准库）
 ```
 
-（代理启动时会自动检查并安装）
+客户端（Codex CLI 等）API 端点指向 `http://<代理机器IP>:9999`。
 
-### 2. 启动代理
-
-```bash
-python3 glm_proxy.py
-```
-
-默认监听 `0.0.0.0:9999`。
-
-### 3. 配置 Codex CLI
-
-将 Codex 的 API 端点指向本代理：
-
-```
-http://<代理机器IP>:9999
-```
-
-### 4. 验证
+验证：
 
 ```bash
 curl http://127.0.0.1:9999/v1/models
+curl http://127.0.0.1:9999/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"glm-5.3","messages":[{"role":"user","content":"ping"}]}'
 ```
 
-运行本地回归测试：
+回归测试：
 
 ```bash
 python3 -m unittest discover -v
 ```
 
-## 上游路由规则
-
-未指定上游时，按以下规则自动选择：
-
-自动链不区分工作时间，始终按配置顺序回退：
-
-1. **官方（official）**
-2. **Venus DeepSeek（venus-deepseek）**
-3. **内网千问（internal）**
-
 ## 日志
 
-- 控制台实时输出
-- `logs/` 目录保存调试数据：
-  - `exchange_*.json`：请求+响应对（排查工具调用问题）
-  - `debug_req_*.json`：大请求体（排查上下文问题）
-  - `proxy.log`：nohup 后台运行时的完整日志
+- 控制台实时输出；`nohup` 场景完整日志落 `logs/proxy.log`
+- `logs/exchange_*.json`：请求+响应对（DEBUG 开启时）
+- `logs/debug_req_*.json`：异常请求体存证
 
-## apply_patch 工作原理
+## 已知上游行为备忘
 
-Codex 的 `apply_patch` 是 FREEFORM 工具（grammar 格式），但：
-
-1. **GLM 不支持 FREEFORM 工具** → 代理把 grammar 工具定义转成普通 function，并在描述里教 GLM 生成 V4A patch 格式
-2. **GLM 返回的是 `function_call`** → 代理转成 Codex 期望的 `custom_tool_call`，并补全流式 `custom_tool_call_input.delta` + `.done` 事件（否则长 patch 会被 Codex 丢弃）
-3. **Codex 返回 `custom_tool_call_output`** → 代理转回 GLM 的 `function_call_output`
-
-代理还会自动修复 GLM 常见的 patch 格式错误：补全 `*** Begin/End Patch`、清理带前缀的命令行。
-
-## 限速与错误处理
-
-- **1234（上下文超限）**：流式拦截，保留已生成内容并合成正常结束
-- **1305（限速）**：令牌桶控制官方 API 频率（默认 1.5 req/s，突发 2）
-- **上游失败**：自动回退到下一个可用上游
+- 智谱官方：`/api/v1/responses` 支持 Responses；`/api/coding/paas/v4/chat/completions` 走订阅额度；`/api/coding/paas/v4/responses` 不存在
+- GLM 长思考场景会先推数千条 `reasoning_text.delta` 再出正文——首输出超时必须按 SSE 活动滚动，固定 45s 会误杀（v5.3.2 修复）
+- GLM 在 `max_output_tokens` 截断时发 `response.incomplete`（非 completed），按合法终态处理
 
 ## 许可
 
 私有项目。
+

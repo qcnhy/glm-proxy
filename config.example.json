@@ -1,58 +1,58 @@
 {
   "_comment": "复制本文件为 config.json 并填入真实密钥。config.json 不会被提交到 git。",
-  "_comment_upstreams": "渠道按优先级排列。能力由 URL 字段决定：有 completion_url+relay_port=可服务 Responses(codex-relay→Completions)与通用 OpenAI 路径，有 anthropic_url=可服务 /v1/messages 直连。路由 flag: disabled(禁用)。内网渠道放在最后作为兜底。",
+  "_comment_upstreams": "渠道按优先级排列。三端点全部显式配置完整 URL（不运行时拼接）：responses_url=Responses API，completion_url=Chat Completions（完整含 /chat/completions），anthropic_url=Anthropic Messages。留空字符串表示该渠道不支持此端点。路由 flag：disabled(禁用)，only_models(子串匹配请求模型才使用该渠道，大小写不敏感)，cf_gate(有 Cloudflare 百秒闸的大载荷跳过)。",
   "upstreams": [
     {
-      "_comment": "GPT 原生 Responses 固定渠道：使用独立数字 key，不加入 GLM 回退链。store_responses=false 时代理会删除所有纯 item_reference、rs_*/reasoning 和 previous_response_id；进入 GLM 回退链时执行相同清理。",
-      "name": "chatgpt",
-      "completion_url": "https://chatgpt.com/backend-api/codex/chat/completions",
-      "tokens_file": "chatgpt_tokens.json",
-      "key": "",
-      "model": "gpt-5.6-sol",
-      "responses_direct": true,
-      "chain_exclude": true,
-      "disabled": true,
-      "strip_max_output": true,
-      "store_responses": false
-    },
-    {
-      "_comment": "智谱官方：原生两端点，一个 key 通吃。completion_url 用 coding 路径。",
+      "_comment": "智谱官方：原生 Responses + Coding 订阅 Completions + Anthropic Messages，一个 key 通吃。",
       "name": "official",
+      "responses_url": "https://open.bigmodel.cn/api/v1/responses",
       "completion_url": "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
       "anthropic_url": "https://open.bigmodel.cn/api/anthropic/v1/messages",
       "anthropic_auth": "x-api-key",
       "key": "YOUR_ZHIPU_API_KEY",
-      "relay_port": 4446,
-      "interceptor_port": 14446,
       "model": "glm-5.3",
       "messages_model": "glm-5.3",
       "available_models": ["glm-5.3", "glm-5.3-flash"],
       "max_context_tokens": 1000000
     },
     {
-      "_comment": "Venus DeepSeek V4 Pro",
+      "_comment": "Venus 内网 GLM：三端点齐全；only_models 用子串匹配承接 flash/luna/haiku 类请求。",
+      "name": "internal",
+      "responses_url": "https://aigateway.venusgroup.com.cn/ai/zhipu/responses",
+      "completion_url": "https://aigateway.venusgroup.com.cn/ai/zhipu/openai/v1/chat/completions",
+      "anthropic_url": "https://aigateway.venusgroup.com.cn/ai/zhipu/anthropic/v1/messages",
+      "anthropic_auth": "bearer",
+      "key": "YOUR_INTERNAL_KEY",
+      "model": "GLM-5.3-Flash",
+      "only_models": ["flash", "luna", "haiku"],
+      "max_context_tokens": 1000000
+    },
+    {
+      "_comment": "ChatGPT 官方订阅 OAuth 渠道：tokens_file 提供 access_token；store_responses=false 时代理删除纯 item_reference、rs_*/reasoning 与 previous_response_id。",
+      "name": "chatgpt",
+      "responses_url": "https://chatgpt.com/backend-api/codex/responses",
+      "completion_url": "https://chatgpt.com/backend-api/codex/chat/completions",
+      "anthropic_url": "",
+      "tokens_file": "chatgpt_tokens.json",
+      "key": "",
+      "model": "gpt-6-sol",
+      "available_models": ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-6-sol"],
+      "store_responses": false,
+      "strip_max_output": true,
+      "disabled": true
+    },
+    {
+      "_comment": "Venus DeepSeek V4 Pro（备用）。",
       "name": "venus-deepseek",
+      "responses_url": "",
       "completion_url": "https://aigateway.venusgroup.com.cn/ai/deepseek/openai/v1/chat/completions",
       "anthropic_url": "https://aigateway.venusgroup.com.cn/ai/deepseek/anthropic/v1/messages",
       "anthropic_auth": "bearer",
       "key": "YOUR_INTERNAL_KEY",
-      "relay_port": 4450,
-      "interceptor_port": 14450,
       "model": "deepseek-v4-pro",
-      "messages_model": "deepseek-v4-pro",
-      "max_context_tokens": 1000000
-    },
-    {
-      "_comment": "内网千问兜底",
-      "name": "internal",
-      "completion_url": "https://aigateway.venusgroup.com.cn/ai/aliyun/openai/v1/chat/completions",
-      "anthropic_url": "https://aigateway.venusgroup.com.cn/ai/aliyun/anthropic/v1/messages",
-      "anthropic_auth": "bearer",
-      "key": "YOUR_INTERNAL_KEY",
-      "relay_port": 4444,
-      "interceptor_port": 14444,
-      "model": "qwen3.5-plus",
-      "max_context_tokens": 800000
+      "max_context_tokens": 1000000,
+      "strip_custom_tools": true,
+      "disabled": true
     }
   ]
 }
