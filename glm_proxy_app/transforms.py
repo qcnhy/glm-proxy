@@ -238,57 +238,6 @@ def _extract_additional_tools(body):
                     if subs:
                         dbg("    [additional_tools] namespace %s subs: %s", t.get("name"), ", ".join(subs))
     return body
-def _fix_tool_result_roles(body):
-    """Anthropic 端点严格校验 tool_result 块只能在 user 消息。
-
-    Claude Code 客户端会把上一轮工具结果(tool_result)和新的思考(thinking/text)+工具调用(tool_use)
-    混进同一条 assistant 消息 → venus 等严格端点 400「tool_result blocks can only be in user messages」。
-    （智谱 official 端点宽松放行，故平时不暴露；official 429 封锁回退 venus 时才触发。）
-
-    这里把 assistant 消息里混入的 tool_result 拆成独立 user 消息（放在思考之前，
-    语义上 tool_result 对应更早的 tool_use，应先于本轮思考）。若前一条已是 user
-    （连续 user 违反 role 交替），则合并进前一条。幂等：无混入时原样返回。"""
-    if not isinstance(body, dict):
-        return body
-    msgs = body.get("messages")
-    if not isinstance(msgs, list):
-        return body
-    out = []
-    changed = 0
-    for m in msgs:
-        if not isinstance(m, dict) or m.get("role") != "assistant":
-            out.append(m)
-            continue
-        c = m.get("content")
-        if not isinstance(c, list):
-            out.append(m)
-            continue
-        tr_idx = [i for i, b in enumerate(c) if isinstance(b, dict) and b.get("type") == "tool_result"]
-        if not tr_idx:
-            out.append(m)
-            continue
-        tr_blocks = [c[i] for i in tr_idx]
-        rest_blocks = [b for i, b in enumerate(c) if i not in tr_idx]
-        # 拆出的 tool_result 放到前一条 user 消息末尾（保持 role 交替），否则独立成 user 消息
-        if out and isinstance(out[-1], dict) and out[-1].get("role") == "user":
-            prev_c = out[-1].get("content")
-            if isinstance(prev_c, str):
-                out[-1]["content"] = [{"type": "text", "text": prev_c}] + tr_blocks
-            elif isinstance(prev_c, list):
-                out[-1]["content"] = prev_c + tr_blocks
-            else:
-                out[-1]["content"] = tr_blocks
-        else:
-            out.append({"role": "user", "content": tr_blocks})
-        if rest_blocks:
-            out.append({"role": "assistant", "content": rest_blocks})
-        changed += 1
-    if changed:
-        body["messages"] = out
-        dbg("    [tool_result-role] fixed %d assistant msg → 拆出 tool_result 到 user", changed)
-    return body
-
-
 def _inject_tool_rules(body):
     """注入工具描述规则：Codex 新版 exec（JS 编排器）→ V8 沙箱约束 + tools.apply_patch()/shell_command() 用法。
     apply_patch 在新版已降为 exec 的嵌套工具（非独立工具），靠 exec 描述教模型调 tools.apply_patch()。

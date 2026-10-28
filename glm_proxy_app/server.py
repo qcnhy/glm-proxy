@@ -18,8 +18,7 @@ from .common import (
     _channel_blocked_until, _req_counter, log,
 )
 from .transforms import (
-    _est_tokens, _extract_additional_tools, _fix_tool_result_roles,
-    _inject_tool_rules, _is_overflow_signal,
+    _est_tokens, _extract_additional_tools, _inject_tool_rules, _is_overflow_signal,
     _merge_duplicate_tool_outputs, _normalize_sse_block,
     _patch_msg_usage, _route_mode, _select_upstream_model, _stream_timeout_error, _strip_gpt_state,
 )
@@ -284,8 +283,6 @@ class Handler(BaseHTTPRequestHandler):
                         if len(body["tools"]) != _before:
                             log.info("    [strip] %s: %d → %d tools (stripped custom)", up["name"], _before, len(body["tools"]))
 
-                if is_messages:
-                    _fix_tool_result_roles(body)
                 # ChatGPT backend 拒绝 max_output_tokens；store 由渠道显式配置。
                 _scg = up.get("strip_max_output")
                 _mox = body.pop("max_output_tokens", None) if _scg else None
