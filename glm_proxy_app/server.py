@@ -310,10 +310,13 @@ class Handler(BaseHTTPRequestHandler):
 
             log.info("[#%d]     -> %s", self._req_id, up["name"])
 
-            # GPT 直通为 key=0 独占渠道：连接上游等待响应头期间先向客户端提交 SSE
+            # responses_url 渠道：连接上游等待响应头期间先向客户端提交 SSE
             # 并发送心跳，避免长首包触发 Codex idle timeout。
+            # 只能提交一次（route_sse_committed）：链首渠道回退时若重复 send_response，
+            # 第二份 HTTP 头会混入 SSE 流，客户端解析即卡死。
             _connect_ka_stop = None
-            if is_stream and is_responses and route_mode == "responses_url":
+            if (is_stream and is_responses and route_mode == "responses_url"
+                    and not route_sse_committed):
                 _connect_ka_stop = threading.Event()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v5.2.0 — Python 路由层（codex-relay 已退役）
+GLM API 代理 v5.2.1 — Python 路由层（codex-relay 已退役）
 
 架构：
     Codex CLI → 本代理(:9999) → 各上游原生端点
