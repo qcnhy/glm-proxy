@@ -19,7 +19,7 @@ from .common import (
 )
 from .transforms import (
     _est_tokens, _extract_additional_tools, _fix_tool_result_roles,
-    _flatten_encrypted_content, _inject_tool_rules, _is_overflow_signal,
+    _inject_tool_rules, _is_overflow_signal,
     _merge_duplicate_tool_outputs, _normalize_sse_block,
     _patch_msg_usage, _route_mode, _select_upstream_model, _stream_timeout_error, _strip_gpt_state,
 )
@@ -270,7 +270,6 @@ class Handler(BaseHTTPRequestHandler):
                         log.warning("    payload %dKB, stripping previous_response_id", pid_len // 1024)
                         del body["previous_response_id"]
                 _extract_additional_tools(body)  # Codex additional_tools(input 内) → 顶层 tools
-                _flatten_encrypted_content(body)  # 仅降级 encrypted_content；明文 agent_message 由 relay 0.6.0 原生转译
                 # namespace 展平已移除（v2.9.93）：codex-relay 0.5.8 (#62) 原生处理 namespace，
                 # custom 子工具裸名/function 子工具 namespaced 编码由 relay 自己正确 round-trip。
                 _inject_tool_rules(body)  # 注入 exec 沙箱规则（relay 路径覆盖）

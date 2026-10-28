@@ -237,48 +237,6 @@ def _extract_additional_tools(body):
                     if subs:
                         dbg("    [additional_tools] namespace %s subs: %s", t.get("name"), ", ".join(subs))
     return body
-
-def _flatten_encrypted_content(body):
-    """v4.9.2 瘦身版 agent 展平：仅处理 encrypted_content 块。
-
-    codex-relay 0.6.0 已原生转译明文 agent_message（agent_message content must
-    contain only plaintext text parts），且对 encrypted_content 明确拒绝：
-    "encrypted agent_message content cannot be forwarded to a Chat Completions
-    upstream"（HTTP 422）。故只需把所有位置的 encrypted_content 块降级为
-    input_text（取其 encrypted_content 字段文本），agent_message 类型本身交给
-    relay 转译。幂等。"""
-    if not isinstance(body, dict):
-        return body
-    inp = body.get("input")
-    if not isinstance(inp, list):
-        return body
-
-    def _flat_blocks(content):
-        if not isinstance(content, list):
-            return None
-        out, changed = [], False
-        for b in content:
-            if isinstance(b, dict) and b.get("type") == "encrypted_content":
-                out.append({"type": "input_text", "text": b.get("encrypted_content", "")})
-                changed = True
-            else:
-                out.append(b)
-        return out if changed else None
-
-    n_enc = 0
-    for idx, item in enumerate(inp):
-        if not isinstance(item, dict) or not isinstance(item.get("content"), list):
-            continue
-        blocks = _flat_blocks(item["content"])
-        if blocks is not None:
-            n_enc += sum(1 for b in item["content"]
-                         if isinstance(b, dict) and b.get("type") == "encrypted_content")
-            inp[idx] = {**item, "content": blocks}
-    if n_enc:
-        dbg("    [agent_msg] flattened %d encrypted_content→input_text", n_enc)
-    return body
-
-
 def _fix_tool_result_roles(body):
     """Anthropic 端点严格校验 tool_result 块只能在 user 消息。
 
