@@ -27,8 +27,9 @@ class RouteModeTests(unittest.TestCase):
         self.assertEqual("openai", _route_mode(upstream, False, False))
         with_responses = {"openai_url": "https://example.test/v1",
                           "responses_url": "https://example.test/responses"}
+        # v5.2.5: completions 直通独立于 responses_url —— 有 openai_url 即承接
         self.assertEqual("responses_url", _route_mode(with_responses, True, False))
-        self.assertIsNone(_route_mode(with_responses, False, False))
+        self.assertEqual("openai", _route_mode(with_responses, False, False))
 
 
 class ToolchainTests(unittest.TestCase):

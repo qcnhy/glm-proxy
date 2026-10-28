@@ -10,7 +10,7 @@ from urllib.request import Request, urlopen
 from .common import LISTEN, UPSTREAMS, ThreadedHTTPServer, log
 from .server import Handler
 
-VERSION = "5.2.4"
+VERSION = "5.2.5"
 
 _PROBE_INTERVAL = 300  # venusgroup 内网探针周期（秒），兼作保活
 
