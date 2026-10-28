@@ -16,13 +16,13 @@
       "max_context_tokens": 1000000
     },
     {
-      "_comment": "Venus 内网 GLM：三端点齐全；only_models 用子串匹配承接 flash/luna/haiku 类请求。",
+      "_comment": "私有 GLM 网关示例：三端点齐全；only_models 用子串匹配承接 flash/luna/haiku 类请求。URL 换成你自己的网关。",
       "name": "internal",
-      "responses_url": "https://aigateway.venusgroup.com.cn/ai/zhipu/responses",
-      "completion_url": "https://aigateway.venusgroup.com.cn/ai/zhipu/openai/v1/chat/completions",
-      "anthropic_url": "https://aigateway.venusgroup.com.cn/ai/zhipu/anthropic/v1/messages",
+      "responses_url": "https://YOUR_GATEWAY_HOST/ai/zhipu/responses",
+      "completion_url": "https://YOUR_GATEWAY_HOST/ai/zhipu/openai/v1/chat/completions",
+      "anthropic_url": "https://YOUR_GATEWAY_HOST/ai/zhipu/anthropic/v1/messages",
       "anthropic_auth": "bearer",
-      "key": "YOUR_INTERNAL_KEY",
+      "key": "YOUR_GATEWAY_KEY",
       "model": "GLM-5.3-Flash",
       "only_models": ["flash", "luna", "haiku"],
       "max_context_tokens": 1000000
@@ -42,13 +42,13 @@
       "disabled": true
     },
     {
-      "_comment": "Venus DeepSeek V4 Pro（备用）。",
-      "name": "venus-deepseek",
+      "_comment": "DeepSeek V4 Pro 备用渠道示例（无 Responses 端点时留空即可）。",
+      "name": "deepseek",
       "responses_url": "",
-      "completion_url": "https://aigateway.venusgroup.com.cn/ai/deepseek/openai/v1/chat/completions",
-      "anthropic_url": "https://aigateway.venusgroup.com.cn/ai/deepseek/anthropic/v1/messages",
+      "completion_url": "https://YOUR_GATEWAY_HOST/ai/deepseek/openai/v1/chat/completions",
+      "anthropic_url": "https://YOUR_GATEWAY_HOST/ai/deepseek/anthropic/v1/messages",
       "anthropic_auth": "bearer",
-      "key": "YOUR_INTERNAL_KEY",
+      "key": "YOUR_GATEWAY_KEY",
       "model": "deepseek-v4-pro",
       "max_context_tokens": 1000000,
       "strip_custom_tools": true,

@@ -12,14 +12,15 @@ from .server import Handler
 
 VERSION = "5.4.0"
 
-_PROBE_INTERVAL = 300  # venusgroup 内网探针周期（秒），兼作保活
+_PROBE_INTERVAL = 300  # 内网网关探针周期（秒），兼作保活
 
 
 def _probe_venus_loop():
-    """v4.9.1: venusgroup 内网渠道周期探针。
+    """v4.9.1: 内网网关渠道周期探针。
 
     v5.4.0: 探针改走 responses_url（Responses 端点），摆脱对 completion_url 的依赖。
-    每 5 分钟对 responses_url 指向 venusgroup 的启用渠道发一条 1-token 请求：
+    v5.4.0: 探针改走 responses_url（Responses 端点），摆脱对 completion_url 的依赖。
+    每 5 分钟对 responses_url 含 "venusgroup" 的启用渠道发一条 1-token 请求：
     - 记录可用性日志（仅观测，不影响路由——失败渠道由现有回退链处理）
     - 顺带保活内网网关会话/连接
     """

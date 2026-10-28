@@ -92,7 +92,7 @@ def _route_mode(up, is_responses, is_messages):
     """
     if is_responses:
         # v5.1.0: 统一 responses_url — 渠道配置完整 Responses 端点 URL 直通
-        # （官方 /api/v1、venusgroup /ai/zhipu/responses、GPT 后端等）。
+        # （官方 /api/v1、私有网关 /ai/zhipu/responses、GPT 后端等）。
         if up.get("responses_url"):
             return "responses_url"
         # v5.0.0: codex-relay 退役。无原生 Responses 能力且无 relay 的渠道不再承接

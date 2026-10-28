@@ -26,7 +26,7 @@ GLM Proxy (:9999)
 | `common.py` | 配置加载、日志、共享状态、HTTP Server 基础设施 |
 | `transforms.py` | 请求/工具调用/SSE 的无状态规范化与路由模式判定 |
 | `server.py` | 客户端 HTTP Handler、上游路由、流式响应与回退 |
-| `main.py` | 应用启动、venusgroup 探针线程、优雅退出 |
+| `main.py` | 应用启动、内网网关探针线程、优雅退出 |
 
 模块依赖单向：`common → transforms → server → main`。协议修复优先放 `transforms.py`。
 
@@ -113,4 +113,3 @@ python3 -m unittest discover -v
 ## 许可
 
 私有项目。
-
