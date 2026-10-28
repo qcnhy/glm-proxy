@@ -140,7 +140,7 @@ def _load_config():
 
 _cfg = _load_config()
 
-LISTEN = ("0.0.0.0", 9999)
+LISTEN = ("0.0.0.0", int(os.environ.get("GLM_PROXY_PORT", "9999")))
 REQUEST_TIMEOUT = 300
 # GPT 原生 Responses 偶发接受请求后不返回任何有效 SSE。Codex 不把 SSE comment
 # 心跳视为 completion 进度，因此必须在客户端 idle watchdog 前主动回退。
