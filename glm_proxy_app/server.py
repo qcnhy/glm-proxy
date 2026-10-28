@@ -18,8 +18,8 @@ from .common import (
     _channel_blocked_until, _req_counter, log,
 )
 from .transforms import (
-    _est_tokens, _extract_additional_tools, _fix_tool_result_roles,
-    _inject_tool_rules, _is_overflow_signal,
+    _est_tokens,
+    _is_overflow_signal,
     _merge_duplicate_tool_outputs, _normalize_sse_block,
     _patch_msg_usage, _route_mode, _select_upstream_model, _stream_timeout_error, _strip_gpt_state,
 )
@@ -269,10 +269,8 @@ class Handler(BaseHTTPRequestHandler):
                     if pid_len > 200000:
                         log.warning("    payload %dKB, stripping previous_response_id", pid_len // 1024)
                         del body["previous_response_id"]
-                _extract_additional_tools(body)  # Codex additional_tools(input 内) → 顶层 tools
                 # namespace 展平已移除（v2.9.93）：codex-relay 0.5.8 (#62) 原生处理 namespace，
                 # custom 子工具裸名/function 子工具 namespaced 编码由 relay 自己正确 round-trip。
-                _inject_tool_rules(body)  # 注入 exec 沙箱规则（relay 路径覆盖）
                 # messages 路径防御：若 tools 仍含 "type":"custom"（不应出现）则剔之。
                 _tools_bak = None
                 if up.get("strip_custom_tools"):
@@ -284,8 +282,6 @@ class Handler(BaseHTTPRequestHandler):
                         if len(body["tools"]) != _before:
                             log.info("    [strip] %s: %d → %d tools (stripped custom)", up["name"], _before, len(body["tools"]))
 
-                if is_messages:
-                    _fix_tool_result_roles(body)
                 # ChatGPT backend 拒绝 max_output_tokens；store 由渠道显式配置。
                 _scg = up.get("strip_max_output")
                 _mox = body.pop("max_output_tokens", None) if _scg else None

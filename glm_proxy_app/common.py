@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GLM API 代理 v5.1.0 — Python 路由层（codex-relay 已退役）
+GLM API 代理 v5.2.0 — Python 路由层（codex-relay 已退役）
 
 架构：
     Codex CLI → 本代理(:9999) → 各上游原生端点
@@ -10,7 +10,7 @@ GLM API 代理 v5.1.0 — Python 路由层（codex-relay 已退役）
 
 功能：
     - GLM 内部端点（/ai/zhipu/responses）与官方端点（/api/v1/responses）均原生
-      支持 Responses 协议，转译层 codex-relay 自 v5.1.0 起退役
+      支持 Responses 协议，转译层 codex-relay 自 v5.0.0 起退役
     - Python 层负责：模型覆盖、密钥注入、多上游回退、429 封锁、探针保活
     - /v1/models 返回静态模型列表
     - 日志和错误请求保存到 logs/ 目录
