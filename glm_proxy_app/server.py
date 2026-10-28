@@ -443,6 +443,21 @@ class Handler(BaseHTTPRequestHandler):
                 # 任意路径 + HTTP 超限(ecloud/venus/internal 等 400 带超限文案) → 返干净 400 触发客户端压缩（不回退）
                 _ovtxt = err_body.decode("utf-8", errors="replace")
                 if (is_messages or is_responses) and _is_overflow_signal(_ovtxt):
+                    if route_sse_committed:
+                        # v5.4.7: SSE 已预提交（已发 200 头+connected 心跳）时禁止再发裸 HTTP 头——
+                        # 二次 send_response 会把 HTTP/1.1 400 拼进 SSE 字节流，客户端解码器报
+                        # "error decoding response body" 后挂起到超时。改为 SSE 事件收尾。
+                        log.warning("[#%d]     !!! %s overflow after SSE precommit, emitting response.failed",
+                                    self._req_id, up["name"])
+                        _failed = {"type": "response.failed", "response": {"status": "failed", "error": {
+                            "code": "context_overflow", "message": _ovtxt[:500]}}}
+                        try:
+                            self.wfile.write(("event: response.failed\ndata: "
+                                              + json.dumps(_failed, ensure_ascii=False) + "\n\n").encode())
+                            self.wfile.flush()
+                        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                            pass
+                        return
                     self._send_overflow_400(up, _est_tokens(body), as_responses=is_responses, upstream_text=_ovtxt)
                     return
                 # 429 rate_limit → 解析重置时间并封锁 official（HTTP 错误，所有路径都经过此处）
