@@ -19,10 +19,9 @@ from .common import (
 )
 from .transforms import (
     _est_tokens, _extract_additional_tools, _fix_tool_result_roles,
-    _flatten_agent_messages, _inject_tool_rules, _is_overflow_signal,
+    _inject_tool_rules, _is_overflow_signal,
     _merge_duplicate_tool_outputs, _normalize_sse_block,
     _patch_msg_usage, _route_mode, _select_upstream_model, _stream_timeout_error, _strip_gpt_state,
-    _strip_responses_images,
 )
 
 class Handler(BaseHTTPRequestHandler):
@@ -144,7 +143,7 @@ class Handler(BaseHTTPRequestHandler):
         # 普通回退链不能解析其他上游的服务端 item 引用。进入链前删除所有纯
         # item_reference、rs_*/reasoning 和 previous_response_id，保留完整消息及工具记录。
         # 钉选/数字 key 指向链内渠道时同样需要清理（GPT 会话切渠道不能带 rs_*）；
-        # 唯一例外：目标是无状态 responses_direct 渠道（循环内自行 strip）。
+        # 唯一例外：目标是无状态 responses_url 渠道（循环内自行 strip）。
         if is_responses and isinstance(body, dict):
             _n_gpt, _had_prev = _strip_gpt_state(body)
             if _n_gpt or _had_prev:
@@ -193,12 +192,9 @@ class Handler(BaseHTTPRequestHandler):
                 continue
 
             # 构建目标 URL 和请求头（每个上游只需一次）
-            if route_mode == "responses_direct":
-                # 原生 Responses 端点直通
-                api_path = self.path
-                if api_path.startswith("/v1/"):
-                    api_path = api_path[3:]
-                url = up["openai_url"].rstrip("/") + api_path
+            if route_mode == "responses_url":
+                # v5.1.0: 渠道配置完整 Responses 端点 URL，直通不拼路径
+                url = up["responses_url"]
                 up_headers = {
                     "Content-Type": "application/json",
                     "Authorization": f"Bearer {up.get('key', '')}",
@@ -215,13 +211,6 @@ class Handler(BaseHTTPRequestHandler):
                             up_headers["chatgpt-account-id"] = _acct
                         up_headers["OpenAI-Beta"] = "responses=experimental"
                         up_headers["originator"] = "codex_cli_rs"
-            elif route_mode == "responses_relay":
-                # Responses API → codex-relay（Chat Completions 路径，OpenAI 原生）
-                url = f"http://127.0.0.1:{up['relay_port']}{self.path}"
-                up_headers = {
-                    "Content-Type": "application/json",
-                    "Authorization": self.headers.get("Authorization", ""),
-                }
             elif route_mode == "messages":
                 # Messages API → Anthropic 端点
                 url = up["anthropic_url"].rstrip("/")
@@ -266,7 +255,7 @@ class Handler(BaseHTTPRequestHandler):
             payload = None
             if body is not None:
                 # 无状态 GPT 渠道同样不能解析上一轮未持久化或其他上游的纯 item_reference。
-                if route_mode == "responses_direct" and up.get("store_responses") is False:
+                if route_mode == "responses_url" and up.get("store_responses") is False:
                     _n_gpt, _had_prev = _strip_gpt_state(body)
                     if _n_gpt or _had_prev:
                         dbg("[#%d]     [gpt-state] %s store=false stripped %d item(s), previous_response_id=%s",
@@ -281,7 +270,6 @@ class Handler(BaseHTTPRequestHandler):
                         log.warning("    payload %dKB, stripping previous_response_id", pid_len // 1024)
                         del body["previous_response_id"]
                 _extract_additional_tools(body)  # Codex additional_tools(input 内) → 顶层 tools
-                _flatten_agent_messages(body)  # Codex 多智能体 agent_message/encrypted_content → message/input_text
                 # namespace 展平已移除（v2.9.93）：codex-relay 0.5.8 (#62) 原生处理 namespace，
                 # custom 子工具裸名/function 子工具 namespaced 编码由 relay 自己正确 round-trip。
                 _inject_tool_rules(body)  # 注入 exec 沙箱规则（relay 路径覆盖）
@@ -301,15 +289,6 @@ class Handler(BaseHTTPRequestHandler):
                 # ChatGPT backend 拒绝 max_output_tokens；store 由渠道显式配置。
                 _scg = up.get("strip_max_output")
                 _mox = body.pop("max_output_tokens", None) if _scg else None
-                # Responses→Completions(relay) 链路剥离图片（GLM completions 只收 text，1210）
-                _img_backup = None
-                if route_mode == "responses_relay":
-                    _img_backup = json.dumps(body.get("input"), ensure_ascii=False) if isinstance(body.get("input"), list) else None
-                    _n_img = _strip_responses_images(body)
-                    if not _n_img:
-                        _img_backup = None
-                    else:
-                        log.info("[#%d]     [strip] %s: removed %d input_image(s) for completions", self._req_id, up["name"], _n_img)
                 _force_store = up.get("store_responses")
                 _store_bak = body.get("store", "__absent__") if _force_store is not None else "__skip__"
                 if _force_store is not None:
@@ -317,8 +296,6 @@ class Handler(BaseHTTPRequestHandler):
                 payload = json.dumps(body).encode()
                 if _mox is not None:
                     body["max_output_tokens"] = _mox  # 恢复（回退下一上游时原样）
-                if _img_backup is not None:
-                    body["input"] = json.loads(_img_backup)  # 恢复图片（回退其他渠道时原样）
                 if _store_bak == "__absent__":
                     body.pop("store", None)
                 elif _store_bak != "__skip__":
@@ -340,7 +317,7 @@ class Handler(BaseHTTPRequestHandler):
             # GPT 直通为 key=0 独占渠道：连接上游等待响应头期间先向客户端提交 SSE
             # 并发送心跳，避免长首包触发 Codex idle timeout。
             _connect_ka_stop = None
-            if is_stream and is_responses and route_mode == "responses_direct":
+            if is_stream and is_responses and route_mode == "responses_url":
                 _connect_ka_stop = threading.Event()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
@@ -364,9 +341,9 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 req = Request(url, data=payload, headers=up_headers, method=method)
                 first_output_deadline = (time.monotonic() + GPT_FIRST_OUTPUT_TIMEOUT
-                                         if route_mode == "responses_direct" and is_stream else None)
+                                         if route_mode == "responses_url" and is_stream else None)
                 connect_timeout = (GPT_FIRST_OUTPUT_TIMEOUT
-                                   if route_mode == "responses_direct" and is_stream
+                                   if route_mode == "responses_url" and is_stream
                                    else REQUEST_TIMEOUT)
                 _ctx = None
                 if up.get("host_header"):  # IP 直连 + Host 头还原域名：证书 CN 是域名，需关校验
@@ -384,7 +361,7 @@ class Handler(BaseHTTPRequestHandler):
                             resp, up, url, up_headers, payload, method, _est_tokens(body),
                             precommitted=route_sse_committed,
                             first_output_timeout=(GPT_FIRST_OUTPUT_TIMEOUT
-                                                  if route_mode == "responses_direct" else None),
+                                                  if route_mode == "responses_url" else None),
                             first_output_deadline=first_output_deadline)
                         if fallback:
                             # 未发头即失败（429限流/502不可达/DNS等），回退下一上游；
@@ -394,7 +371,7 @@ class Handler(BaseHTTPRequestHandler):
                                 last_err = (int(fcode), json.dumps({"error": ferr}).encode())
                             except (TypeError, ValueError):
                                 last_err = (502, b'{"error":"upstream failed before output"}')
-                            if route_mode == "responses_direct":
+                            if route_mode == "responses_url":
                                 # GPT 直通失败回退 GLM 链：先剥服务端状态引用再重放。
                                 _strip_gpt_state(body)
                             log.warning("[#%d]     !!! %s failed before output, trying next upstream",
@@ -842,7 +819,7 @@ class Handler(BaseHTTPRequestHandler):
         def _commit_locked():
             # 调用方须持 wlock。probe-before-commit：延迟提交 200，首次 _write 才提交，
             # 便于超限(200流式)时改返干净 400。commit 后启动 keepalive——
-            # responses_direct 直通渠道无 codex-relay keepalive，GPT 大上下文首内容可达数分钟，
+            # responses_url 直通渠道无 codex-relay keepalive，GPT 大上下文首内容可达数分钟，
             # 不发心跳客户端会 "Stream idle timeout" 断开（与 messages 路径 v2.9.80 同型问题）
             if committed[0]:
                 return
@@ -942,7 +919,9 @@ class Handler(BaseHTTPRequestHandler):
                             log.warning("[#%d]     !!! %s response.failed (mid-stream): %s", self._req_id, upstream_name, err)
                             _write(out)
                             continue
-                        if t == "response.completed":
+                        # v4.9.3: GLM 原生 Responses 在 max_output_tokens 截断时发
+                        # response.incomplete（而非 completed）——同样是合法终态，按 completed 同等处理。
+                        if t in ("response.completed", "response.incomplete"):
                             held_completed = p
                             continue
                         # probe-hold：非内容块(response.created 等)握住不发，见首条内容才 flush；
@@ -1129,7 +1108,7 @@ class Handler(BaseHTTPRequestHandler):
         pt = p.get("type", "")
         # 提取 usage 用于日志
         usage = None
-        if pt == "response.completed":
+        if pt in ("response.completed", "response.incomplete"):
             usage = p.get("response", {}).get("usage")
         elif pt == "message_delta":
             delta_usage = p.get("usage")
@@ -1208,9 +1187,9 @@ class Handler(BaseHTTPRequestHandler):
         供缺口1(500/502) 与 缺口3(流式 context_exceeded) 复用。只在上游「确实处理不了」时
         才拦截返 400 触发客户端压缩重试——不做飞行前预判拦截（用户要求：先让请求发出去试）。
         返回 True=已发400(调用方应return)；False=未超限不拦截(调用方继续回退下一个上游)。"""
-        # responses_direct（GPT 直通）不走 est 启发式：GPT 超限会返回结构化 400（带真实上限），
+        # responses_url（GPT 直通）不走 est 启发式：GPT 超限会返回结构化 400（带真实上限），
         # 由 _is_overflow_signal 路径处理；est>0.9*兜底值(200K) 的猜测对 GPT 只会误伤。
-        if up.get("responses_direct"):
+        if up.get("responses_url"):
             return False
         max_ctx = up.get("max_context_tokens", 200000)
         est_tokens = _est_tokens(body)  # 剔除 base64 图片，避免虚高

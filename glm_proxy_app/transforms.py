@@ -85,53 +85,23 @@ def _strip_gpt_state(body):
     return removed, removed_previous
 
 
-def _strip_responses_images(body):
-    """Responses → Completions(relay) 链路剥离 input_image：GLM completions 端点
-    只接受 content.type=text（上游 1210 '参数非法'），图片会整请求 400。
-    剥离后用占位文本提示模型，避免静默丢图。返回替换的图片数（0=无图，不动 body）。"""
-    if not isinstance(body, dict):
-        return 0
-    items = body.get("input")
-    if not isinstance(items, list):
-        return 0
-    n = 0
-    for item in items:
-        content = item.get("content") if isinstance(item, dict) else None
-        if not isinstance(content, list):
-            # *_call_output.output 可能是 list（view_image 返回图片 base64，~1MB/张），
-            # completions 端点只收 text；同样剥离（1261 实锤触发源）。
-            # 按 "*_call_output" 通用匹配：custom_tool_call_output 同样携带图片且
-            # 曾漏剥导致 4.9MB base64 直发上游触发 1261（2026-08-28 #3304）。
-            if (isinstance(item, dict) and isinstance(item.get("type"), str)
-                    and item["type"].endswith("_call_output")
-                    and isinstance(item.get("output"), list)):
-                if any(isinstance(b, dict) and b.get("image_url") for b in item["output"]):
-                    item["output"] = "[图片已省略：当前渠道不支持图片输入]"
-                    n += 1
-            continue
-        for i, block in enumerate(content):
-            if isinstance(block, dict) and block.get("type") == "input_image":
-                content[i] = {"type": "input_text", "text": "[图片已省略：当前渠道不支持图片输入]"}
-                n += 1
-    return n
-
-
 def _route_mode(up, is_responses, is_messages):
     """根据请求需求和渠道能力选择统一路由模式；None 表示不兼容。
 
     路由只依赖能力字段，不依赖渠道名称或配置位置。
     """
     if is_responses:
-        if up.get("responses_direct") and up.get("openai_url"):
-            return "responses_direct"
-        # Responses 统一走 codex-relay（Responses→Chat Completions）
-        if up.get("openai_url") and up.get("relay_port"):
-            return "responses_relay"
+        # v5.1.0: 统一 responses_url — 渠道配置完整 Responses 端点 URL 直通
+        # （官方 /api/v1、venusgroup /ai/zhipu/responses、GPT 后端等）。
+        if up.get("responses_url"):
+            return "responses_url"
+        # v5.0.0: codex-relay 退役。无原生 Responses 能力且无 relay 的渠道不再承接
+        # responses 请求（跳过走回退链）。
         return None
     if is_messages:
         return "messages" if up.get("anthropic_url") else None
-    # responses_direct 声明的是单端点能力，不隐式扩展为通用 OpenAI 能力。
-    if up.get("openai_url") and not up.get("responses_direct"):
+    # responses_url 声明的是单端点能力，不隐式扩展为通用 OpenAI 能力。
+    if up.get("openai_url") and not up.get("responses_url"):
         return "openai"
     return None
 
@@ -267,69 +237,6 @@ def _extract_additional_tools(body):
                     if subs:
                         dbg("    [additional_tools] namespace %s subs: %s", t.get("name"), ", ".join(subs))
     return body
-
-
-def _flatten_agent_messages(body):
-    """规整 Codex 多智能体（sub-agent）消息为标准类型，避免 relay 路径产出未知内容类型。
-
-    Codex 桌面版多智能体功能在 input 数组里发：
-    - type=agent_message：父 agent 给子 agent 的协作消息（NEW_TASK 等，含 author/recipient）
-    - content block type=encrypted_content：携带任务 payload 文本（encrypted_content 字段）
-    codex-relay 不认识 agent_message，会把它的 content 块（含 encrypted_content）原样透传，
-    GLM/智谱 Anthropic 端点只认 text/image/tool_use/tool_result → 1214「content[N].type 类型错误」。
-
-    这里：agent_message → message(role=user，子 agent 收到的任务即用户指令)；
-          encrypted_content 块 → input_text（取其 encrypted_content 字段文本）。
-    relay 路径规整后产出标准类型。幂等。"""
-    if not isinstance(body, dict):
-        return body
-    inp = body.get("input")
-    if not isinstance(inp, list):
-        return body
-
-    def _flat_blocks(content):
-        """encrypted_content → input_text；其余块原样保留。返回新列表；无改动返回 None。"""
-        if not isinstance(content, list):
-            return None
-        out, changed = [], False
-        for b in content:
-            if isinstance(b, dict) and b.get("type") == "encrypted_content":
-                out.append({"type": "input_text", "text": b.get("encrypted_content", "")})
-                changed = True
-            else:
-                out.append(b)
-        return out if changed else None
-
-    new_inp, changed = [], False
-    n_agent = n_enc = 0
-    for item in inp:
-        if not isinstance(item, dict):
-            new_inp.append(item)
-            continue
-        if item.get("type") == "agent_message":
-            changed = True
-            n_agent += 1
-            raw_c = item.get("content", [])
-            blocks = _flat_blocks(raw_c) or raw_c
-            n_enc += sum(1 for b in (raw_c or []) if isinstance(b, dict) and b.get("type") == "encrypted_content")
-            new_inp.append({"type": "message", "role": "user", "content": blocks})
-        else:
-            # 普通 message 的 content 也可能混入 encrypted_content 块
-            if item.get("type") == "message":
-                orig_c = item.get("content")
-                blocks = _flat_blocks(orig_c)
-                if blocks is not None:
-                    changed = True
-                    n_enc += sum(1 for b in (orig_c or []) if isinstance(b, dict) and b.get("type") == "encrypted_content")
-                    item = {**item, "content": blocks}
-            new_inp.append(item)
-    if changed:
-        body["input"] = new_inp
-        dbg("    [agent_msg] flattened %d agent_message→message, %d encrypted_content→input_text",
-                 n_agent, n_enc)
-    return body
-
-
 def _fix_tool_result_roles(body):
     """Anthropic 端点严格校验 tool_result 块只能在 user 消息。
 
