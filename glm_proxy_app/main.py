@@ -10,7 +10,7 @@ from urllib.request import Request, urlopen
 from .common import LISTEN, UPSTREAMS, ThreadedHTTPServer, log
 from .server import Handler
 
-VERSION = "5.3.0"
+VERSION = "5.3.1"
 
 _PROBE_INTERVAL = 300  # venusgroup 内网探针周期（秒），兼作保活
 
@@ -34,7 +34,7 @@ def _probe_venus_loop():
             body = json.dumps({"model": model,
                                "messages": [{"role": "user", "content": "ping"}],
                                "max_tokens": 1}).encode()
-            req = Request(up["completion_url"].rstrip("/") + "/chat/completions", data=body,
+            req = Request(up["completion_url"], data=body,
                           headers={"Content-Type": "application/json",
                                    "Authorization": "Bearer " + up.get("key", "")},
                           method="POST")

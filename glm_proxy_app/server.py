@@ -225,11 +225,9 @@ class Handler(BaseHTTPRequestHandler):
                     **auth_header,
                 }
             else:  # route_mode == "openai"
-                # 通用 OpenAI 路径（/v1/chat/completions 等）
-                api_path = self.path
-                if api_path.startswith("/v1/"):
-                    api_path = api_path[3:]
-                url = up["completion_url"].rstrip("/") + api_path
+                # v5.3.1: completion_url 为完整端点（含 /chat/completions），
+                # 与 responses_url/anthropic_url 一致全显式配置，不做路径拼接。
+                url = up["completion_url"]
                 up_headers = {
                     "Authorization": f"Bearer {up['key']}",
                     "Connection": "close",

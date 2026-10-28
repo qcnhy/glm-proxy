@@ -5,7 +5,7 @@
     {
       "_comment": "GPT 原生 Responses 固定渠道：使用独立数字 key，不加入 GLM 回退链。store_responses=false 时代理会删除所有纯 item_reference、rs_*/reasoning 和 previous_response_id；进入 GLM 回退链时执行相同清理。",
       "name": "chatgpt",
-      "completion_url": "https://chatgpt.com/backend-api/codex",
+      "completion_url": "https://chatgpt.com/backend-api/codex/chat/completions",
       "tokens_file": "chatgpt_tokens.json",
       "key": "",
       "model": "gpt-5.6-sol",
@@ -18,7 +18,7 @@
     {
       "_comment": "智谱官方：原生两端点，一个 key 通吃。completion_url 用 coding 路径。",
       "name": "official",
-      "completion_url": "https://open.bigmodel.cn/api/coding/paas/v4",
+      "completion_url": "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
       "anthropic_url": "https://open.bigmodel.cn/api/anthropic/v1/messages",
       "anthropic_auth": "x-api-key",
       "key": "YOUR_ZHIPU_API_KEY",
@@ -32,7 +32,7 @@
     {
       "_comment": "Venus DeepSeek V4 Pro",
       "name": "venus-deepseek",
-      "completion_url": "https://aigateway.venusgroup.com.cn/ai/deepseek/openai/v1",
+      "completion_url": "https://aigateway.venusgroup.com.cn/ai/deepseek/openai/v1/chat/completions",
       "anthropic_url": "https://aigateway.venusgroup.com.cn/ai/deepseek/anthropic/v1/messages",
       "anthropic_auth": "bearer",
       "key": "YOUR_INTERNAL_KEY",
@@ -45,7 +45,7 @@
     {
       "_comment": "内网千问兜底",
       "name": "internal",
-      "completion_url": "https://aigateway.venusgroup.com.cn/ai/aliyun/openai/v1",
+      "completion_url": "https://aigateway.venusgroup.com.cn/ai/aliyun/openai/v1/chat/completions",
       "anthropic_url": "https://aigateway.venusgroup.com.cn/ai/aliyun/anthropic/v1/messages",
       "anthropic_auth": "bearer",
       "key": "YOUR_INTERNAL_KEY",

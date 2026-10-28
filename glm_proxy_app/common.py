@@ -6,7 +6,7 @@ GLM API 代理 v5.2.1 — Python 路由层（codex-relay 已退役）
     Codex CLI → 本代理(:9999) → 各上游原生端点
       /v1/responses → responses_url（完整端点 URL 直通）
       /v1/messages  → anthropic_url 直连
-      /v1/chat/completions → completion_url 直连
+      /v1/chat/completions → completion_url 直连（完整端点，零拼接）
 
 功能：
     - GLM 内部端点（/ai/zhipu/responses）与官方端点（/api/v1/responses）均原生
