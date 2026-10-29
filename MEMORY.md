@@ -1,6 +1,6 @@
 # Project Memory
 
-## Current state (v5.4.3, 2026-10-29)
+## Current state (v5.4.8, 2026-10-29)
 
 - Architecture: single Python proxy, stdlib only. common.py (config/logger/server/rotating-log), server.py (routing/streams/fallback), transforms.py (request transforms), main.py (startup+probe), __init__.py. codex-relay fully retired since v5.0.0.
 - Upstream layout (config.json, not git-tracked): internal (enabled, probe:true, only_models=flash/luna/haiku substring match) -> official (bigmodel, enabled) -> chatgpt/cmoyan/venus-deepseek (disabled, kept as cold spares per user decision).
@@ -35,6 +35,13 @@ Do NOT merge official's three URLs into one - v5.2.5 incident: merge dropped com
 
 - Empty-output fallback re-bills tokens (same request re-sent to next channel). Low frequency; revisit on real pain.
 - disabled channels keep their config blocks (chatgpt tokens_file/store_responses etc.) as cold spares.
+
+## create_thread 工具缺失事件 (2026-10-29, 已解决)
+
+- 现象: 桌面端(26.1023) SSH 远程会话无 create_thread/thread 工具组。**自愈于桌面端完全重启**(客户端 apps MCP 协商状态损坏)。重启连接/重启 app-server 无效。
+- 误判教训: session-flags ignored 警告(code_mode_tool_search 等)是干扰项,与本案无关; tools=0 旧日志口径误导排查(真实工具在 additional_tools)。
+- v5.4.8 日志: >>> 行改 tools_raw/addl, 提取后打 [tools-final] 清单。排查口径: addl=0→客户端没发; addl>0 但 final 缺项→proxy 丢。
+- 已部署 100 (2026-10-29 14:39 重启生效)。注意 addl=N 提取后可能少于 N(namespace 去重合并)。
 
 ## Verification
 
