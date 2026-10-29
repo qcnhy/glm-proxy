@@ -39,7 +39,9 @@ Do NOT merge official's three URLs into one - v5.2.5 incident: merge dropped com
 ## create_thread 工具缺失事件 (2026-10-29, 已解决)
 
 - 现象: 桌面端(26.1023) SSH 远程会话无 create_thread/thread 工具组。**自愈于桌面端完全重启**(客户端 apps MCP 协商状态损坏)。重启连接/重启 app-server 无效。
-- 误判教训: session-flags ignored 警告(code_mode_tool_search 等)是干扰项,与本案无关; tools=0 旧日志口径误导排查(真实工具在 additional_tools)。
+- 最终验证: 用户会话成功 create_thread("Batch U 解限验证" 线程, 14:38 实证在跑) — 工具链完全恢复。
+- 注意: exec(V8沙箱)内嵌套调 mcp__codex_app__ 写工具(create_thread等)会因参数序列化差异报 invalid arguments — 是嵌套调用限制,非系统故障,勿再误判。
+- 误判教训: ①session-flags ignored 警告是干扰项; ②tools=0 旧口径误导(真实工具在 additional_tools); ③"参数校验器版本错位"推断错误,用户直接调用成功即为反证。
 - v5.4.8 日志: >>> 行改 tools_raw/addl, 提取后打 [tools-final] 清单。排查口径: addl=0→客户端没发; addl>0 但 final 缺项→proxy 丢。
 - 已部署 100 (2026-10-29 14:39 重启生效)。注意 addl=N 提取后可能少于 N(namespace 去重合并)。
 
