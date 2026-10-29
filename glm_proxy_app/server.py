@@ -285,7 +285,15 @@ class Handler(BaseHTTPRequestHandler):
                 if is_responses:
                     _tl = body.get("tools")
                     if isinstance(_tl, list) and _tl:
-                        _ns = ",".join(t.get("name", "?") for t in _tl if isinstance(t, dict))
+                        # v5.4.9: 展开每个 namespace 的子工具名 — create_thread 等以
+                        # namespace subs 形态注入时, 只看顶层名会漏(2026-10-29 事件复盘)
+                        _ns = ",".join(
+                            (t.get("name", "?") + "(" + ",".join(
+                                st.get("name", "?") for st in (t.get("tools") or [])
+                                if isinstance(st, dict)) + ")")
+                            if isinstance(t, dict) and (t.get("tools") or t.get("type") == "namespace")
+                            else t.get("name", "?")
+                            for t in _tl if isinstance(t, dict))
                         log.info("[#%d]     [tools-final] %d tools: %s",
                                  self._req_id, len(_tl), _ns)
                 # namespace 展平已移除（v2.9.93）：codex-relay 0.5.8 (#62) 原生处理 namespace，
