@@ -123,9 +123,15 @@ class Handler(BaseHTTPRequestHandler):
         # 3) 日志 + 计算 payload 大小
         raw_len = len(raw) if method == "POST" else 0
         if is_responses:
-            log.info("[#%d] >>> [%s] POST %s stream=%s tools=%d input=%d",
-                     self._req_id, client_ip, self.path, is_stream, len(body.get("tools", [])),
-                     len(body.get("input", [])))
+            # v5.4.8: tools_raw=客户端顶层 tools 数(新版 Codex 恒为 0,真实工具在 input 的
+            # additional_tools 内,提取发生在第4步)。tools=留待提取后由 _log_final_tools 补打,
+            # 避免 tools=0 误导排查(2026-10-29 create_thread 误判事故)。
+            _n_add = sum(len(i.get("tools") or [])
+                         for i in body.get("input", [])
+                         if isinstance(i, dict) and i.get("type") == "additional_tools")
+            log.info("[#%d] >>> [%s] POST %s stream=%s tools_raw=%d addl=%d input=%d",
+                     self._req_id, client_ip, self.path, is_stream,
+                     len(body.get("tools", [])), _n_add, len(body.get("input", [])))
         else:
             log.info("[#%d] >>> [%s] %s %s", self._req_id, client_ip, method, self.path)
 
@@ -275,6 +281,13 @@ class Handler(BaseHTTPRequestHandler):
                         log.warning("    payload %dKB, stripping previous_response_id", pid_len // 1024)
                         del body["previous_response_id"]
                 _extract_additional_tools(body)  # Codex additional_tools(input 内) → 顶层 tools
+                # v5.4.8: 提取后打最终转发工具清单 — ROUTE 行 tools_raw=0 时这里是唯一真值
+                if is_responses:
+                    _tl = body.get("tools")
+                    if isinstance(_tl, list) and _tl:
+                        _ns = ",".join(t.get("name", "?") for t in _tl if isinstance(t, dict))
+                        log.info("[#%d]     [tools-final] %d tools: %s",
+                                 self._req_id, len(_tl), _ns)
                 # namespace 展平已移除（v2.9.93）：codex-relay 0.5.8 (#62) 原生处理 namespace，
                 # custom 子工具裸名/function 子工具 namespaced 编码由 relay 自己正确 round-trip。
                 _inject_tool_rules(body)  # 注入 exec 沙箱规则（relay 路径覆盖）
